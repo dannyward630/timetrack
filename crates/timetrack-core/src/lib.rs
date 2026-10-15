@@ -46,8 +46,9 @@ pub use aggregate::{
     week_totals,
 };
 pub use export::{
-    CSV_HEADER, ExportScope, default_export_filename, entries_in_scope, escape_field, export_csv,
-    format_export_status, format_local_iso8601, month_id, week_id,
+    CSV_HEADER, ExportScope, default_export_filename, entries_in_scope, entries_in_scope_at,
+    escape_field, export_csv, export_csv_at, format_export_status, format_local_iso8601, month_id,
+    week_id,
 };
 pub use model::{
     Entry, EntrySource, MS_PER_DAY, Project, STORE_VERSION, Store, local_day_of, local_day_start,

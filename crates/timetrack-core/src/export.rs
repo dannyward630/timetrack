@@ -12,8 +12,9 @@
 //! Excel, not in a hex editor. Duration appears as both `HH:MM:SS` and raw
 //! minutes, and `source` is included so hand-entered time is visible.
 //!
-//! Pure like the rest of the core: takes the store, a scope, `now` and the
-//! UTC offset explicitly, so it is testable without I/O or a clock.
+//! Pure like the rest of the core: takes the store, a scope, an anchor
+//! instant and the UTC offset explicitly, so it is testable without I/O or a
+//! clock.
 
 use crate::aggregate::{iso_week_of, month_of};
 use crate::format_duration;
@@ -23,9 +24,9 @@ use crate::tz::Tz;
 /// What an export covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExportScope {
-    /// The ISO week containing `now`.
+    /// The ISO week containing the anchor.
     Week,
-    /// The calendar month containing `now`.
+    /// The calendar month containing the anchor.
     Month,
     /// Everything.
     #[default]
@@ -56,18 +57,24 @@ impl ExportScope {
 pub const CSV_HEADER: &str =
     "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note";
 
-/// Entries in `scope`, oldest first (the order a stakeholder reads).
-pub fn entries_in_scope<'a>(
+/// Entries in `scope` for `anchor_ms`, oldest first (the order a stakeholder reads).
+///
+/// The week is the ISO week containing the anchor and the month is the
+/// calendar month containing the anchor (both via `tz.day_of`); all time
+/// ignores the anchor entirely. Each entry buckets by its `started_at` only,
+/// never split or duplicated, so a 22:00-to-02:00 entry appears once with its
+/// full duration in the start period.
+pub fn entries_in_scope_at<'a>(
     store: &'a Store,
     scope: ExportScope,
-    now_ms: i64,
+    anchor_ms: i64,
     tz: &Tz,
 ) -> Vec<&'a crate::Entry> {
     let mut out: Vec<&crate::Entry> = match scope {
         ExportScope::All => store.entries.iter().collect(),
         ExportScope::Week => {
-            let today = tz.day_of(now_ms);
-            let week = iso_week_of(today);
+            let anchor_day = tz.day_of(anchor_ms);
+            let week = iso_week_of(anchor_day);
             store
                 .entries
                 .iter()
@@ -78,8 +85,8 @@ pub fn entries_in_scope<'a>(
                 .collect()
         }
         ExportScope::Month => {
-            let today = tz.day_of(now_ms);
-            let (year, month) = month_of(today);
+            let anchor_day = tz.day_of(anchor_ms);
+            let (year, month) = month_of(anchor_day);
             store
                 .entries
                 .iter()
@@ -89,6 +96,20 @@ pub fn entries_in_scope<'a>(
     };
     out.sort_by_key(|e| e.started_at);
     out
+}
+
+/// Entries in `scope` anchored at `now_ms` (the current week/month).
+///
+/// Backward-compat wrapper over [`entries_in_scope_at`]: existing callers
+/// keep compiling and keep current-period behaviour, while new code paths
+/// pass an explicit anchor.
+pub fn entries_in_scope<'a>(
+    store: &'a Store,
+    scope: ExportScope,
+    now_ms: i64,
+    tz: &Tz,
+) -> Vec<&'a crate::Entry> {
+    entries_in_scope_at(store, scope, now_ms, tz)
 }
 
 /// Stable identity of the ISO week containing `anchor_ms` (`2026-W41`).
@@ -223,10 +244,15 @@ pub fn escape_field(s: &str) -> String {
 }
 
 /// Render the store (or the scoped subset) as CSV, including the header.
-pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, tz: &Tz) -> String {
+///
+/// `anchor_ms` selects which week or month `scope` covers; all time ignores
+/// it. The CSV shape is frozen: header row, one row per entry in scope oldest
+/// first, local wall-clock stamps without offset, readable duration plus
+/// minutes, source column, minimal quoting.
+pub fn export_csv_at(store: &Store, scope: ExportScope, anchor_ms: i64, tz: &Tz) -> String {
     let mut out = String::from(CSV_HEADER);
     out.push('\n');
-    for e in entries_in_scope(store, scope, now_ms, tz) {
+    for e in entries_in_scope_at(store, scope, anchor_ms, tz) {
         let project = store
             .project(&e.project_id)
             .map(|p| p.name.as_str())
@@ -252,6 +278,15 @@ pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, tz: &Tz) -> St
         out.push('\n');
     }
     out
+}
+
+/// Render the store (or the scoped subset) as CSV, anchored at `now_ms`.
+///
+/// Backward-compat wrapper over [`export_csv_at`]: existing callers keep
+/// compiling and keep current-period behaviour, while new code paths pass an
+/// explicit anchor.
+pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, tz: &Tz) -> String {
+    export_csv_at(store, scope, now_ms, tz)
 }
 
 #[cfg(test)]
@@ -470,5 +505,183 @@ mod tests {
             format_export_status(5, ExportScope::All, "all", "timetrack-export-all.csv"),
             "exported 5 entries (all time) to timetrack-export-all.csv"
         );
+    }
+
+    fn anchored_store(rows: &[(&str, i64, i64)]) -> Store {
+        let mut s = Store::default();
+        s.projects.push(Project {
+            id: "p1".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        for (id, a, b) in rows {
+            s.entries.push(Entry {
+                id: (*id).into(),
+                project_id: "p1".into(),
+                description: (*id).into(),
+                started_at: *a,
+                ended_at: *b,
+                source: EntrySource::Manual,
+                note: None,
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn chosen_week_returns_exact_starts_in_week_set() {
+        // ISO week 41 of 2026 runs Mon 5 Oct - Sun 11 Oct (UTC).
+        let s = anchored_store(&[
+            ("e_mon", 1_791_194_400_000, 1_791_198_000_000), // Mon 5 Oct 10:00-11:00
+            ("e_sun", 1_791_712_800_000, 1_791_716_400_000), // Sun 11 Oct 10:00-11:00
+            ("e_next", 1_791_799_200_000, 1_791_802_800_000), // Mon 12 Oct 10:00-11:00
+        ]);
+        let anchor = 1_791_460_800_000; // Thu 8 Oct 12:00 UTC, inside W41
+        let ids: Vec<&str> = entries_in_scope_at(&s, ExportScope::Week, anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(ids, ["e_mon", "e_sun"]);
+        let csv = export_csv_at(&s, ExportScope::Week, anchor, &utc());
+        assert!(
+            csv.contains("e_mon") && csv.contains("e_sun"),
+            "got:\n{csv}"
+        );
+        assert!(
+            !csv.contains("e_next"),
+            "next week must not leak in:\n{csv}"
+        );
+    }
+
+    #[test]
+    fn chosen_month_returns_exact_starts_in_month_set() {
+        let s = anchored_store(&[
+            ("e_sep", 1_789_466_400_000, 1_789_470_000_000), // 15 Sep 10:00-11:00
+            ("e_sep_end", 1_790_762_400_000, 1_790_766_000_000), // 30 Sep 10:00-11:00
+            ("e_oct", 1_790_848_800_000, 1_790_852_400_000), // 1 Oct 10:00-11:00
+        ]);
+        let sep_anchor = 1_789_473_600_000; // 15 Sep 12:00 UTC
+        let oct_anchor = 1_791_460_800_000; // 8 Oct 12:00 UTC
+        let sep_ids: Vec<&str> = entries_in_scope_at(&s, ExportScope::Month, sep_anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(sep_ids, ["e_sep", "e_sep_end"]);
+        let oct_ids: Vec<&str> = entries_in_scope_at(&s, ExportScope::Month, oct_anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(oct_ids, ["e_oct"]);
+        let csv = export_csv_at(&s, ExportScope::Month, sep_anchor, &utc());
+        assert!(
+            !csv.contains("e_oct"),
+            "October must not leak into September:\n{csv}"
+        );
+    }
+
+    #[test]
+    fn all_ignores_anchor_entirely() {
+        let s = anchored_store(&[
+            ("e_sep", 1_789_466_400_000, 1_789_470_000_000),
+            ("e_oct", 1_790_848_800_000, 1_790_852_400_000),
+        ]);
+        let sep_anchor = 1_789_473_600_000;
+        let oct_anchor = 1_791_460_800_000;
+        let a: Vec<&str> = entries_in_scope_at(&s, ExportScope::All, sep_anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        let b: Vec<&str> = entries_in_scope_at(&s, ExportScope::All, oct_anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(a, ["e_sep", "e_oct"]);
+        assert_eq!(
+            b,
+            ["e_sep", "e_oct"],
+            "a stale anchor must never narrow a full dump"
+        );
+        assert_eq!(
+            export_csv_at(&s, ExportScope::All, sep_anchor, &utc()),
+            export_csv_at(&s, ExportScope::All, oct_anchor, &utc()),
+            "all-time bytes must not depend on the anchor"
+        );
+    }
+
+    #[test]
+    fn spanning_entry_appears_once_with_full_duration_in_start_week() {
+        // Sun 11 Oct 22:00 UTC -> Mon 12 Oct 02:00 UTC: 4h across the W41/W42 line.
+        let s = anchored_store(&[("e_span", 1_791_756_000_000, 1_791_770_400_000)]);
+        let w41 = 1_791_460_800_000; // Thu 8 Oct 12:00 UTC
+        let w42 = 1_791_806_400_000; // Mon 12 Oct 12:00 UTC
+        let in_start: Vec<&str> = entries_in_scope_at(&s, ExportScope::Week, w41, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(in_start, ["e_span"]);
+        assert!(
+            entries_in_scope_at(&s, ExportScope::Week, w42, &utc()).is_empty(),
+            "the end week must not repeat the entry"
+        );
+        let csv = export_csv_at(&s, ExportScope::Week, w41, &utc());
+        assert_eq!(
+            csv.lines().count(),
+            2,
+            "header plus one row, never duplicated:\n{csv}"
+        );
+        assert!(
+            csv.contains("04:00:00") && csv.contains(",240,"),
+            "full duration, got:\n{csv}"
+        );
+        assert_eq!(
+            export_csv_at(&s, ExportScope::Week, w42, &utc())
+                .lines()
+                .count(),
+            1,
+            "header only in the end week"
+        );
+    }
+
+    #[test]
+    fn spanning_entry_appears_once_with_full_duration_in_start_month() {
+        // 30 Sep 22:00 UTC -> 1 Oct 02:00 UTC: 4h across the Sep/Oct line.
+        let s = anchored_store(&[("e_span", 1_790_805_600_000, 1_790_820_000_000)]);
+        let sep_anchor = 1_789_473_600_000;
+        let oct_anchor = 1_791_460_800_000;
+        assert_eq!(
+            entries_in_scope_at(&s, ExportScope::Month, sep_anchor, &utc()).len(),
+            1
+        );
+        assert!(
+            entries_in_scope_at(&s, ExportScope::Month, oct_anchor, &utc()).is_empty(),
+            "October must not repeat the September entry"
+        );
+        let csv = export_csv_at(&s, ExportScope::Month, sep_anchor, &utc());
+        assert_eq!(csv.lines().count(), 2, "header plus one row:\n{csv}");
+        assert!(
+            csv.contains("04:00:00") && csv.contains(",240,"),
+            "full duration, got:\n{csv}"
+        );
+    }
+
+    #[test]
+    fn overlapping_entries_appear_as_separate_rows_oldest_first() {
+        // Inserted newest-first on purpose: the export must still read oldest first.
+        let s = anchored_store(&[
+            ("e_late", 1_791_198_000_000, 1_791_205_200_000), // Mon 5 Oct 11:00-13:00
+            ("e_early", 1_791_194_400_000, 1_791_201_600_000), // Mon 5 Oct 10:00-12:00
+        ]);
+        let anchor = 1_791_460_800_000;
+        let ids: Vec<&str> = entries_in_scope_at(&s, ExportScope::Week, anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(ids, ["e_early", "e_late"]);
+        let csv = export_csv_at(&s, ExportScope::Week, anchor, &utc());
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "header plus one row per entry:\n{csv}");
+        assert!(lines[1].contains("e_early"), "oldest first, got:\n{csv}");
+        assert!(lines[2].contains("e_late"), "got:\n{csv}");
     }
 }
