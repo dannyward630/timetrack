@@ -46,10 +46,34 @@ enum Msg {
     /// A success worth showing (e.g. where an export was written). Snapshots
     /// never clear feedback, so this survives until the next action.
     Status(String),
+    /// An export save completed: the footer status plus where the bytes went
+    /// and whether the portal granted it, so the Export tab can label a host
+    /// path differently from the sandboxed fallback.
+    ExportSaved {
+        status: String,
+        dest: String,
+        via_portal: bool,
+    },
     /// An action succeeded. Snapshots never clear feedback (they arrive
     /// every second and would make errors unreadable), so success arrives as
     /// its own message that dismisses the previous error.
     ActionOk,
+}
+
+/// What an export save needs: the typed scope plus the paths and labels
+/// derived from it. Bundles the five `ExportCsv` fields so the click site,
+/// the action and the service thread pass one value instead of five loose
+/// strings (the scope stays typed end to end — nothing re-parses it).
+#[derive(Debug, Clone)]
+struct ExportRequest {
+    scope: timetrack_core::ExportScope,
+    /// Sandboxed fallback path when no portal answers.
+    path: String,
+    /// `None` is the old scope-only call; `Some` the scope-plus-anchor call.
+    anchor_ms: Option<i64>,
+    period_id: String,
+    /// Period-stamped name prefilled in the save dialog.
+    suggested_name: String,
 }
 
 /// A command the UI wants performed. The service thread owns the bus
@@ -101,13 +125,7 @@ enum Action {
     /// them. `suggested_name` is the period-stamped name prefilled in the
     /// dialog; `path` is the sandboxed fallback when no portal answers.
     /// `period_id` feeds the saved status line.
-    ExportCsv {
-        scope: String,
-        path: String,
-        anchor_ms: Option<i64>,
-        period_id: String,
-        suggested_name: String,
-    },
+    ExportCsv(ExportRequest),
     /// Launch the service binary. The GUI is a flatpak and cannot run host
     /// binaries itself, so this asks the session bus to activate it, which
     /// works when a D-Bus activation file is installed on the host.
@@ -222,13 +240,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         Ok(Action::MergeEntries { ids }) => {
                             report(&tx, client.merge(&ids).await.map(|_| ()));
                         }
-                        Ok(Action::ExportCsv {
-                            scope,
-                            path,
-                            anchor_ms,
-                            period_id,
-                            suggested_name,
-                        }) => {
+                        Ok(Action::ExportCsv(req)) => {
                             // The service refusal stays typed; a local write
                             // failure is a local note, not a service error.
                             // All time and current scopes travel over the old
@@ -237,9 +249,10 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                             // the scope-plus-anchor call, which against an old
                             // service refuses with a version message rather
                             // than writing a wrong file.
-                            let fetched = match anchor_ms {
-                                Some(at) => client.export_csv_at(&scope, at).await,
-                                None => client.export_csv(&scope).await,
+                            let scope_str = req.scope.as_str().to_string();
+                            let fetched = match req.anchor_ms {
+                                Some(at) => client.export_csv_at(&scope_str, at).await,
+                                None => client.export_csv(&scope_str).await,
                             };
                             match fetched {
                                 Ok(csv) => {
@@ -248,13 +261,16 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                     // location. Cancel is a quiet status that
                                     // writes nothing; no portal falls back to
                                     // the interim sandboxed write.
-                                    match resolve_export_destination(
-                                        portal_save_file(&suggested_name).await,
-                                        &path,
-                                    ) {
+                                    let outcome = portal_save_file(&req.suggested_name).await;
+                                    let via_portal = matches!(outcome, PortalOutcome::Granted(_));
+                                    match resolve_export_destination(outcome, &req.path) {
                                         Some(dest) => {
                                             let _ = tx.send(export_write_msg(
-                                                &csv, &dest, &scope, &period_id,
+                                                &csv,
+                                                &dest,
+                                                req.scope,
+                                                &req.period_id,
+                                                via_portal,
                                             ));
                                         }
                                         None => {
@@ -854,6 +870,9 @@ struct ExportPicker {
 
 impl ExportPicker {
     /// This week anchored at now: the common retrospective needs no typing.
+    /// The typed day starts in UTC (the default snapshot's zone) and is
+    /// re-mirrored from the snapshot zone on arrival via
+    /// [`ExportPicker::refresh_from_snapshot`].
     fn new(now_ms: i64) -> Self {
         let utc = timetrack_core::Tz::utc();
         ExportPicker {
@@ -950,85 +969,45 @@ impl ExportPicker {
             }
         }
     }
+
+    /// Re-mirror the typed day from the snapshot zone after a snapshot
+    /// arrives. Only the just-opened value is fixed: while the field is being
+    /// typed (`editing`) the text is the user's, never the mirror.
+    fn refresh_from_snapshot(&mut self, tz: &timetrack_core::Tz) {
+        if !self.editing {
+            self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        }
+    }
 }
 
 /// The anchor's local day as `YYYY-MM-DD`, the spelling the typed field and
-/// the CLI share.
+/// the CLI share. Thin wrapper over the shared core helper so the GUI mirror
+/// and the shifters cannot disagree about the day boundary.
 fn format_anchor_day(anchor_ms: i64, tz: &timetrack_core::Tz) -> String {
-    timetrack_core::format_local_iso8601(anchor_ms, tz)
-        .split('T')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    timetrack_core::anchor_day_string(anchor_ms, tz)
 }
 
 /// What the stepper sits on: the ISO week id, the month id, or all time
-/// (which has no id because its anchor is ignored).
+/// (which has no id because its anchor is ignored). Thin wrapper over the
+/// shared scope table so both UIs agree.
 fn export_period_label(
     scope: timetrack_core::ExportScope,
     anchor_ms: i64,
     tz: &timetrack_core::Tz,
 ) -> String {
-    match scope {
-        timetrack_core::ExportScope::Week => timetrack_core::week_id(anchor_ms, tz),
-        timetrack_core::ExportScope::Month => timetrack_core::month_id(anchor_ms, tz),
-        timetrack_core::ExportScope::All => "all time".to_string(),
-    }
+    scope.period_id(anchor_ms, tz)
 }
 
-/// Move the anchor one scope step per `delta`: seven days per week press (a
-/// midday anchor drifts at most an hour across a DST edge, so the local day
-/// stays exact), one calendar month per month press; all time is inert.
+/// Move the anchor one scope step per `delta`. Thin wrapper over the shared
+/// scope table: both week and month resolve through the day spelling, so a
+/// DST edge cannot move the anchor off midday.
 fn shift_export_anchor(
     scope: timetrack_core::ExportScope,
     anchor_ms: i64,
     delta: i32,
     tz: &timetrack_core::Tz,
 ) -> i64 {
-    match scope {
-        timetrack_core::ExportScope::Week => {
-            anchor_ms + delta as i64 * 7 * timetrack_core::MS_PER_DAY
-        }
-        timetrack_core::ExportScope::Month => shift_anchor_month(anchor_ms, delta, tz),
-        timetrack_core::ExportScope::All => anchor_ms,
-    }
-}
-
-/// Shift the anchor's calendar month, keeping the day where the month has
-/// one. Resolves through the terminal day spelling so a DST edge cannot move
-/// the anchor off its day.
-fn shift_anchor_month(anchor_ms: i64, delta: i32, tz: &timetrack_core::Tz) -> i64 {
-    let text = format_anchor_day(anchor_ms, tz);
-    let mut parts = text.split('-');
-    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
-        return anchor_ms;
-    };
-    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) else {
-        return anchor_ms;
-    };
-    let total = y * 12 + (m - 1) + delta as i64;
-    let new_y = total.div_euclid(12);
-    let new_m = total.rem_euclid(12) + 1;
-    let new_d = d.min(days_in_anchor_month(new_y, new_m));
-    let spelled = format!("{new_y:04}-{new_m:02}-{new_d:02}");
-    timetrack_core::parse_anchor_day(&spelled, "anchor", tz).unwrap_or(anchor_ms)
-}
-
-/// Leap years for the anchor month clamp (the core's rule, restated where it
-/// is used so the GUI needs no new core surface for one clamp).
-fn is_anchor_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-/// Length of a calendar month for the anchor month clamp.
-fn days_in_anchor_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_anchor_leap_year(year) => 29,
-        2 => 28,
-        _ => 30,
-    }
+    scope.shift(anchor_ms, delta, tz)
 }
 
 /// The three tabs (REQUIREMENTS §13).
@@ -1123,6 +1102,12 @@ pub struct TimetrackView {
     /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
     /// defaults to now at view creation; all time ignores it.
     export_picker: ExportPicker,
+    /// Where the last export save went, and whether the portal granted it.
+    /// `None` before the first save. Drives the Export tab's location line:
+    /// a portal grant names its host path, a fallback keeps the sandboxed
+    /// wording.
+    export_last_dest: Option<String>,
+    export_last_via_portal: bool,
 }
 
 /// The name prefilled in the system save dialog for a scope plus anchor
@@ -1251,17 +1236,27 @@ fn export_cancel_msg() -> Msg {
 /// core wording, while a failed write stays a local note with path and
 /// reason, never a service error. An existing destination is overwritten:
 /// the portal's own overwrite question already governed it, so there is
-/// exactly one prompt, never a second app confirm.
-fn export_write_msg(csv: &str, dest: &str, scope: &str, period_id: &str) -> Msg {
+/// exactly one prompt, never a second app confirm. The scope travels typed
+/// (nothing re-parses it); `via_portal` records whether the portal granted
+/// the path so the Export tab can label a host path differently from the
+/// sandboxed fallback.
+fn export_write_msg(
+    csv: &str,
+    dest: &str,
+    scope: timetrack_core::ExportScope,
+    period_id: &str,
+    via_portal: bool,
+) -> Msg {
     match std::fs::write(dest, csv) {
         Ok(()) => {
             let count = csv.lines().count().saturating_sub(1);
             let basename = dest.rsplit('/').next().unwrap_or(dest);
-            let status = match timetrack_core::ExportScope::parse(scope) {
-                Some(parsed) => export_saved_status(count, parsed, period_id, basename),
-                None => format!("exported {count} entries to {basename}"),
-            };
-            Msg::Status(status)
+            let status = export_saved_status(count, scope, period_id, basename);
+            Msg::ExportSaved {
+                status,
+                dest: dest.to_string(),
+                via_portal,
+            }
         }
         Err(e) => Msg::Error(StatusMsg {
             text: format!("could not write {dest}: {e}"),
@@ -1294,6 +1289,16 @@ fn export_location_label() -> &'static str {
     "Sandboxed save: writes inside the app sandbox"
 }
 
+/// The Export tab's location line given the last save: a portal grant wrote
+/// to a host path, so it says so with the path; anything else (fallback save
+/// or no save yet) keeps the sandboxed wording.
+fn export_location_text(last: Option<(&str, bool)>) -> String {
+    match last {
+        Some((dest, true)) => format!("Saved via system dialog: {dest}"),
+        _ => export_location_label().to_string(),
+    }
+}
+
 /// Status line after an interim save: entry count, scope, week or month id,
 /// and file base name, in the shared core wording.
 fn export_saved_status(
@@ -1318,11 +1323,7 @@ fn export_anchor_for_save(
 ) -> Option<i64> {
     match scope {
         timetrack_core::ExportScope::All => None,
-        _ if export_period_label(scope, anchor_ms, tz)
-            == export_period_label(scope, now_ms, tz) =>
-        {
-            None
-        }
+        _ if scope.period_id(anchor_ms, tz) == scope.period_id(now_ms, tz) => None,
         _ => Some(anchor_ms),
     }
 }
@@ -1330,38 +1331,22 @@ fn export_anchor_for_save(
 /// The rows the scoped export will hold, oldest first, over the snapshot's
 /// entries with the snapshot zone (spec #19).
 ///
-/// The same bucketing as the service (`started_at` wins per ADR-0002, all
-/// time ignores the anchor), so the preview shows what the file will hold
-/// without a second service call. The snapshot arrives newest first; the
-/// preview re-sorts oldest first, the order a stakeholder reads.
+/// Filters with the shared core predicate ([`timetrack_core::entry_in_scope`]:
+/// `started_at` wins per ADR-0002, all time ignores the anchor), so the
+/// preview shows what the file will hold without a second service call and
+/// cannot disagree with the service bucketing. The snapshot arrives newest
+/// first; the preview re-sorts oldest first, the order a stakeholder reads.
 fn export_preview_entries<'a>(
     snapshot: &'a Snapshot,
     scope: timetrack_core::ExportScope,
     anchor_ms: i64,
     tz: &timetrack_core::Tz,
 ) -> Vec<&'a timetrack_proto::EntryView> {
-    let mut out: Vec<&timetrack_proto::EntryView> = match scope {
-        timetrack_core::ExportScope::All => snapshot.entries.iter().collect(),
-        timetrack_core::ExportScope::Week => {
-            let week = timetrack_core::iso_week_of(tz.day_of(anchor_ms));
-            snapshot
-                .entries
-                .iter()
-                .filter(|e| {
-                    let d = tz.day_of(e.started_at);
-                    d >= week.start_day && d < week.start_day + 7
-                })
-                .collect()
-        }
-        timetrack_core::ExportScope::Month => {
-            let (year, month) = timetrack_core::month_of(tz.day_of(anchor_ms));
-            snapshot
-                .entries
-                .iter()
-                .filter(|e| timetrack_core::month_of(tz.day_of(e.started_at)) == (year, month))
-                .collect()
-        }
-    };
+    let mut out: Vec<&timetrack_proto::EntryView> = snapshot
+        .entries
+        .iter()
+        .filter(|e| timetrack_core::entry_in_scope(e.started_at, scope, anchor_ms, tz))
+        .collect();
     out.sort_by_key(|e| e.started_at);
     out
 }
@@ -1386,6 +1371,8 @@ impl TimetrackView {
             merge_confirm: None,
             delete_confirm: None,
             export_picker: ExportPicker::new(now_ms()),
+            export_last_dest: None,
+            export_last_via_portal: false,
         };
         view.schedule_poll(cx);
         view
@@ -1451,6 +1438,16 @@ impl TimetrackView {
                         self.snapshot = *s;
                         changed = true;
                     }
+                    // The typed day mirrors the anchor's local day: re-mirror
+                    // it from the snapshot zone now that a real zone exists.
+                    // User edits stay intact — only the just-opened value is
+                    // fixed (see `refresh_from_snapshot`).
+                    let tz = snapshot_tz(&self.snapshot);
+                    let before = self.export_picker.anchor_text.clone();
+                    self.export_picker.refresh_from_snapshot(&tz);
+                    if self.export_picker.anchor_text != before {
+                        changed = true;
+                    }
                     // A routine snapshot must not wipe feedback from the last
                     // action: snapshots arrive every second, so clearing here
                     // made error reports from the service thread unreadable.
@@ -1482,6 +1479,20 @@ impl TimetrackView {
                 Ok(Msg::Error(note)) => set_status(&mut self.status, note, &mut changed),
                 Ok(Msg::Status(note)) => {
                     set_status(&mut self.status, StatusMsg::local(note), &mut changed)
+                }
+                Ok(Msg::ExportSaved {
+                    status,
+                    dest,
+                    via_portal,
+                }) => {
+                    set_status(&mut self.status, StatusMsg::local(status), &mut changed);
+                    if self.export_last_dest.as_deref() != Some(dest.as_str())
+                        || self.export_last_via_portal != via_portal
+                    {
+                        self.export_last_dest = Some(dest);
+                        self.export_last_via_portal = via_portal;
+                        changed = true;
+                    }
                 }
                 Ok(Msg::ActionOk) => {
                     // A success dismisses the previous error -- but only one
@@ -1993,6 +2004,16 @@ impl TimetrackView {
     fn step_export_anchor(&mut self, delta: i32) {
         let tz = snapshot_tz(&self.snapshot);
         self.export_picker.step(delta, &tz);
+    }
+
+    /// The Export tab's location line: a portal grant names its host path,
+    /// anything else keeps the sandboxed wording.
+    fn export_location_text(&self) -> String {
+        export_location_text(
+            self.export_last_dest
+                .as_deref()
+                .map(|dest| (dest, self.export_last_via_portal)),
+        )
     }
 
     /// Handle a key press while the anchor day field is open. Always returns
@@ -3146,13 +3167,13 @@ impl TimetrackView {
                                         view.export_picker.anchor_ms,
                                         &tz,
                                     );
-                                    view.send(Action::ExportCsv {
-                                        scope: button_scope.as_str().to_string(),
+                                    view.send(Action::ExportCsv(ExportRequest {
+                                        scope: button_scope,
                                         path,
                                         anchor_ms,
                                         period_id,
                                         suggested_name,
-                                    });
+                                    }));
                                     cx.notify();
                                 });
                             })
@@ -3165,7 +3186,7 @@ impl TimetrackView {
                     .pt_1()
                     .text_sm()
                     .text_color(rgb(0x6a6a80))
-                    .child(export_location_label()),
+                    .child(self.export_location_text()),
             );
         }
 
@@ -3995,6 +4016,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn week_stepper_stays_at_midday_across_dst() {
+        // GUI pin of the core DST fix: stepping a week across Rome's spring
+        // forward must land at midday, not 11:00 drifting off the day.
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        let before = timetrack_core::parse_anchor_day("2026-03-22", "anchor", &rome).unwrap();
+        let after = shift_export_anchor(timetrack_core::ExportScope::Week, before, 1, &rome);
+        assert_eq!(format_anchor_day(after, &rome), "2026-03-29");
+        assert_eq!(timetrack_core::format_local_hm(after, &rome), "12:00");
+        let back = shift_export_anchor(timetrack_core::ExportScope::Week, after, -1, &rome);
+        assert_eq!(format_anchor_day(back, &rome), "2026-03-22");
+        assert_eq!(timetrack_core::format_local_hm(back, &rome), "12:00");
+    }
+
+    #[test]
+    fn typed_day_refreshes_from_the_snapshot_zone() {
+        // The picker opens on UTC (the default snapshot's zone); the first
+        // real snapshot re-mirrors the just-opened value, but never a day
+        // being typed.
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        // 2026-07-05 23:30 UTC is 2026-07-06 in Rome (+2): the UTC mirror
+        // shows the 5th, the Rome mirror the 6th.
+        let anchor = 1_783_294_200_000;
+        assert_eq!(format_anchor_day(anchor, &utc_tz()), "2026-07-05");
+        let mut picker = ExportPicker::new(anchor);
+        assert_eq!(picker.anchor_text, "2026-07-05");
+        picker.refresh_from_snapshot(&rome);
+        assert_eq!(picker.anchor_text, "2026-07-06");
+        // While typing, the user's text wins.
+        picker.start_editing();
+        picker.anchor_text = "2026-10-".to_string();
+        picker.refresh_from_snapshot(&utc_tz());
+        assert_eq!(picker.anchor_text, "2026-10-");
+    }
+
+    #[test]
+    fn location_line_names_a_portal_grant_path() {
+        // After a portal grant the tab names the host path it wrote to;
+        // fallback saves (and no save yet) keep the sandboxed wording.
+        assert_eq!(
+            export_location_text(Some(("/host/chosen.csv", true))),
+            "Saved via system dialog: /host/chosen.csv"
+        );
+        assert_eq!(
+            export_location_text(Some(("/sandbox/timetrack-export-all.csv", false))),
+            export_location_label()
+        );
+        assert_eq!(export_location_text(None), export_location_label());
+    }
+
     // --- scoped preview plus honest interim save (ticket #26) ---
 
     /// Three entries, newest first as the service sends them: one in
@@ -4334,11 +4405,25 @@ mod tests {
             std::env::temp_dir().join(format!("tt-portal-granted-{}-week.csv", std::process::id()));
         let dest_str = dest.to_string_lossy().into_owned();
         let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
-        match export_write_msg(&csv, &dest_str, "week", "2026-W41") {
-            Msg::Status(text) => assert_eq!(
-                text,
-                format!("exported 2 entries (week 2026-W41) to {basename}")
-            ),
+        match export_write_msg(
+            &csv,
+            &dest_str,
+            timetrack_core::ExportScope::Week,
+            "2026-W41",
+            true,
+        ) {
+            Msg::ExportSaved {
+                status,
+                dest: saved_dest,
+                via_portal,
+            } => {
+                assert_eq!(
+                    status,
+                    format!("exported 2 entries (week 2026-W41) to {basename}")
+                );
+                assert_eq!(saved_dest, dest_str);
+                assert!(via_portal);
+            }
             _ => panic!("a granted write reports success"),
         }
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), csv);
@@ -4404,9 +4489,15 @@ mod tests {
         let dest_str = dest.to_string_lossy().into_owned();
         let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
         std::fs::write(&dest, "old bytes").unwrap();
-        match export_write_msg(&csv, &dest_str, "week", "2026-W41") {
-            Msg::Status(text) => assert_eq!(
-                text,
+        match export_write_msg(
+            &csv,
+            &dest_str,
+            timetrack_core::ExportScope::Week,
+            "2026-W41",
+            true,
+        ) {
+            Msg::ExportSaved { status, .. } => assert_eq!(
+                status,
                 format!("exported 1 entries (week 2026-W41) to {basename}")
             ),
             Msg::Error(_) => panic!("an existing destination must be overwritten, not refused"),
@@ -4425,7 +4516,13 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let dest = dir.to_string_lossy().into_owned();
         let csv = format!("{}\n", timetrack_core::CSV_HEADER);
-        match export_write_msg(&csv, &dest, "week", "2026-W41") {
+        match export_write_msg(
+            &csv,
+            &dest,
+            timetrack_core::ExportScope::Week,
+            "2026-W41",
+            false,
+        ) {
             Msg::Error(note) => {
                 assert_eq!(note.kind, StatusKind::Local);
                 assert!(

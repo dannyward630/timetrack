@@ -27,7 +27,7 @@ pub enum ParseError {
     EmptyMoment(String),
     #[error("{what}: '{text}' is not a number of minutes ago")]
     BadRelative { what: String, text: String },
-    #[error("{what}: '{text}' is neither -90, 90, now, HH:MM nor YYYY-MM-DD")]
+    #[error("{what}: '{text}' is neither -90, 90, now nor HH:MM")]
     BadShape { what: String, text: String },
     #[error("{what}: '{text}' has a bad hour")]
     BadHour { what: String, text: String },
@@ -55,21 +55,22 @@ pub type ParseResult<T> = Result<T, ParseError>;
 
 /// Parse a moment given by a person, in milliseconds since the epoch.
 ///
-/// Four forms, covering what a person actually means:
+/// Three forms, covering what a person actually means:
 ///
 /// - `-90` — minutes relative to now, so `-90` is 90 minutes ago;
 /// - `90` — a bare positive number reads as minutes from now;
 /// - `09:30` — today at that wall-clock time, in local time;
-/// - `2026-10-12` — that calendar day at local midday, in local time;
 /// - `now` — this instant.
 ///
 /// `now_ms` is the caller's clock reading and `tz` the service's zone:
 /// `HH:MM` anchors on local midnight, not UTC midnight, or entries land hours
 /// out for anyone east or west of Greenwich. Midnight itself comes from the
 /// zone (`Tz::day_start`), so days either side of a DST transition still
-/// anchor on their own midnight. A calendar day resolves to local midday
-/// (not midnight) so midnight/DST edges cannot push the anchor into the
-/// wrong day.
+/// anchor on their own midnight.
+///
+/// Calendar days (`YYYY-MM-DD`) are deliberately refused here: only the
+/// export anchor path parses them (see [`parse_anchor_day`]), so `add -S`,
+/// edit, split and friends keep their main-branch behaviour.
 ///
 /// A leading `-` is why the CLI passes these through clap with
 /// `allow_hyphen_values`: `-90` is a perfectly ordinary thing to type.
@@ -92,14 +93,6 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult
     if let Ok(mins) = text.parse::<i64>() {
         // A bare positive number reads as "minutes from now".
         return Ok(now_ms + mins * 60_000);
-    }
-
-    // A calendar day (`YYYY-MM-DD`) resolves to local midday that day, so
-    // midnight/DST edges cannot shift it. Anything with a day-like
-    // separator that is not a valid day is refused as a day, naming the
-    // value, rather than falling through to the HH:MM shape error.
-    if text.contains('-') || text.contains('/') {
-        return parse_anchor_day(text, what, tz);
     }
 
     let (h, m) = text.split_once(':').ok_or_else(|| ParseError::BadShape {
@@ -133,8 +126,9 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult
 /// bucketing into the wrong day. Midday is safely inside the intended day
 /// in every zone.
 ///
-/// Also reached through [`parse_moment`], so the CLI and GUI share one
-/// spelling and cannot disagree.
+/// Only the export anchor path reaches this (`--at` on the CLI, the typed
+/// day on the Export tab): [`parse_moment`] deliberately refuses days so
+/// entry moments keep their main-branch behaviour.
 pub fn parse_anchor_day(text: &str, what: &str, tz: &Tz) -> ParseResult<i64> {
     let text = text.trim();
     if text.is_empty() {
@@ -350,7 +344,7 @@ mod tests {
     #[test]
     fn a_calendar_day_resolves_to_local_midday_utc() {
         // 2026-10-12 is a Monday; midday UTC is 12:00 that day.
-        let t = parse_moment("2026-10-12", "anchor", 0, &utc()).unwrap();
+        let t = parse_anchor_day("2026-10-12", "anchor", &utc()).unwrap();
         assert_eq!(t, 1_791_806_400_000);
         assert_eq!(format_local_hm(t, &utc()), "12:00");
         assert_eq!(utc().day_of(t), 20_738);
@@ -360,11 +354,11 @@ mod tests {
     fn a_calendar_day_resolves_to_midday_in_a_named_zone_summer_and_winter() {
         let rome = Tz::parse("Europe/Rome").unwrap();
         // 2026-07-15 12:00 Rome (CEST, +2) = 10:00 UTC.
-        let summer = parse_moment("2026-07-15", "anchor", 0, &rome).unwrap();
+        let summer = parse_anchor_day("2026-07-15", "anchor", &rome).unwrap();
         assert_eq!(summer, 1_784_109_600_000);
         assert_eq!(format_local_hm(summer, &rome), "12:00");
         // 2026-01-15 12:00 Rome (CET, +1) = 11:00 UTC.
-        let winter = parse_moment("2026-01-15", "anchor", 0, &rome).unwrap();
+        let winter = parse_anchor_day("2026-01-15", "anchor", &rome).unwrap();
         assert_eq!(winter, 1_768_474_800_000);
         assert_eq!(format_local_hm(winter, &rome), "12:00");
     }
@@ -373,11 +367,11 @@ mod tests {
     fn a_calendar_day_survives_dst_transition_days() {
         let rome = Tz::parse("Europe/Rome").unwrap();
         // Spring forward 2026-03-29 (23h day): noon is CEST (+2).
-        let spring = parse_moment("2026-03-29", "anchor", 0, &rome).unwrap();
+        let spring = parse_anchor_day("2026-03-29", "anchor", &rome).unwrap();
         assert_eq!(spring, 1_774_778_400_000);
         assert_eq!(format_local_hm(spring, &rome), "12:00");
         // Fall back 2026-10-25 (25h day): noon is CET (+1).
-        let autumn = parse_moment("2026-10-25", "anchor", 0, &rome).unwrap();
+        let autumn = parse_anchor_day("2026-10-25", "anchor", &rome).unwrap();
         assert_eq!(autumn, 1_792_926_000_000);
         assert_eq!(format_local_hm(autumn, &rome), "12:00");
     }
@@ -392,14 +386,20 @@ mod tests {
             "2026-1-5",
             "not-a-day",
         ] {
-            let e = parse_moment(bad, "anchor", 0, &utc()).unwrap_err().to_string();
+            let e = parse_anchor_day(bad, "anchor", &utc())
+                .unwrap_err()
+                .to_string();
             assert!(e.contains("anchor"), "{bad:?} should name the field: {e}");
             assert!(e.contains(bad), "{bad:?} should name the value: {e}");
         }
         // Empty names the field.
-        let e = parse_moment("", "anchor", 0, &utc()).unwrap_err().to_string();
+        let e = parse_anchor_day("", "anchor", &utc())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("anchor"), "empty should name the field: {e}");
-        let e = parse_moment("   ", "anchor", 0, &utc()).unwrap_err().to_string();
+        let e = parse_anchor_day("   ", "anchor", &utc())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("anchor"), "blank should name the field: {e}");
     }
 
@@ -409,7 +409,7 @@ mod tests {
         let rome = Tz::parse("Europe/Rome").unwrap();
         // 2026-10-12 is a Monday. The anchor resolves to midday, well inside
         // the day, while a 00:30 entry sits near the week edge.
-        let anchor = parse_moment("2026-10-12", "anchor", 0, &rome).unwrap();
+        let anchor = parse_anchor_day("2026-10-12", "anchor", &rome).unwrap();
         let monday_0030 = 1_791_757_800_000; // 2026-10-12 00:30 Rome (+2)
         assert_eq!(format_local_hm(monday_0030, &rome), "00:30");
         assert_eq!(
@@ -422,6 +422,23 @@ mod tests {
             iso_week_of(rome.day_of(monday_0030)),
             "and therefore the same ISO week"
         );
+    }
+
+    #[test]
+    fn calendar_days_are_refused_as_moments() {
+        // Regression: `YYYY-MM-DD` leaked into every moment field via
+        // `parse_moment`, so `add -S`, edit and split accepted midday days.
+        // Days belong to the export-anchor path only (`parse_anchor_day`).
+        for day in ["2026-10-12", "2026-01-15", "2026-13-01", "2026/10/12"] {
+            for what in ["start", "end", "at"] {
+                let e = parse_moment(day, what, 0, &utc()).unwrap_err().to_string();
+                assert!(
+                    e.contains(what),
+                    "{day:?} as {what} should name the field: {e}"
+                );
+                assert!(e.contains(day), "{day:?} should name the value: {e}");
+            }
+        }
     }
 
     #[test]

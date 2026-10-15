@@ -536,7 +536,10 @@ else
   bad "all ignores the anchor" "anchored all-time differed"
 fi
 contains "stdout export carries the header" "id,project,description" "$("$CLI" export --scope all)"
-contains "file export names the file" "exported to" "$("$CLI" export --scope all --out "$WORK/export-said.csv")"
+out=$("$CLI" export --scope all --out "$WORK/export-said.csv")
+contains "file export names the count" "exported " "$out"
+contains "file export names the scope and period" "(all time) to" "$out"
+contains "file export names the file" "export-said.csv" "$out"
 contains "old week spelling keeps working" "id,project" "$("$CLI" export --scope this-week | head -1)"
 out=$("$CLI" export --scope week --at bogus 2>&1); contains "bad anchor refused" "bogus" "$out"
 "$CLI" export --scope week --at bogus >/dev/null 2>&1 && bad "bad anchor exits non-zero" "exit 0" || ok "bad anchor exits non-zero"
@@ -585,9 +588,32 @@ check "interface is the new one" "org.sequ.timetrack.Entries" \
 printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
   && bad "stopwatch methods are gone" "Start/Stop/Cancel still exposed" \
   || ok "stopwatch methods are gone"
-for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived ExportCsv; do
+for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived ExportCsv ExportCsvAt; do
   printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
 done
+
+echo
+echo "== old/new export compat =="
+# Old-scope call against the new service still serves current periods (the
+# compat the rig can cover: only the new binary exists here, so there is no
+# old-service binary to run the new anchored call against in CI). The reverse
+# — a chosen anchor against an old service refusing with a version message
+# rather than serving a wrong file — is pinned at the CLI/proto seam by unit
+# test (`anchored_export_against_an_old_service_refuses_as_version_mismatch`,
+# `export_anchor_accepts_days_and_moments`), not gold-plated into e2e.
+"$CLI" export --scope week --out "$WORK/export-compat-week.csv" >/dev/null
+contains "old week call serves the current week" "id,project,description" "$(head -1 "$WORK/export-compat-week.csv")"
+"$CLI" export --scope month --out "$WORK/export-compat-month.csv" >/dev/null
+contains "old month call serves the current month" "id,project,description" "$(head -1 "$WORK/export-compat-month.csv")"
+"$CLI" export --scope all --out "$WORK/export-compat-all.csv" >/dev/null
+compat_week_rows=$(($(wc -l <"$WORK/export-compat-week.csv") - 1))
+compat_month_rows=$(($(wc -l <"$WORK/export-compat-month.csv") - 1))
+compat_all_rows=$(($(wc -l <"$WORK/export-compat-all.csv") - 1))
+if [ "$compat_week_rows" -le "$compat_all_rows" ] && [ "$compat_month_rows" -le "$compat_all_rows" ]; then
+  ok "old calls narrow all-time (week $compat_week_rows, month $compat_month_rows, all $compat_all_rows)"
+else
+  bad "old calls narrow all-time" "week=$compat_week_rows month=$compat_month_rows all=$compat_all_rows"
+fi
 
 echo
 echo "======================================"
