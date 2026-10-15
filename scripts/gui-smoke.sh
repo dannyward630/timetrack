@@ -28,8 +28,9 @@
 #   - deletes by keyboard with `d`: the first press only paints the
 #     confirmation, Escape cancels it with nothing deleted, and `d` `d`
 #     removes the entry and moves the total.
-#   - switches to the Export tab with `Tab` `Tab`, clicks "Export all" and
-#     asserts the CSV file landed with the spec header.
+#   - switches to the Export tab with `Tab` `Tab`, presses `[` and `]`
+#     asserting the anchor stepper repainted and returned, then clicks
+#     "Export all" and asserts the CSV file landed with the spec header.
 #   - cycles the three tabs with `Tab`, asserting the window changed and
 #     that three presses return it pixel-identical to Home.
 #
@@ -498,6 +499,29 @@ elif "$WORK/xtest" "$DISP" key 1; then
   shot export-tab.png
   EXPORTS=$(blobs export-tab.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45' | wc -l)
   check "three export buttons are drawn" "3" "$EXPORTS"
+  # The anchor picker (scope pills, stepper, typed day) is neutral, never
+  # action green, so the count above still holds with the picker painted.
+  # One press back a period must repaint the tab (the period label moves),
+  # and one press forward must bring it back pixel-identical. No save
+  # assertions here: preview and saving move in tickets 26+.
+  "$WORK/xtest" "$DISP" key bracketleft
+  sleep 1.5
+  shot export-prev.png
+  DIFF=$(magick compare -metric AE "$WORK/export-tab.png" "$WORK/export-prev.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the anchor stepper repainted the tab ($DIFF pixels changed)"
+  else
+    bad "the anchor stepper repainted the tab" "the tab is pixel-identical after ["
+  fi
+  "$WORK/xtest" "$DISP" key bracketright
+  sleep 1.5
+  shot export-back.png
+  DIFF=$(magick compare -metric AE "$WORK/export-tab.png" "$WORK/export-back.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" = "0" ]; then
+    ok "stepping back and forth returned the tab"
+  else
+    bad "stepping back and forth returned the tab" "$DIFF pixels differ"
+  fi
   # The rightmost button is "Export all".
   CLICK=$(blobs export-tab.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '3p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
   echo "  clicking ($CLICK)"
