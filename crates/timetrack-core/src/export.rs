@@ -91,6 +91,57 @@ pub fn entries_in_scope<'a>(
     out
 }
 
+/// Stable identity of the ISO week containing `anchor_ms` (`2026-W41`).
+///
+/// Monday-start per ISO 8601, resolved through `tz` so both UIs agree: the
+/// same anchor on either side of a zone boundary names different weeks. The
+/// year is the ISO year, so 2021-01-01 (a Friday) is `2020-W53` while
+/// 2026-01-01 (a Thursday) opens `2026-W01`.
+pub fn week_id(anchor_ms: i64, tz: &Tz) -> String {
+    let week = iso_week_of(tz.day_of(anchor_ms));
+    format!("{:04}-W{:02}", week.year, week.week)
+}
+
+/// Stable identity of the calendar month containing `anchor_ms` (`2026-09`).
+///
+/// The local month, not the ISO year: 2025-12-29 sits in ISO week `2026-W01`
+/// but still in month `2025-12`.
+pub fn month_id(anchor_ms: i64, tz: &Tz) -> String {
+    let (year, month) = month_of(tz.day_of(anchor_ms));
+    format!("{year:04}-{month:02}")
+}
+
+/// Default file name for saving an export of `scope` anchored at `anchor_ms`.
+///
+/// Week and month names carry their period id so one week never silently
+/// overwrites the last; all time ignores the anchor and takes the plain name.
+pub fn default_export_filename(scope: ExportScope, anchor_ms: i64, tz: &Tz) -> String {
+    match scope {
+        ExportScope::Week => format!("timetrack-export-week-{}.csv", week_id(anchor_ms, tz)),
+        ExportScope::Month => format!("timetrack-export-month-{}.csv", month_id(anchor_ms, tz)),
+        ExportScope::All => "timetrack-export-all.csv".to_string(),
+    }
+}
+
+/// Status line after a saved export, naming entry count, scope, period, and file.
+///
+/// All time has no period (its anchor is ignored), so `period_id` is unused
+/// there and the status reads `(all time)`.
+pub fn format_export_status(
+    entry_count: usize,
+    scope: ExportScope,
+    period_id: &str,
+    basename: &str,
+) -> String {
+    match scope {
+        ExportScope::All => format!("exported {entry_count} entries (all time) to {basename}"),
+        _ => format!(
+            "exported {entry_count} entries ({} {period_id}) to {basename}",
+            scope.as_str()
+        ),
+    }
+}
+
 /// Format a UTC instant as a local ISO 8601 timestamp without offset
 /// (`2026-09-29T14:00:00`), per §10.
 ///
@@ -336,5 +387,88 @@ mod tests {
         assert_eq!(ExportScope::parse("month"), Some(ExportScope::Month));
         assert_eq!(ExportScope::parse("all"), Some(ExportScope::All));
         assert_eq!(ExportScope::parse("everything"), None);
+    }
+
+    #[test]
+    fn week_id_formats_the_iso_week() {
+        // 2026-10-08 is the Thursday of ISO week 41 (Mon 5 Oct - Sun 11 Oct).
+        assert_eq!(week_id(1_791_460_800_000, &utc()), "2026-W41");
+    }
+
+    #[test]
+    fn week_id_follows_the_iso_year_across_january_first() {
+        // 2021-01-01 was a Friday, so it belongs to the last week of ISO
+        // year 2020; 2026-01-01 was a Thursday, opening ISO year 2026.
+        assert_eq!(week_id(1_609_502_400_000, &utc()), "2020-W53");
+        assert_eq!(week_id(1_767_268_800_000, &utc()), "2026-W01");
+        // ... and the Monday before it shares that week.
+        assert_eq!(week_id(1_767_009_600_000, &utc()), "2026-W01");
+    }
+
+    #[test]
+    fn week_id_uses_the_zone_offset() {
+        // 2026-07-05 23:30 UTC is Sunday in UTC but Monday 00:30 at UTC+1,
+        // so the two zones name different weeks for the same anchor.
+        let anchor = 1_783_294_200_000;
+        assert_eq!(week_id(anchor, &utc()), "2026-W27");
+        assert_eq!(week_id(anchor, &Tz::fixed_ms(3_600_000)), "2026-W28");
+    }
+
+    #[test]
+    fn month_id_formats_year_and_month() {
+        assert_eq!(month_id(1_789_473_600_000, &utc()), "2026-09");
+        assert_eq!(month_id(1_767_268_800_000, &utc()), "2026-01");
+        // The local month is not the ISO year: 2025-12-29 sits in ISO week
+        // 2026-W01 but still in calendar month 2025-12.
+        assert_eq!(week_id(1_767_009_600_000, &utc()), "2026-W01");
+        assert_eq!(month_id(1_767_009_600_000, &utc()), "2025-12");
+    }
+
+    #[test]
+    fn default_filenames_carry_the_period() {
+        assert_eq!(
+            default_export_filename(ExportScope::Week, 1_791_460_800_000, &utc()),
+            "timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            default_export_filename(ExportScope::Month, 1_789_473_600_000, &utc()),
+            "timetrack-export-month-2026-09.csv"
+        );
+        assert_eq!(
+            default_export_filename(ExportScope::All, 1_791_460_800_000, &utc()),
+            "timetrack-export-all.csv"
+        );
+    }
+
+    #[test]
+    fn export_status_names_count_scope_period_and_file() {
+        assert_eq!(
+            format_export_status(
+                12,
+                ExportScope::Week,
+                "2026-W41",
+                "timetrack-export-week-2026-W41.csv"
+            ),
+            "exported 12 entries (week 2026-W41) to timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            format_export_status(
+                3,
+                ExportScope::Month,
+                "2026-09",
+                "timetrack-export-month-2026-09.csv"
+            ),
+            "exported 3 entries (month 2026-09) to timetrack-export-month-2026-09.csv"
+        );
+    }
+
+    #[test]
+    fn export_status_for_all_time_names_no_period() {
+        // All time has no period (its anchor is ignored), so there is no
+        // period id to name — the status says so plainly.
+        assert_eq!(
+            format_export_status(5, ExportScope::All, "all", "timetrack-export-all.csv"),
+            "exported 5 entries (all time) to timetrack-export-all.csv"
+        );
     }
 }
