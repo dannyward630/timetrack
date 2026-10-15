@@ -51,7 +51,7 @@ pub use export::{
 pub use model::{
     Entry, EntrySource, MS_PER_DAY, Project, STORE_VERSION, Store, local_day_of, local_day_start,
 };
-pub use parse::{ParseError, ParseResult, format_local_hm, parse_duration, parse_moment};
+pub use parse::{ParseError, ParseResult, format_local_hm, parse_anchor_day, parse_duration, parse_moment};
 pub use rules::{
     Counter, Ids, QUICK_ADD_MS, RuleError, RuleResult, create_duration, create_entry,
     create_project, days_exceeding_24h, delete_entry, delete_project, format_merge_delta,
