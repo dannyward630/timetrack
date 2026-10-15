@@ -794,6 +794,209 @@ fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String>
     }
 }
 
+/// The Export tab's scope-plus-anchor picker (spec #19).
+///
+/// One shared anchor selects which week or month the stepper and the typed
+/// day point at; all time ignores it. The typed day accepts the terminal day
+/// spelling (`YYYY-MM-DD`) parsed with the snapshot zone, exactly like the
+/// CLI's `--at`. The three export buttons below keep calling the old
+/// scope-only path in this ticket (preview/save move in 26+), so this edits
+/// shared anchor state only.
+///
+/// Plain state over values like the entry dialog, so every transition is
+/// unit-testable without a window.
+#[derive(Debug, Clone)]
+struct ExportPicker {
+    scope: timetrack_core::ExportScope,
+    /// The instant selecting which week or month; ignored by all time.
+    anchor_ms: i64,
+    /// The typed day as shown in the field; mirrors the anchor's local day.
+    anchor_text: String,
+    /// Whether keystrokes go to the typed day field.
+    editing: bool,
+    /// The last bad day, shown inline; the anchor is unchanged.
+    error: Option<String>,
+}
+
+impl ExportPicker {
+    /// This week anchored at now: the common retrospective needs no typing.
+    fn new(now_ms: i64) -> Self {
+        let utc = timetrack_core::Tz::utc();
+        ExportPicker {
+            scope: timetrack_core::ExportScope::Week,
+            anchor_ms: now_ms,
+            anchor_text: format_anchor_day(now_ms, &utc),
+            editing: false,
+            error: None,
+        }
+    }
+
+    /// All time ignores the anchor, so its controls render inert.
+    fn is_active(&self) -> bool {
+        self.scope != timetrack_core::ExportScope::All
+    }
+
+    fn period_label(&self, tz: &timetrack_core::Tz) -> String {
+        export_period_label(self.scope, self.anchor_ms, tz)
+    }
+
+    /// Switch week/month/all, keeping the shared anchor; the typed day
+    /// re-mirrors it.
+    fn set_scope(&mut self, scope: timetrack_core::ExportScope, tz: &timetrack_core::Tz) {
+        self.scope = scope;
+        self.editing = false;
+        self.error = None;
+        self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+    }
+
+    /// One stepper press. Stepping leaves edit mode: the field mirrors the
+    /// anchor again.
+    fn step(&mut self, delta: i32, tz: &timetrack_core::Tz) {
+        if !self.is_active() {
+            return;
+        }
+        self.anchor_ms = shift_export_anchor(self.scope, self.anchor_ms, delta, tz);
+        self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        self.editing = false;
+        self.error = None;
+    }
+
+    /// Open the typed day field. Never for all time.
+    fn start_editing(&mut self) {
+        if !self.is_active() {
+            return;
+        }
+        self.editing = true;
+        self.error = None;
+    }
+
+    /// Close the field without committing, mirroring the anchor again.
+    fn cancel_editing(&mut self, tz: &timetrack_core::Tz) {
+        self.editing = false;
+        self.error = None;
+        self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+    }
+
+    /// Append typed text to the day field, clearing a stale error.
+    fn type_text(&mut self, ch: &str) {
+        if !self.editing || !self.is_active() {
+            return;
+        }
+        self.anchor_text.push_str(ch);
+        self.error = None;
+    }
+
+    /// Delete the last character of the day field.
+    fn backspace(&mut self) {
+        if !self.editing || !self.is_active() {
+            return;
+        }
+        self.anchor_text.pop();
+        self.error = None;
+    }
+
+    /// Commit the typed day: the terminal spelling parsed with the snapshot
+    /// zone. A bad day stays open with an inline error and the anchor is
+    /// unchanged.
+    fn commit(&mut self, tz: &timetrack_core::Tz) -> bool {
+        if !self.editing || !self.is_active() {
+            return false;
+        }
+        match timetrack_core::parse_anchor_day(&self.anchor_text, "anchor", tz) {
+            Ok(anchor) => {
+                self.anchor_ms = anchor;
+                self.anchor_text = format_anchor_day(anchor, tz);
+                self.error = None;
+                self.editing = false;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+}
+
+/// The anchor's local day as `YYYY-MM-DD`, the spelling the typed field and
+/// the CLI share.
+fn format_anchor_day(anchor_ms: i64, tz: &timetrack_core::Tz) -> String {
+    timetrack_core::format_local_iso8601(anchor_ms, tz)
+        .split('T')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// What the stepper sits on: the ISO week id, the month id, or all time
+/// (which has no id because its anchor is ignored).
+fn export_period_label(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
+    match scope {
+        timetrack_core::ExportScope::Week => timetrack_core::week_id(anchor_ms, tz),
+        timetrack_core::ExportScope::Month => timetrack_core::month_id(anchor_ms, tz),
+        timetrack_core::ExportScope::All => "all time".to_string(),
+    }
+}
+
+/// Move the anchor one scope step per `delta`: seven days per week press (a
+/// midday anchor drifts at most an hour across a DST edge, so the local day
+/// stays exact), one calendar month per month press; all time is inert.
+fn shift_export_anchor(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    delta: i32,
+    tz: &timetrack_core::Tz,
+) -> i64 {
+    match scope {
+        timetrack_core::ExportScope::Week => {
+            anchor_ms + delta as i64 * 7 * timetrack_core::MS_PER_DAY
+        }
+        timetrack_core::ExportScope::Month => shift_anchor_month(anchor_ms, delta, tz),
+        timetrack_core::ExportScope::All => anchor_ms,
+    }
+}
+
+/// Shift the anchor's calendar month, keeping the day where the month has
+/// one. Resolves through the terminal day spelling so a DST edge cannot move
+/// the anchor off its day.
+fn shift_anchor_month(anchor_ms: i64, delta: i32, tz: &timetrack_core::Tz) -> i64 {
+    let text = format_anchor_day(anchor_ms, tz);
+    let mut parts = text.split('-');
+    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        return anchor_ms;
+    };
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) else {
+        return anchor_ms;
+    };
+    let total = y * 12 + (m - 1) + delta as i64;
+    let new_y = total.div_euclid(12);
+    let new_m = total.rem_euclid(12) + 1;
+    let new_d = d.min(days_in_anchor_month(new_y, new_m));
+    let spelled = format!("{new_y:04}-{new_m:02}-{new_d:02}");
+    timetrack_core::parse_anchor_day(&spelled, "anchor", tz).unwrap_or(anchor_ms)
+}
+
+/// Leap years for the anchor month clamp (the core's rule, restated where it
+/// is used so the GUI needs no new core surface for one clamp).
+fn is_anchor_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Length of a calendar month for the anchor month clamp.
+fn days_in_anchor_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_anchor_leap_year(year) => 29,
+        2 => 28,
+        _ => 30,
+    }
+}
+
 /// The three tabs (REQUIREMENTS §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -883,6 +1086,9 @@ pub struct TimetrackView {
     /// A pending delete confirmation. Only `d` (confirm), escape (cancel)
     /// and `q` (quit) do anything while this is `Some`.
     delete_confirm: Option<DeleteConfirm>,
+    /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
+    /// defaults to now at view creation; all time ignores it.
+    export_picker: ExportPicker,
 }
 
 /// Where a GUI export lands by default.
@@ -914,6 +1120,7 @@ impl TimetrackView {
             split_prompt: None,
             merge_confirm: None,
             delete_confirm: None,
+            export_picker: ExportPicker::new(now_ms()),
         };
         view.schedule_poll(cx);
         view
@@ -1068,6 +1275,11 @@ impl TimetrackView {
         if self.split_prompt.is_some() {
             return self.on_split_key(ev);
         }
+        // The anchor day field owns the keyboard while it is being typed
+        // in, like the modal prompts do.
+        if self.export_picker.editing {
+            return self.on_anchor_key(ev);
+        }
         // A pending merge only listens for its own answer.
         if self.merge_confirm.is_some() {
             return self.on_merge_key(ev);
@@ -1115,6 +1327,25 @@ impl TimetrackView {
             // Split and merge (REQUIREMENTS §8).
             "s" => self.open_split_prompt(),
             "m" => self.open_merge_confirm(),
+
+            // Export anchor picker (spec #19): one press moves one period,
+            // and `t` opens the typed day. Only on the Export tab; elsewhere
+            // these keys stay unbound.
+            "[" => {
+                if self.tab == Tab::Export {
+                    self.step_export_anchor(-1);
+                }
+            }
+            "]" => {
+                if self.tab == Tab::Export {
+                    self.step_export_anchor(1);
+                }
+            }
+            "t" => {
+                if self.tab == Tab::Export {
+                    self.export_picker.start_editing();
+                }
+            }
 
             "h" => self.project_cursor = self.project_cursor.saturating_sub(1),
             "l" => {
@@ -1493,6 +1724,41 @@ impl TimetrackView {
         }
     }
 
+    /// Move the export anchor one period in `delta` (±1 per press).
+    fn step_export_anchor(&mut self, delta: i32) {
+        let tz = snapshot_tz(&self.snapshot);
+        self.export_picker.step(delta, &tz);
+    }
+
+    /// Handle a key press while the anchor day field is open. Always returns
+    /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_anchor_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                let tz = snapshot_tz(&self.snapshot);
+                self.export_picker.cancel_editing(&tz);
+            }
+            "enter" => {
+                let tz = snapshot_tz(&self.snapshot);
+                self.export_picker.commit(&tz);
+            }
+            "backspace" => self.export_picker.backspace(),
+            // Tab stays in the field: enter sets the day, escape cancels.
+            "tab" => {}
+            _ => {
+                // Printable text, and only that: same gate as the dialogs, so
+                // shortcuts and special keys never leak into the day.
+                let m = &ev.keystroke.modifiers;
+                if !m.control && !m.alt && !m.platform {
+                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
+                        self.export_picker.type_text(ch);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Add one of the quick-add buckets to the selected project.
     fn quick_add(&mut self, duration_ms: i64) {
         match self.current_project() {
@@ -1539,6 +1805,8 @@ impl TimetrackView {
                 "d to confirm the delete · esc to cancel".to_string()
             } else if self.project_prompt.is_some() {
                 "type a name · enter save · esc cancel".to_string()
+            } else if self.export_picker.editing {
+                "type a day YYYY-MM-DD · enter set · esc cancel".to_string()
             } else {
                 "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · tab tabs · j/k move · h/l project · q quit"
                     .to_string()
@@ -2337,6 +2605,79 @@ impl TimetrackView {
             .into_any_element()
     }
 
+    /// One scope pill on the Export tab. Neutral rather than green: green is
+    /// the export-action colour the smoke check counts.
+    fn render_scope_pill(
+        &self,
+        scope: timetrack_core::ExportScope,
+        id: &'static str,
+        label: &'static str,
+    ) -> impl IntoElement {
+        let selected = self.export_picker.scope == scope;
+        let entity = self.entity.clone();
+        div()
+            .id(ElementId::from(id))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(if selected {
+                rgba(0x2a2a3aff)
+            } else {
+                rgba(0x00000000)
+            })
+            .text_color(if selected {
+                rgb(0xffffff)
+            } else {
+                rgb(0x7a7a90)
+            })
+            .child(label)
+            .when_some(entity, move |el, entity| {
+                el.on_click(move |_ev, _window, cx| {
+                    entity.update(cx, |view, cx| {
+                        let tz = snapshot_tz(&view.snapshot);
+                        view.export_picker.set_scope(scope, &tz);
+                        cx.notify();
+                    });
+                })
+            })
+    }
+
+    /// One anchor stepper button. Inert (present but clickless) for all time,
+    /// which ignores the anchor. Neutral rather than green, as above.
+    fn render_step_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        delta: i32,
+    ) -> impl IntoElement {
+        let active = self.export_picker.is_active();
+        let entity = self.entity.clone();
+        let mut button = div()
+            .id(ElementId::from(id))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgba(0x3a3a4aff))
+            .text_color(if active { rgb(0xc8c8d8) } else { rgb(0x6a6a80) })
+            .child(label);
+        if active {
+            button = button
+                .cursor_pointer()
+                .when_some(entity, move |el, entity| {
+                    el.on_click(move |_ev, _window, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.step_export_anchor(delta);
+                            cx.notify();
+                        });
+                    })
+                });
+        } else {
+            button = button.cursor_default();
+        }
+        button
+    }
+
     /// Export. The service owns aggregation, so what is shown here is exactly
     /// what a CSV would contain, rather than a second aggregation that could
     /// disagree with the totals on Home.
@@ -2356,6 +2697,125 @@ impl TimetrackView {
             timetrack_core::format_duration(self.snapshot.week.total_ms),
             timetrack_core::format_duration(self.snapshot.total_ms),
         )));
+
+        // Scope plus anchor: the stepper and the typed day edit one shared
+        // anchor, and all time visibly ignores it. The export buttons below
+        // keep calling the old scope-only path until tickets 26+.
+        let tz = snapshot_tz(&self.snapshot);
+        let picker_active = self.export_picker.is_active();
+        body = body.child(
+            div()
+                .pt_4()
+                .text_sm()
+                .text_color(rgb(0x7a7a90))
+                .child("SCOPE"),
+        );
+        {
+            let mut row = div().flex().gap_2().pt_1();
+            for (scope, id, label) in [
+                (timetrack_core::ExportScope::Week, "scope-week", "Week"),
+                (timetrack_core::ExportScope::Month, "scope-month", "Month"),
+                (timetrack_core::ExportScope::All, "scope-all", "All"),
+            ] {
+                row = row.child(self.render_scope_pill(scope, id, label));
+            }
+            body = body.child(row);
+        }
+        body = body.child(
+            div()
+                .pt_3()
+                .text_sm()
+                .text_color(rgb(0x7a7a90))
+                .child("ANCHOR"),
+        );
+        {
+            let mut row = div().flex().items_center().gap_2().pt_1();
+            row = row.child(self.render_step_button("anchor-prev", "< prev", -1));
+            row = row.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_color(if picker_active {
+                        rgb(0xffffff)
+                    } else {
+                        rgb(0x6a6a80)
+                    })
+                    .child(self.export_picker.period_label(&tz)),
+            );
+            row = row.child(self.render_step_button("anchor-next", "next >", 1));
+            body = body.child(row);
+        }
+        {
+            let field_text = if self.export_picker.editing {
+                format!("{}_", self.export_picker.anchor_text)
+            } else {
+                self.export_picker.anchor_text.clone()
+            };
+            let entity = self.entity.clone();
+            let mut field = div()
+                .id(ElementId::from("anchor-field"))
+                .flex_1()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(if self.export_picker.editing {
+                    rgba(0x2a2a3aff)
+                } else {
+                    rgba(0x00000000)
+                })
+                .text_color(if picker_active {
+                    rgb(0xe6e6f0)
+                } else {
+                    rgb(0x6a6a80)
+                })
+                .child(format!("day {field_text}"));
+            if picker_active {
+                field = field.cursor_pointer().when_some(entity, |el, entity| {
+                    el.on_click(move |_ev, _window, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.export_picker.start_editing();
+                            cx.notify();
+                        });
+                    })
+                });
+            } else {
+                field = field.cursor_default();
+            }
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pt_1()
+                    .child(field)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x6a6a80))
+                            .child("(YYYY-MM-DD)"),
+                    ),
+            );
+        }
+        if picker_active {
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("t type a day · [ previous period · ] next period"),
+            );
+        } else {
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("anchor ignored for all time"),
+            );
+        }
+        if let Some(err) = &self.export_picker.error {
+            body = body.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+        }
 
         // The columns a CSV export will carry, shown as a header so the shape
         // is visible without opening a file.
@@ -3066,5 +3526,171 @@ mod tests {
         assert_eq!(bar_width(0, 3_600_000), 0.0);
         // No entries (or no time) anywhere: zero width, never NaN.
         assert_eq!(bar_width(0, 0), 0.0);
+    }
+
+    // --- export anchor picker (ticket #25) ---
+
+    fn utc_tz() -> timetrack_core::Tz {
+        timetrack_core::Tz::utc()
+    }
+
+    fn day_anchor(text: &str) -> i64 {
+        timetrack_core::parse_anchor_day(text, "anchor", &utc_tz()).unwrap()
+    }
+
+    #[test]
+    fn anchor_picker_defaults_to_this_week_at_now() {
+        // The anchor is now at view creation; week is the default scope, and
+        // the typed day mirrors the anchor's local day.
+        let now = 1_791_460_800_000; // Thu 8 Oct 2026 12:00 UTC
+        let picker = ExportPicker::new(now);
+        assert_eq!(picker.scope, timetrack_core::ExportScope::Week);
+        assert_eq!(picker.anchor_ms, now);
+        assert_eq!(picker.anchor_text, "2026-10-08");
+        assert!(picker.is_active());
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W41");
+    }
+
+    #[test]
+    fn week_stepper_moves_one_week_per_press_across_year_boundary() {
+        // 2026-01-01 was a Thursday opening ISO week 2026-W01; one press back
+        // lands in 2025-W52, and the label follows the core week id.
+        let mut picker = ExportPicker::new(day_anchor("2026-01-01"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W01");
+        picker.step(-1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2025-12-25"));
+        assert_eq!(picker.anchor_text, "2025-12-25");
+        assert_eq!(picker.period_label(&utc_tz()), "2025-W52");
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-01-01"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W01");
+    }
+
+    #[test]
+    fn month_stepper_moves_one_month_per_press_across_year_boundary() {
+        let mut picker = ExportPicker::new(day_anchor("2026-01-15"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W03");
+        picker.set_scope(timetrack_core::ExportScope::Month, &utc_tz());
+        assert_eq!(picker.period_label(&utc_tz()), "2026-01");
+        picker.step(-1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2025-12-15"));
+        assert_eq!(picker.anchor_text, "2025-12-15");
+        assert_eq!(picker.period_label(&utc_tz()), "2025-12");
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-01-15"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-01");
+    }
+
+    #[test]
+    fn month_stepper_clamps_to_short_months() {
+        // 2026 is not a leap year, so stepping back from 31 March lands on
+        // 28 February rather than spilling into March.
+        let mut picker = ExportPicker::new(day_anchor("2026-03-31"));
+        picker.set_scope(timetrack_core::ExportScope::Month, &utc_tz());
+        picker.step(-1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-02-28"));
+        assert_eq!(picker.anchor_text, "2026-02-28");
+    }
+
+    #[test]
+    fn typed_day_and_stepper_share_one_anchor() {
+        // Typing a day moves the same anchor the stepper moves: after the
+        // commit the label follows, and the next press steps from there.
+        let mut picker = ExportPicker::new(day_anchor("2026-10-08"));
+        picker.start_editing();
+        picker.anchor_text = "2026-10-12".to_string();
+        assert!(picker.commit(&utc_tz()));
+        assert_eq!(picker.anchor_ms, day_anchor("2026-10-12"));
+        assert_eq!(picker.anchor_text, "2026-10-12");
+        assert_eq!(picker.error, None);
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W42");
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-10-19"));
+        assert_eq!(picker.anchor_text, "2026-10-19");
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W43");
+    }
+
+    #[test]
+    fn bad_day_leaves_the_anchor_alone() {
+        let before = day_anchor("2026-10-08");
+        let mut picker = ExportPicker::new(before);
+        for bad in ["2026-13-01", "2026-02-30", "not-a-day", "2026-10"] {
+            picker.start_editing();
+            picker.anchor_text = bad.to_string();
+            assert!(!picker.commit(&utc_tz()), "{bad:?} must not commit");
+            assert_eq!(
+                picker.anchor_ms, before,
+                "{bad:?} must leave the anchor alone"
+            );
+            let err = picker.error.clone().expect("an inline error is shown");
+            assert!(err.contains("anchor"), "must name the field: {err}");
+            assert!(err.contains(bad), "must name the bad day: {err}");
+        }
+    }
+
+    #[test]
+    fn all_time_leaves_the_anchor_controls_inert() {
+        // All time ignores the anchor, so the stepper is a no-op and the
+        // field never opens there; the anchor itself is kept, not cleared.
+        let before = day_anchor("2026-10-08");
+        let mut picker = ExportPicker::new(before);
+        picker.set_scope(timetrack_core::ExportScope::All, &utc_tz());
+        assert!(!picker.is_active());
+        assert_eq!(picker.period_label(&utc_tz()), "all time");
+        picker.step(-1, &utc_tz());
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, before, "stepping all time moves nothing");
+        picker.start_editing();
+        assert!(!picker.editing, "the day field never opens for all time");
+        assert_eq!(picker.anchor_ms, before);
+    }
+
+    #[test]
+    fn switching_scope_keeps_the_anchor() {
+        let anchor = day_anchor("2026-09-15");
+        let mut picker = ExportPicker::new(anchor);
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W38");
+        picker.set_scope(timetrack_core::ExportScope::Month, &utc_tz());
+        assert_eq!(picker.anchor_ms, anchor);
+        assert_eq!(picker.anchor_text, "2026-09-15");
+        assert_eq!(picker.period_label(&utc_tz()), "2026-09");
+    }
+
+    #[test]
+    fn period_labels_use_the_core_week_and_month_ids() {
+        assert_eq!(
+            export_period_label(
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            "2026-W41"
+        );
+        assert_eq!(
+            export_period_label(
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-09-15"),
+                &utc_tz()
+            ),
+            "2026-09"
+        );
+        assert_eq!(
+            export_period_label(
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-09-15"),
+                &utc_tz()
+            ),
+            "all time"
+        );
+        assert_eq!(
+            shift_export_anchor(
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-09-15"),
+                1,
+                &utc_tz()
+            ),
+            day_anchor("2026-09-15"),
+            "all time ignores the anchor entirely"
+        );
     }
 }
