@@ -485,6 +485,62 @@ else
   bad "scoped exports narrow the rows" "week=$week_rows month=$month_rows all=$all_rows"
 fi
 out=$("$CLI" export --scope bogus 2>&1); contains "bad scope refused" "unknown export scope" "$out"
+# Chosen week/month via --at (ticket #24): 14 days back is always a different
+# ISO week from today and 40 days back always a different calendar month, in
+# any month, so these hold every day of the year. Kept entries, so `created`
+# tracks them for the exact counts elsewhere.
+"$CLI" add -p Work -S -20160 -E -20100 -d "chosen-week-old" >/dev/null; created=$((created+1))
+"$CLI" add -p Work -S -60 -E -30 -d "chosen-week-new" >/dev/null; created=$((created+1))
+"$CLI" add -p Work -S -57660 -E -57600 -d "chosen-month-old" >/dev/null; created=$((created+1))
+OLD_WEEK_DAY=$(date -u -d '14 days ago' +%F)
+NEW_DAY=$(date -u +%F)
+OLD_MONTH_DAY=$(date -u -d '40 days ago' +%F)
+"$CLI" export --scope week --at "$OLD_WEEK_DAY" --out "$WORK/export-chosen-week.csv" >/dev/null
+contains "chosen week holds the old entry" "chosen-week-old" "$(cat "$WORK/export-chosen-week.csv")"
+if grep -q "chosen-week-new" "$WORK/export-chosen-week.csv"; then
+  bad "chosen week excludes this week" "chosen-week-new leaked in"
+else
+  ok "chosen week excludes this week"
+fi
+"$CLI" export --scope week --at "$NEW_DAY" --out "$WORK/export-current-week.csv" >/dev/null
+contains "current week holds the new entry" "chosen-week-new" "$(cat "$WORK/export-current-week.csv")"
+if grep -q "chosen-week-old" "$WORK/export-current-week.csv"; then
+  bad "current week excludes the old week" "chosen-week-old leaked in"
+else
+  ok "current week excludes the old week"
+fi
+chosen_week_rows=$(($(wc -l <"$WORK/export-chosen-week.csv") - 1))
+if [ "$chosen_week_rows" -le "$all_rows" ]; then
+  ok "chosen week narrows all-time ($chosen_week_rows <= $all_rows)"
+else
+  bad "chosen week narrows all-time" "week=$chosen_week_rows all=$all_rows"
+fi
+"$CLI" export --scope month --at "$OLD_MONTH_DAY" --out "$WORK/export-chosen-month.csv" >/dev/null
+contains "chosen month holds the old entry" "chosen-month-old" "$(cat "$WORK/export-chosen-month.csv")"
+if grep -q "chosen-week-new" "$WORK/export-chosen-month.csv"; then
+  bad "chosen month excludes this month" "chosen-week-new leaked in"
+else
+  ok "chosen month excludes this month"
+fi
+chosen_month_rows=$(($(wc -l <"$WORK/export-chosen-month.csv") - 1))
+if [ "$chosen_month_rows" -le "$all_rows" ]; then
+  ok "chosen month narrows all-time ($chosen_month_rows <= $all_rows)"
+else
+  bad "chosen month narrows all-time" "month=$chosen_month_rows all=$all_rows"
+fi
+"$CLI" export --scope all --at "$OLD_MONTH_DAY" --out "$WORK/export-all-anchored.csv" >/dev/null
+"$CLI" export --scope all --out "$WORK/export-all-plain.csv" >/dev/null
+if cmp -s "$WORK/export-all-anchored.csv" "$WORK/export-all-plain.csv"; then
+  ok "all ignores the anchor"
+else
+  bad "all ignores the anchor" "anchored all-time differed"
+fi
+contains "stdout export carries the header" "id,project,description" "$("$CLI" export --scope all)"
+contains "file export names the file" "exported to" "$("$CLI" export --scope all --out "$WORK/export-said.csv")"
+contains "old week spelling keeps working" "id,project" "$("$CLI" export --scope this-week | head -1)"
+out=$("$CLI" export --scope week --at bogus 2>&1); contains "bad anchor refused" "bogus" "$out"
+"$CLI" export --scope week --at bogus >/dev/null 2>&1 && bad "bad anchor exits non-zero" "exit 0" || ok "bad anchor exits non-zero"
+"$CLI" export --scope bogus >/dev/null 2>&1 && bad "bad scope exits non-zero" "exit 0" || ok "bad scope exits non-zero"
 
 echo
 echo "== service aggregates agree on a large store =="
