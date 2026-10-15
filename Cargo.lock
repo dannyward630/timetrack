@@ -5787,6 +5787,7 @@ name = "timetrack-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd 0.11.1",
  "async-io",
  "gpui",
  "timetrack-core",

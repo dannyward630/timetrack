@@ -94,15 +94,19 @@ enum Action {
     /// before sending this.
     MergeEntries { ids: Vec<String> },
     /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
-    /// the CSV over D-Bus and writes it to `path`: `anchor_ms` selects which
-    /// week or month when `Some` (the scope-plus-anchor call), while `None`
-    /// keeps the old scope-only call for all time and current scopes so old
-    /// services keep serving them. `period_id` feeds the saved status line.
+    /// the CSV over D-Bus, asks the system save dialog where to put it, and
+    /// writes it there: `anchor_ms` selects which week or month when `Some`
+    /// (the scope-plus-anchor call), while `None` keeps the old scope-only
+    /// call for all time and current scopes so old services keep serving
+    /// them. `suggested_name` is the period-stamped name prefilled in the
+    /// dialog; `path` is the sandboxed fallback when no portal answers.
+    /// `period_id` feeds the saved status line.
     ExportCsv {
         scope: String,
         path: String,
         anchor_ms: Option<i64>,
         period_id: String,
+        suggested_name: String,
     },
     /// Launch the service binary. The GUI is a flatpak and cannot run host
     /// binaries itself, so this asks the session bus to activate it, which
@@ -223,6 +227,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                             path,
                             anchor_ms,
                             period_id,
+                            suggested_name,
                         }) => {
                             // The service refusal stays typed; a local write
                             // failure is a local note, not a service error.
@@ -237,28 +242,21 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                 None => client.export_csv(&scope).await,
                             };
                             match fetched {
-                                Ok(csv) => match std::fs::write(&path, &csv) {
-                                    Ok(()) => {
-                                        let count = csv.lines().count().saturating_sub(1);
-                                        let basename = path.rsplit('/').next().unwrap_or(&path);
-                                        let status =
-                                            match timetrack_core::ExportScope::parse(&scope) {
-                                                Some(parsed) => export_saved_status(
-                                                    count, parsed, &period_id, basename,
-                                                ),
-                                                None => format!(
-                                                    "exported {count} entries to {basename}"
-                                                ),
-                                            };
-                                        let _ = tx.send(Msg::Status(status));
+                                Ok(csv) => {
+                                    // The dialog opens after the fetch, so a
+                                    // service refusal never prompts for a
+                                    // location. Cancel sends nothing and the
+                                    // status stays untouched; no portal falls
+                                    // back to the interim sandboxed write.
+                                    if let Some(dest) = resolve_export_destination(
+                                        portal_save_file(&suggested_name).await,
+                                        &path,
+                                    ) {
+                                        let _ = tx.send(export_write_msg(
+                                            &csv, &dest, &scope, &period_id,
+                                        ));
                                     }
-                                    Err(e) => {
-                                        let _ = tx.send(Msg::Error(StatusMsg {
-                                            text: format!("could not write {path}: {e}"),
-                                            kind: StatusKind::Local,
-                                        }));
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
                                 }
@@ -1122,7 +1120,122 @@ pub struct TimetrackView {
     export_picker: ExportPicker,
 }
 
-/// Where a GUI export lands until the portal save dialog lands (ticket 27).
+/// The name prefilled in the system save dialog for a scope plus anchor
+/// (ticket 27): the period-stamped default, so one week never silently
+/// overwrites the last; all time ignores the anchor and keeps the plain name.
+fn export_suggested_name(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
+    timetrack_core::default_export_filename(scope, anchor_ms, tz)
+}
+
+/// What the system save dialog answered (ticket 27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortalOutcome {
+    /// The user confirmed: write through this granted path, never the
+    /// sandboxed fallback.
+    Granted(String),
+    /// The user cancelled: a quiet no-op, the status stays untouched.
+    Cancelled,
+    /// No portal answered (headless CI, non-flatpak run): the interim
+    /// sandboxed write runs on as the automatic fallback.
+    Unavailable,
+}
+
+/// Where the fetched CSV goes: the granted path on confirm, nowhere on
+/// cancel (`None` means the caller sends nothing), the sandboxed fallback
+/// when no portal is available.
+fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<String> {
+    match outcome {
+        PortalOutcome::Granted(granted) => Some(granted),
+        PortalOutcome::Cancelled => None,
+        PortalOutcome::Unavailable => Some(fallback.to_string()),
+    }
+}
+
+/// Headless-test seam for the save dialog (ticket 27).
+///
+/// When `TIMETRACK_PORTAL_STUB` is `record:<file>`, the requested dialog
+/// name is appended to `<file>` and the portal counts as unavailable, so
+/// headless runs exercise the dialog wiring (which name is requested) while
+/// the sandboxed fallback keeps working. Anything else is not a stub.
+fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> {
+    let log = stub.strip_prefix("record:")?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()?;
+    use std::io::Write;
+    writeln!(file, "{current_name}").ok()?;
+    Some(PortalOutcome::Unavailable)
+}
+
+/// Ask the system save dialog where to write an export (ticket 27).
+///
+/// The period-stamped `current_name` is prefilled so one week never silently
+/// overwrites the last; the portal's own overwrite question governs existing
+/// files, so there is exactly one prompt. Cancel is quiet (`Cancelled`);
+/// anything but a confirm or a cancel — no portal frontend, no session bus
+/// — counts as unavailable and the sandboxed fallback runs.
+async fn portal_save_file(current_name: &str) -> PortalOutcome {
+    if let Ok(stub) = std::env::var("TIMETRACK_PORTAL_STUB") {
+        if let Some(outcome) = portal_stub_outcome(&stub, current_name) {
+            return outcome;
+        }
+    }
+    let request = ashpd::desktop::file_chooser::SelectedFiles::save_file()
+        .title("Save export")
+        .current_name(current_name)
+        .send()
+        .await;
+    let files = match request {
+        Ok(request) => match request.response() {
+            Ok(files) => files,
+            Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
+                return PortalOutcome::Cancelled;
+            }
+            Err(_) => return PortalOutcome::Unavailable,
+        },
+        Err(_) => return PortalOutcome::Unavailable,
+    };
+    let Some(uri) = files.uris().first() else {
+        return PortalOutcome::Cancelled;
+    };
+    match uri.to_file_path() {
+        Ok(path) => PortalOutcome::Granted(path.to_string_lossy().into_owned()),
+        Err(_) => PortalOutcome::Unavailable,
+    }
+}
+
+/// Write fetched CSV bytes to `dest` and report the outcome as one message.
+///
+/// The granted portal path and the sandboxed fallback share this: success
+/// names count, scope, week or month id and file base name in the shared
+/// core wording, while a failed write stays a local note with path and
+/// reason, never a service error.
+fn export_write_msg(csv: &str, dest: &str, scope: &str, period_id: &str) -> Msg {
+    match std::fs::write(dest, csv) {
+        Ok(()) => {
+            let count = csv.lines().count().saturating_sub(1);
+            let basename = dest.rsplit('/').next().unwrap_or(dest);
+            let status = match timetrack_core::ExportScope::parse(scope) {
+                Some(parsed) => export_saved_status(count, parsed, period_id, basename),
+                None => format!("exported {count} entries to {basename}"),
+            };
+            Msg::Status(status)
+        }
+        Err(e) => Msg::Error(StatusMsg {
+            text: format!("could not write {dest}: {e}"),
+            kind: StatusKind::Local,
+        }),
+    }
+}
+
+/// Where a GUI export lands while the portal is unreachable (ticket 27
+/// fallback).
 ///
 /// The GUI is a flatpak, so `$HOME` is the sandbox, never the host home.
 /// The name carries the week or month id so one week never silently
@@ -1134,7 +1247,7 @@ fn default_export_path(
     tz: &timetrack_core::Tz,
 ) -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let name = timetrack_core::default_export_filename(scope, anchor_ms, tz);
+    let name = export_suggested_name(scope, anchor_ms, tz);
     format!("{home}/{name}")
 }
 
@@ -2967,6 +3080,8 @@ impl TimetrackView {
                 let entity = self.entity.clone();
                 let button_scope = *button_scope;
                 let path = default_export_path(button_scope, self.export_picker.anchor_ms, &tz);
+                let suggested_name =
+                    export_suggested_name(button_scope, self.export_picker.anchor_ms, &tz);
                 let label = format!("Export {}", button_scope.as_str());
                 row = row.child(
                     div()
@@ -2981,6 +3096,7 @@ impl TimetrackView {
                         .when_some(entity, move |el, entity| {
                             el.on_click(move |_ev, _window, cx| {
                                 let path = path.clone();
+                                let suggested_name = suggested_name.clone();
                                 entity.update(cx, |view, cx| {
                                     let tz = snapshot_tz(&view.snapshot);
                                     let anchor_ms = export_anchor_for_save(
@@ -2999,6 +3115,7 @@ impl TimetrackView {
                                         path,
                                         anchor_ms,
                                         period_id,
+                                        suggested_name,
                                     });
                                     cx.notify();
                                 });
@@ -4093,5 +4210,130 @@ mod tests {
             ),
             Some(anchor)
         );
+    }
+
+    // --- portal save dialog (ticket #27) ---
+
+    #[test]
+    fn portal_suggests_period_stamped_names() {
+        // The system save dialog opens with the period-stamped default name
+        // prefilled: the week or month id for scoped exports so one week
+        // never silently overwrites the last, the plain name for all time
+        // whatever the anchor is. The literals are the independent truth, not
+        // a recompute of the core naming.
+        assert_eq!(
+            export_suggested_name(
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            "timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            export_suggested_name(
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-09-15"),
+                &utc_tz()
+            ),
+            "timetrack-export-month-2026-09.csv"
+        );
+        for anchor in [day_anchor("2026-09-15"), day_anchor("2026-10-08")] {
+            assert_eq!(
+                export_suggested_name(timetrack_core::ExportScope::All, anchor, &utc_tz()),
+                "timetrack-export-all.csv"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_save_writes_through_the_granted_path() {
+        // A confirmed dialog wins over the sandboxed fallback: the bytes go
+        // to the path the portal granted, never to the fallback.
+        assert_eq!(
+            resolve_export_destination(
+                PortalOutcome::Granted("/host/chosen.csv".to_string()),
+                "/sandbox/timetrack-export-week-2026-W41.csv",
+            ),
+            Some("/host/chosen.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn cancelled_save_is_a_quiet_no_op() {
+        // Cancelling the dialog resolves to no destination at all: the
+        // caller sends nothing, so the current status stays untouched
+        // (ticket 28 pins the wording; there is none here).
+        assert_eq!(
+            resolve_export_destination(
+                PortalOutcome::Cancelled,
+                "/sandbox/timetrack-export-week-2026-W41.csv",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_portal_falls_back_to_the_sandboxed_path() {
+        // No portal (headless CI, non-flatpak run): the interim sandboxed
+        // write runs on, so the workflow never breaks where no dialog can
+        // open.
+        assert_eq!(
+            resolve_export_destination(
+                PortalOutcome::Unavailable,
+                "/sandbox/timetrack-export-week-2026-W41.csv",
+            ),
+            Some("/sandbox/timetrack-export-week-2026-W41.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn granted_path_write_lands_bytes_and_reports_status() {
+        // A confirmed save writes the already-fetched scoped CSV through the
+        // granted path and reports count, scope, week id and file base name
+        // in the shared core wording.
+        let csv = format!(
+            "{}\ne1,p1,review,2026-10-06T12:00:00,2026-10-06T13:00:00,01:00:00,60,manual,\ne2,p1,review,2026-10-07T12:00:00,2026-10-07T13:00:00,01:00:00,60,manual,\n",
+            timetrack_core::CSV_HEADER
+        );
+        let dest =
+            std::env::temp_dir().join(format!("tt-portal-granted-{}-week.csv", std::process::id()));
+        let dest_str = dest.to_string_lossy().into_owned();
+        let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
+        match export_write_msg(&csv, &dest_str, "week", "2026-W41") {
+            Msg::Status(text) => assert_eq!(
+                text,
+                format!("exported 2 entries (week 2026-W41) to {basename}")
+            ),
+            _ => panic!("a granted write reports success"),
+        }
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), csv);
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[test]
+    fn portal_stub_ignores_anything_else() {
+        assert_eq!(portal_stub_outcome("bogus", "x.csv"), None);
+        assert_eq!(portal_stub_outcome("", "x.csv"), None);
+    }
+
+    #[test]
+    fn portal_stub_records_the_dialog_name() {
+        // Headless-test seam: `record:<file>` logs the requested dialog
+        // name and reports the portal unavailable, so the sandboxed
+        // fallback runs where no live portal exists.
+        let log = std::env::temp_dir().join(format!("tt-portal-stub-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(
+            portal_stub_outcome(
+                &format!("record:{}", log.to_string_lossy()),
+                "timetrack-export-week-2026-W41.csv",
+            ),
+            Some(PortalOutcome::Unavailable)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "timetrack-export-week-2026-W41.csv\n"
+        );
+        std::fs::remove_file(&log).unwrap();
     }
 }

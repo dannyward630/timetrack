@@ -33,7 +33,9 @@
 #     empty week asserting the scoped preview emptied, then clicks
 #     "Export week" and asserts each period-stamped file landed with the
 #     right rows plus a footer status, and clicks "Export all" and asserts
-#     the CSV file landed with the spec header.
+#     the CSV file landed with the spec header. A portal stub records each
+#     save dialog's prefilled name, asserting the dialog wiring without a
+#     live portal (the files still land via the sandboxed fallback).
 #   - cycles the three tabs with `Tab`, asserting the window changed and
 #     that three presses return it pixel-identical to Home.
 #
@@ -212,6 +214,9 @@ echo
 echo "== the window paints =="
 (
   export DISPLAY=$DISP WAYLAND_DISPLAY= DBUS_SESSION_BUS_ADDRESS TZ=UTC HOME=$WORK
+  # Portal stub (ticket 27): no live portal exists headless, so the dialog
+  # records its prefilled name here and the sandboxed fallback runs on.
+  export TIMETRACK_PORTAL_STUB="record:$WORK/portal-names.log"
   # Empty WAYLAND_DISPLAY is deliberate: gpui picks Wayland when it is set and
   # non-empty, and there is no Wayland compositor on this display.
   # HOME points at the scratch dir so the Export buttons below write their
@@ -524,11 +529,12 @@ elif "$WORK/xtest" "$DISP" key 1; then
   else
     bad "stepping back and forth returned the tab" "$DIFF pixels differ"
   fi
-  # Scoped preview plus interim save: the preview shows the scoped rows
+  # Scoped preview plus portal save: the preview shows the scoped rows
   # oldest first, so stepping to a week with no entries must empty it (the
   # tab repaints again), and saving there must write that week's
-  # period-stamped file with the header alone. No portal assertions: the
-  # save is still the sandboxed interim write; the dialog lands later.
+  # period-stamped file with the header alone. The dialog itself is stubbed
+  # (see the launch env): the names it is offered are asserted after the
+  # "Export all" save below.
   "$WORK/xtest" "$DISP" key bracketleft
   sleep 1.5
   shot export-empty-week.png
@@ -556,12 +562,19 @@ elif "$WORK/xtest" "$DISP" key 1; then
   fi
   # A save reports a status in the footer: the footer band must repaint.
   # The exact wording is pinned by unit test; pixels only prove it appeared.
-  shot export-after-save.png
+  # Poll briefly: the repaint follows the service thread through the 300ms
+  # poll loop, so one screenshot can beat it on slow software rendering.
   WINDOW_H=$(echo "$WINDOW" | awk '{print $2}')
   FOOT="$(echo "$WINDOW" | awk '{print $1}')x40+${WINDOW_X}+$(( WINDOW_Y + WINDOW_H - 40 ))"
   magick "$WORK/export-before-save.png" -crop "$FOOT" +repage "$WORK/foot-before.png" 2>/dev/null
-  magick "$WORK/export-after-save.png" -crop "$FOOT" +repage "$WORK/foot-after.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/foot-before.png" "$WORK/foot-after.png" null: 2>&1 | sed 's/ .*//')
+  DIFF=0
+  for _ in $(seq 1 20); do
+    shot export-after-save.png
+    magick "$WORK/export-after-save.png" -crop "$FOOT" +repage "$WORK/foot-after.png" 2>/dev/null
+    DIFF=$(magick compare -metric AE "$WORK/foot-before.png" "$WORK/foot-after.png" null: 2>&1 | sed 's/ .*//')
+    [ "${DIFF:-0}" != "0" ] && break
+    sleep 0.5
+  done
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the save reported a status ($DIFF pixels changed)"
   else
@@ -591,6 +604,13 @@ elif "$WORK/xtest" "$DISP" key 1; then
   fi
   check "the GUI export has the spec header" "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note" "$(head -1 "$WORK/timetrack-export-all.csv" 2>/dev/null)"
   check "the GUI export holds both remaining entries" "3" "$(wc -l <"$WORK/timetrack-export-all.csv" 2>/dev/null)"
+  # Portal wiring (ticket 27): the stub recorded the dialog's prefilled name
+  # for each of the three saves above, and each must equal the period-stamped
+  # file the fallback wrote. No cancel/overwrite/failure assertions here:
+  # ticket 28 owns those.
+  for f in "$PREV_WEEK_FILE" "$CUR_WEEK_FILE" "$WORK/timetrack-export-all.csv"; do
+    contains "the dialog was offered $(basename "$f")" "$(basename "$f")" "$(cat "$WORK/portal-names.log" 2>/dev/null)"
+  done
   # Export -> Home, so the tab test below starts where it expects.
   "$WORK/xtest" "$DISP" key Tab
   sleep 1.5
