@@ -52,12 +52,15 @@ about where a week starts.
 | Overlap | counted twice, by design; a day over 24h is flagged, never rejected |
 | Projects | create, rename, archive and unarchive; archiving keeps the history in totals |
 | Persistence | atomic writes; survives restart; corrupt or newer stores are refused, never silently reset |
-| CSV export | week, month or all, from the CLI and the GUI Export tab |
+| CSV export | current or chosen week/month (`--at YYYY-MM-DD`, default now) or all time; the CLI prints or writes a file, the GUI Export tab saves through the system dialog with period-stamped names |
 | System tray | week-total tooltip with over-24h attention state, per-project quick-add / undo / delete-confirm, Open TimeTrack, Quit (host only) |
 
-**Not built yet.** The GUI Export tab writes
-`~/timetrack-export-<week|month|all>.csv` with no file picker yet (portal save
-dialog is the follow-up).
+The GUI Export tab picks the period with a previous/next stepper (labelled
+`2026-W41` / `2026-09`) plus a typed `YYYY-MM-DD` day, shows a preview of
+exactly what the file will hold (scoped rows, oldest first), and saves through
+the system save dialog — `timetrack-export-week-2026-W41.csv` and siblings by
+default, so one week never overwrites the last. Cancelling the dialog does
+nothing; without a portal it falls back to a sandboxed save that says so.
 
 ## Building
 
@@ -65,9 +68,9 @@ Requires Rust 1.85 or newer (the crates are edition 2024).
 
 ```sh
 cargo build --release
-cargo test --workspace        # 279 unit tests (GUI tests need the system libs below)
-bash scripts/e2e.sh           # 118 end-to-end checks against a real service
-bash scripts/gui-smoke.sh     # headless GUI: paint, quick-add click, keyboard, confirm dialogs, tabs
+cargo test --workspace        # 320+ unit tests (GUI tests need the system libs below)
+bash scripts/e2e.sh           # 139 end-to-end checks against a real service
+bash scripts/gui-smoke.sh     # 61 headless GUI checks: paint, quick-add click, keyboard, confirm dialogs, tabs, export picker/preview/save
 ```
 
 On Linux the GUI additionally needs the system libraries gpui links against:
@@ -220,6 +223,11 @@ timetrack quick -p Work -m 15                     # method 4: 5/15/30/60
 timetrack shorten e4 -E -45                       # move an endpoint, keep the entry
 timetrack undo e7                                 # only removes a quick-add
 timetrack delete e4                               # explicit
+
+timetrack export --scope week                     # this ISO week to stdout
+timetrack export --scope week --at 2026-10-05 --out oct2.csv  # a chosen week to a file
+timetrack export --scope month --at 2026-09-15    # a chosen month to stdout
+timetrack export --scope all                      # everything (`--at` ignored)
 ```
 
 Timestamps accept `-90` for "90 minutes ago" or `09:30` for that time today.
