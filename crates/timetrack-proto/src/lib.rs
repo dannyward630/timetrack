@@ -517,8 +517,27 @@ impl Client {
 
     /// CSV export (REQUIREMENTS §10). `scope` is `week`, `month` or `all`;
     /// returns the CSV text including the header row.
+    ///
+    /// This stays on the old `ExportCsv` call, anchored at now by the
+    /// service, so it works against both old and new services: current-period
+    /// behaviour never needs the new call.
     pub async fn export_csv(&self, scope: &str) -> Result<String, ClientError> {
         self.call1("ExportCsv", &scope).await
+    }
+
+    /// CSV export anchored at `anchor_ms` (REQUIREMENTS §10). `scope` is
+    /// `week`, `month` or `all`; the anchor selects which week or month and
+    /// is ignored by `all`.
+    ///
+    /// Wire compat (per ADR-0001): this speaks the new `ExportCsvAt` call.
+    /// Against an old service the call answers unknown-method/interface,
+    /// which sorts as [`ClientError::VersionMismatch`] — a version message,
+    /// never a wrong file. Current-period callers stay on [`Client::export_csv`]
+    /// (the old `ExportCsv` call), which works against both old and new
+    /// services; only a chosen anchor needs the new call, and only a chosen
+    /// anchor can meet an old service.
+    pub async fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, ClientError> {
+        self.call1("ExportCsvAt", &(scope, anchor_ms)).await
     }
 
     /// Poll until the service appears on the bus, or give up.
@@ -810,6 +829,32 @@ mod tests {
                 ClientError::VersionMismatch {
                     name: name.to_string()
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_export_against_an_old_service_refuses_as_version_mismatch() {
+        // `export_csv_at` speaks the new `ExportCsvAt` call, which an old
+        // service answers with unknown-method/interface. That must sort as a
+        // version refusal — a version message, never a wrong file — while
+        // current-period callers stay on `export_csv` (the old `ExportCsv`
+        // call), which works against both old and new services.
+        for name in [
+            "org.freedesktop.DBus.Error.UnknownInterface",
+            "org.freedesktop.DBus.Error.UnknownMethod",
+        ] {
+            let err = failed(name, None);
+            assert_eq!(
+                err,
+                ClientError::VersionMismatch {
+                    name: name.to_string()
+                },
+                "a chosen anchor against an old service must refuse, not serve now"
+            );
+            assert!(
+                err.to_string().contains("different versions"),
+                "version wording, got: {err}"
             );
         }
     }

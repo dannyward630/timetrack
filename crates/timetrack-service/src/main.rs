@@ -198,6 +198,18 @@ impl EntryIface {
             .map(|csv| encode(&csv))
             .map_err(to_dbus_err)
     }
+
+    /// CSV export anchored at `anchor_ms` (REQUIREMENTS §10). `scope` is
+    /// `week`, `month` or `all`; the anchor selects which week or month and
+    /// is ignored by `all`. The old `ExportCsv` stays as the now-anchored
+    /// wrapper, so old clients keep current-period behaviour.
+    #[zbus(name = "ExportCsvAt")]
+    fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> zbus::fdo::Result<Wire> {
+        self.0
+            .export_csv_at(scope, anchor_ms)
+            .map(|csv| encode(&csv))
+            .map_err(to_dbus_err)
+    }
 }
 
 /// zbus uses the async-io backend (see the workspace Cargo.toml), so the
