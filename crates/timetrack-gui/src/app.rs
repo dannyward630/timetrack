@@ -4508,7 +4508,7 @@ mod tests {
                     "granted path must be unwritable: {dest}"
                 );
             }
-            other => panic!("fail flag must grant an unwritable path"),
+            _other => panic!("fail flag must grant an unwritable path"),
         }
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
