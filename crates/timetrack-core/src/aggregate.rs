@@ -127,14 +127,20 @@ pub fn month_of(day: i64) -> (i64, u32) {
 }
 
 fn is_leap(y: i64) -> bool {
+    is_leap_year(y)
+}
+
+/// Whether `year` is a leap year (Gregorian rule).
+pub fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn days_in_month(year: i64, month: u32) -> i64 {
+/// Length of a calendar month, in days.
+pub fn days_in_month(year: i64, month: u32) -> i64 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if is_leap(year) => 29,
+        2 if is_leap_year(year) => 29,
         2 => 28,
         _ => 30,
     }

@@ -51,6 +51,88 @@ impl ExportScope {
             ExportScope::All => "all",
         }
     }
+
+    /// Stable identity of the period `anchor_ms` selects: the ISO week id,
+    /// the month id, or `all time` (which has no id because its anchor is
+    /// ignored). One table so the CLI, the GUI label and the saved status
+    /// cannot disagree.
+    pub fn period_id(self, anchor_ms: i64, tz: &Tz) -> String {
+        match self {
+            ExportScope::Week => week_id(anchor_ms, tz),
+            ExportScope::Month => month_id(anchor_ms, tz),
+            ExportScope::All => "all time".to_string(),
+        }
+    }
+
+    /// Move the anchor one scope step per `delta`: seven days per week press,
+    /// one calendar month per month press; all time is inert.
+    ///
+    /// Both week and month resolve through the day spelling
+    /// ([`crate::parse_anchor_day`]), so a DST edge cannot move the anchor
+    /// off midday: the week path re-midnights the shifted instant the same
+    /// way the month path always has.
+    pub fn shift(self, anchor_ms: i64, delta: i32, tz: &Tz) -> i64 {
+        match self {
+            ExportScope::All => anchor_ms,
+            ExportScope::Week => {
+                let shifted = anchor_ms + delta as i64 * 7 * MS_PER_DAY;
+                let spelled = anchor_day_string(shifted, tz);
+                crate::parse_anchor_day(&spelled, "anchor", tz).unwrap_or(shifted)
+            }
+            ExportScope::Month => shift_anchor_month(anchor_ms, delta, tz),
+        }
+    }
+}
+
+/// Whether one entry belongs in `scope` for `anchor_ms`.
+///
+/// The single bucketing predicate behind [`entries_in_scope_at`] and the GUI
+/// preview: the week is the ISO week containing the anchor, the month the
+/// calendar month containing it (both via `tz.day_of`); all time ignores the
+/// anchor. Each entry buckets by its `started_at` only, never split or
+/// duplicated (ADR-0002).
+pub fn entry_in_scope(started_at_ms: i64, scope: ExportScope, anchor_ms: i64, tz: &Tz) -> bool {
+    match scope {
+        ExportScope::All => true,
+        ExportScope::Week => {
+            let week = iso_week_of(tz.day_of(anchor_ms));
+            let d = tz.day_of(started_at_ms);
+            d >= week.start_day && d < week.start_day + 7
+        }
+        ExportScope::Month => month_of(tz.day_of(started_at_ms)) == month_of(tz.day_of(anchor_ms)),
+    }
+}
+
+/// The anchor's local day as `YYYY-MM-DD`, the spelling the typed field and
+/// the CLI share. One helper so the GUI mirror and the week/month shifters
+/// cannot disagree about the day boundary.
+pub fn anchor_day_string(anchor_ms: i64, tz: &Tz) -> String {
+    format_local_iso8601(anchor_ms, tz)
+        .split('T')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Shift the anchor's calendar month, keeping the day where the month has
+/// one. Resolves through the day spelling so a DST edge cannot move the
+/// anchor off its day; clamps to the month length via the shared
+/// [`crate::days_in_month`].
+fn shift_anchor_month(anchor_ms: i64, delta: i32, tz: &Tz) -> i64 {
+    let text = anchor_day_string(anchor_ms, tz);
+    let mut parts = text.split('-');
+    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
+        return anchor_ms;
+    };
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) else {
+        return anchor_ms;
+    };
+    let total = y * 12 + (m - 1) + delta as i64;
+    let new_y = total.div_euclid(12);
+    let new_m = total.rem_euclid(12) + 1;
+    let new_d = d.min(crate::days_in_month(new_y, new_m as u32));
+    let spelled = format!("{new_y:04}-{new_m:02}-{new_d:02}");
+    crate::parse_anchor_day(&spelled, "anchor", tz).unwrap_or(anchor_ms)
 }
 
 /// Header row, in field order.
@@ -72,27 +154,11 @@ pub fn entries_in_scope_at<'a>(
 ) -> Vec<&'a crate::Entry> {
     let mut out: Vec<&crate::Entry> = match scope {
         ExportScope::All => store.entries.iter().collect(),
-        ExportScope::Week => {
-            let anchor_day = tz.day_of(anchor_ms);
-            let week = iso_week_of(anchor_day);
-            store
-                .entries
-                .iter()
-                .filter(|e| {
-                    let d = tz.day_of(e.started_at);
-                    d >= week.start_day && d < week.start_day + 7
-                })
-                .collect()
-        }
-        ExportScope::Month => {
-            let anchor_day = tz.day_of(anchor_ms);
-            let (year, month) = month_of(anchor_day);
-            store
-                .entries
-                .iter()
-                .filter(|e| month_of(tz.day_of(e.started_at)) == (year, month))
-                .collect()
-        }
+        _ => store
+            .entries
+            .iter()
+            .filter(|e| entry_in_scope(e.started_at, scope, anchor_ms, tz))
+            .collect(),
     };
     out.sort_by_key(|e| e.started_at);
     out
@@ -183,8 +249,8 @@ pub fn format_local_iso8601(utc_ms: i64, tz: &Tz) -> String {
 
 /// Day index -> (year, month, day-of-month).
 fn day_to_ymd(day: i64) -> (i64, u32, u32) {
-    // Mirror aggregate.rs's walk so the two cannot disagree about month
-    // lengths; this is the inverse of its day_of_month.
+    // Same walk as aggregate.rs (the inverse of its day_of_month), using the
+    // shared month lengths so the two cannot disagree.
     let mut year = 1970;
     while days_to_year(year + 1) <= day && year < 10_000 {
         year += 1;
@@ -195,7 +261,7 @@ fn day_to_ymd(day: i64) -> (i64, u32, u32) {
     let mut doy = day - days_to_year(year);
     let mut month = 1;
     loop {
-        let len = days_in_month(year, month);
+        let len = crate::days_in_month(year, month);
         if doy < len {
             break;
         }
@@ -209,28 +275,14 @@ fn days_to_year(year: i64) -> i64 {
     let mut days = 0;
     if year >= 1970 {
         for y in 1970..year {
-            days += if is_leap(y) { 366 } else { 365 };
+            days += if crate::is_leap_year(y) { 366 } else { 365 };
         }
     } else {
         for y in year..1970 {
-            days -= if is_leap(y) { 366 } else { 365 };
+            days -= if crate::is_leap_year(y) { 366 } else { 365 };
         }
     }
     days
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn days_in_month(year: i64, month: u32) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap(year) => 29,
-        2 => 28,
-        _ => 30,
-    }
 }
 
 /// Escape one CSV field (RFC 4180 minimal): quote when it contains
@@ -505,6 +557,86 @@ mod tests {
             format_export_status(5, ExportScope::All, "all", "timetrack-export-all.csv"),
             "exported 5 entries (all time) to timetrack-export-all.csv"
         );
+    }
+
+    #[test]
+    fn scope_period_id_names_week_month_or_all_time() {
+        assert_eq!(
+            ExportScope::Week.period_id(1_791_460_800_000, &utc()),
+            "2026-W41"
+        );
+        assert_eq!(
+            ExportScope::Month.period_id(1_789_473_600_000, &utc()),
+            "2026-09"
+        );
+        assert_eq!(
+            ExportScope::All.period_id(1_791_460_800_000, &utc()),
+            "all time"
+        );
+    }
+
+    #[test]
+    fn scope_shift_moves_weeks_months_or_nothing() {
+        let day = |text: &str| crate::parse_anchor_day(text, "anchor", &utc()).unwrap();
+        assert_eq!(
+            ExportScope::Week.shift(day("2026-01-01"), -1, &utc()),
+            day("2025-12-25")
+        );
+        assert_eq!(
+            ExportScope::Month.shift(day("2026-01-15"), -1, &utc()),
+            day("2025-12-15")
+        );
+        assert_eq!(
+            ExportScope::Month.shift(day("2026-03-31"), -1, &utc()),
+            day("2026-02-28")
+        );
+        assert_eq!(
+            ExportScope::All.shift(day("2026-09-15"), 1, &utc()),
+            day("2026-09-15")
+        );
+    }
+
+    #[test]
+    fn scope_week_shift_stays_at_midday_across_dst() {
+        // Spring forward 2026-03-29 (Rome): a fixed +7d in UTC would land at
+        // 11:00 local; the shifter re-middays through the zone like months do.
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        let before = crate::parse_anchor_day("2026-03-22", "anchor", &rome).unwrap();
+        let after = ExportScope::Week.shift(before, 1, &rome);
+        assert_eq!(anchor_day_string(after, &rome), "2026-03-29");
+        assert_eq!(crate::format_local_hm(after, &rome), "12:00");
+        // And back again across the same edge.
+        let back = ExportScope::Week.shift(after, -1, &rome);
+        assert_eq!(anchor_day_string(back, &rome), "2026-03-22");
+        assert_eq!(crate::format_local_hm(back, &rome), "12:00");
+        // Fall back 2026-10-25: same pin the other way.
+        let before = crate::parse_anchor_day("2026-10-18", "anchor", &rome).unwrap();
+        let after = ExportScope::Week.shift(before, 1, &rome);
+        assert_eq!(anchor_day_string(after, &rome), "2026-10-25");
+        assert_eq!(crate::format_local_hm(after, &rome), "12:00");
+    }
+
+    #[test]
+    fn entry_predicate_matches_the_scoped_store_query() {
+        // The GUI preview filters snapshots with this; the store query must
+        // agree exactly, or the preview lies about the file.
+        let s = anchored_store(&[
+            ("e_mon", 1_791_194_400_000, 1_791_198_000_000),
+            ("e_next", 1_791_799_200_000, 1_791_802_800_000),
+        ]);
+        let anchor = 1_791_460_800_000;
+        let via_store: Vec<&str> = entries_in_scope_at(&s, ExportScope::Week, anchor, &utc())
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        let via_predicate: Vec<&str> = s
+            .entries
+            .iter()
+            .filter(|e| entry_in_scope(e.started_at, ExportScope::Week, anchor, &utc()))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(via_store, via_predicate);
+        assert_eq!(via_store, ["e_mon"]);
     }
 
     fn anchored_store(rows: &[(&str, i64, i64)]) -> Store {
