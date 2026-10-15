@@ -606,11 +606,81 @@ elif "$WORK/xtest" "$DISP" key 1; then
   check "the GUI export holds both remaining entries" "3" "$(wc -l <"$WORK/timetrack-export-all.csv" 2>/dev/null)"
   # Portal wiring (ticket 27): the stub recorded the dialog's prefilled name
   # for each of the three saves above, and each must equal the period-stamped
-  # file the fallback wrote. No cancel/overwrite/failure assertions here:
-  # ticket 28 owns those.
+  # file the fallback wrote.
   for f in "$PREV_WEEK_FILE" "$CUR_WEEK_FILE" "$WORK/timetrack-export-all.csv"; do
     contains "the dialog was offered $(basename "$f")" "$(basename "$f")" "$(cat "$WORK/portal-names.log" 2>/dev/null)"
   done
+  # Portal edges (ticket 28, still stubbed, no live portal): the dialog
+  # stays period-stamped throughout; overwrite needs only the portal's own
+  # question, cancel is a quiet no-op that writes nothing, and a failed
+  # write is a local error. Picker, preview, and fallback choice are
+  # untouched: these pins only touch the `<log>.cancel`/`<log>.fail` switches.
+  # Overwrite: saving the current week again offers the dialog once more and
+  # overwrites the same fallback file in place (no second app confirm).
+  LINES_BEFORE=$(wc -l <"$WORK/portal-names.log")
+  shot export-before-overwrite.png
+  CLICK=$(blobs export-before-overwrite.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK)"
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  for _ in $(seq 1 30); do [ "$(wc -l <"$WORK/portal-names.log")" -gt "$LINES_BEFORE" ] && break; sleep 0.3; done
+  check "an existing destination only asks the portal once more" "$((LINES_BEFORE+1))" "$(wc -l <"$WORK/portal-names.log" 2>/dev/null)"
+  check "overwriting keeps one file per week" "2" "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)"
+  check "the overwritten week file still holds both entries" "3" "$(wc -l <"$CUR_WEEK_FILE" 2>/dev/null)"
+  contains "the overwrite dialog kept the period-stamped name" "$(basename "$CUR_WEEK_FILE")" "$(tail -1 "$WORK/portal-names.log" 2>/dev/null)"
+  # Cancel: the next stubbed save answers Cancelled: the dialog is still
+  # offered, no file appears, and the footer repaints with the quiet status
+  # (the exact wording is pinned by unit test; pixels only prove it appeared
+  # and was not an error-styled failure).
+  touch "$WORK/portal-names.log.cancel"
+  shot export-before-cancel.png
+  magick "$WORK/export-before-cancel.png" -crop "$FOOT" +repage "$WORK/foot-before-cancel.png" 2>/dev/null
+  WEEK_COUNT_BEFORE=$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)
+  CLICK=$(blobs export-before-cancel.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK)"
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  sleep 3
+  check "cancel writes no new file" "$WEEK_COUNT_BEFORE" "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)"
+  contains "cancel still offered the dialog" "$(basename "$CUR_WEEK_FILE")" "$(tail -1 "$WORK/portal-names.log" 2>/dev/null)"
+  DIFF=0
+  for _ in $(seq 1 20); do
+    shot export-after-cancel.png
+    magick "$WORK/export-after-cancel.png" -crop "$FOOT" +repage "$WORK/foot-after-cancel.png" 2>/dev/null
+    DIFF=$(magick compare -metric AE "$WORK/foot-before-cancel.png" "$WORK/foot-after-cancel.png" null: 2>&1 | sed 's/ .*//')
+    [ "${DIFF:-0}" != "0" ] && break
+    sleep 0.5
+  done
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "cancel left a quiet status ($DIFF pixels changed)"
+  else
+    bad "cancel left a quiet status" "the footer is pixel-identical after cancel"
+  fi
+  rm -f "$WORK/portal-names.log.cancel"
+  # Failure: the next stubbed save grants an unwritable path: the dialog is
+  # still offered, no fallback file appears, and the footer repaints with the
+  # local error (path plus reason pinned by unit test, never service wording).
+  touch "$WORK/portal-names.log.fail"
+  shot export-before-fail.png
+  magick "$WORK/export-before-fail.png" -crop "$FOOT" +repage "$WORK/foot-before-fail.png" 2>/dev/null
+  CLICK=$(blobs export-before-fail.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK)"
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  sleep 3
+  check "a failed write leaves the week files alone" "2" "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)"
+  contains "the failed dialog kept the period-stamped name" "$(basename "$CUR_WEEK_FILE")" "$(tail -1 "$WORK/portal-names.log" 2>/dev/null)"
+  DIFF=0
+  for _ in $(seq 1 20); do
+    shot export-after-fail.png
+    magick "$WORK/export-after-fail.png" -crop "$FOOT" +repage "$WORK/foot-after-fail.png" 2>/dev/null
+    DIFF=$(magick compare -metric AE "$WORK/foot-before-fail.png" "$WORK/foot-after-fail.png" null: 2>&1 | sed 's/ .*//')
+    [ "${DIFF:-0}" != "0" ] && break
+    sleep 0.5
+  done
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "a failed write reported a status ($DIFF pixels changed)"
+  else
+    bad "a failed write reported a status" "the footer is pixel-identical after the failed write"
+  fi
+  rm -f "$WORK/portal-names.log.fail"
   # Export -> Home, so the tab test below starts where it expects.
   "$WORK/xtest" "$DISP" key Tab
   sleep 1.5

@@ -245,16 +245,21 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                 Ok(csv) => {
                                     // The dialog opens after the fetch, so a
                                     // service refusal never prompts for a
-                                    // location. Cancel sends nothing and the
-                                    // status stays untouched; no portal falls
-                                    // back to the interim sandboxed write.
-                                    if let Some(dest) = resolve_export_destination(
+                                    // location. Cancel is a quiet status that
+                                    // writes nothing; no portal falls back to
+                                    // the interim sandboxed write.
+                                    match resolve_export_destination(
                                         portal_save_file(&suggested_name).await,
                                         &path,
                                     ) {
-                                        let _ = tx.send(export_write_msg(
-                                            &csv, &dest, &scope, &period_id,
-                                        ));
+                                        Some(dest) => {
+                                            let _ = tx.send(export_write_msg(
+                                                &csv, &dest, &scope, &period_id,
+                                            ));
+                                        }
+                                        None => {
+                                            let _ = tx.send(export_cancel_msg());
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1137,7 +1142,8 @@ enum PortalOutcome {
     /// The user confirmed: write through this granted path, never the
     /// sandboxed fallback.
     Granted(String),
-    /// The user cancelled: a quiet no-op, the status stays untouched.
+    /// The user cancelled: a quiet no-op status, writes nothing, never an
+    /// error (ticket 28).
     Cancelled,
     /// No portal answered (headless CI, non-flatpak run): the interim
     /// sandboxed write runs on as the automatic fallback.
@@ -1145,8 +1151,8 @@ enum PortalOutcome {
 }
 
 /// Where the fetched CSV goes: the granted path on confirm, nowhere on
-/// cancel (`None` means the caller sends nothing), the sandboxed fallback
-/// when no portal is available.
+/// cancel (`None` means the caller sends the quiet cancel status and writes
+/// nothing), the sandboxed fallback when no portal is available.
 fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<String> {
     match outcome {
         PortalOutcome::Granted(granted) => Some(granted),
@@ -1155,12 +1161,19 @@ fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<
     }
 }
 
-/// Headless-test seam for the save dialog (ticket 27).
+/// Headless-test seam for the save dialog (tickets 27-28).
 ///
 /// When `TIMETRACK_PORTAL_STUB` is `record:<file>`, the requested dialog
 /// name is appended to `<file>` and the portal counts as unavailable, so
 /// headless runs exercise the dialog wiring (which name is requested) while
 /// the sandboxed fallback keeps working. Anything else is not a stub.
+///
+/// Edge-mode switches for the ticket-28 pins, still with no live portal:
+/// touching `<file>.cancel` makes the next stubbed save answer Cancelled
+/// (quiet no-op, writes nothing), and `<file>.fail` grants a path whose
+/// parent does not exist (local error naming path plus reason). Both still
+/// log the requested name first, so the dialog wiring stays pinned. Only
+/// when the stub is active, so production never sees this.
 fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> {
     let log = stub.strip_prefix("record:")?;
     let mut file = std::fs::OpenOptions::new()
@@ -1170,6 +1183,14 @@ fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> 
         .ok()?;
     use std::io::Write;
     writeln!(file, "{current_name}").ok()?;
+    if std::path::Path::new(&format!("{log}.cancel")).exists() {
+        return Some(PortalOutcome::Cancelled);
+    }
+    if std::path::Path::new(&format!("{log}.fail")).exists() {
+        return Some(PortalOutcome::Granted(format!(
+            "/nonexistent-timetrack-gui/{current_name}"
+        )));
+    }
     Some(PortalOutcome::Unavailable)
 }
 
@@ -1210,12 +1231,27 @@ async fn portal_save_file(current_name: &str) -> PortalOutcome {
     }
 }
 
+/// Quiet status after cancelling the system save dialog (ticket 28).
+///
+/// A no-op, never an error: changing your mind is not a failure, so this
+/// travels as `Msg::Status`, writes nothing, and names no path.
+fn export_cancelled_status() -> &'static str {
+    "export cancelled"
+}
+
+/// The cancel outcome as one message: a quiet status, never error-styled.
+fn export_cancel_msg() -> Msg {
+    Msg::Status(export_cancelled_status().to_string())
+}
+
 /// Write fetched CSV bytes to `dest` and report the outcome as one message.
 ///
 /// The granted portal path and the sandboxed fallback share this: success
 /// names count, scope, week or month id and file base name in the shared
 /// core wording, while a failed write stays a local note with path and
-/// reason, never a service error.
+/// reason, never a service error. An existing destination is overwritten:
+/// the portal's own overwrite question already governed it, so there is
+/// exactly one prompt, never a second app confirm.
 fn export_write_msg(csv: &str, dest: &str, scope: &str, period_id: &str) -> Msg {
     match std::fs::write(dest, csv) {
         Ok(()) => {
@@ -4261,8 +4297,7 @@ mod tests {
     #[test]
     fn cancelled_save_is_a_quiet_no_op() {
         // Cancelling the dialog resolves to no destination at all: the
-        // caller sends nothing, so the current status stays untouched
-        // (ticket 28 pins the wording; there is none here).
+        // caller sends the quiet cancel status instead and writes nothing.
         assert_eq!(
             resolve_export_destination(
                 PortalOutcome::Cancelled,
@@ -4335,5 +4370,151 @@ mod tests {
             "timetrack-export-week-2026-W41.csv\n"
         );
         std::fs::remove_file(&log).unwrap();
+    }
+
+    // --- portal cancel, overwrite, and failure behavior (ticket #28) ---
+
+    #[test]
+    fn cancel_reports_a_quiet_status() {
+        // Cancelling the save dialog is a quiet no-op status, never an
+        // error: changing your mind is not a failure, so this travels as
+        // `Msg::Status`, not `Msg::Error`, and writes nothing (the
+        // `cancelled_save_is_a_quiet_no_op` pin above proves no destination).
+        assert_eq!(export_cancelled_status(), "export cancelled");
+        match export_cancel_msg() {
+            Msg::Status(text) => assert_eq!(text, "export cancelled"),
+            Msg::Error(_) => panic!("cancel must be a quiet status, not an error"),
+            _ => panic!("cancel must be a quiet status"),
+        }
+    }
+
+    #[test]
+    fn existing_destination_is_overwritten_without_a_second_prompt() {
+        // The portal's own overwrite question already governed an existing
+        // destination, so the app writes straight through it: no existence
+        // check, no second confirm, just the new bytes plus the saved status.
+        let csv = format!(
+            "{}\nnew,p1,review,2026-10-06T12:00:00,2026-10-06T13:00:00,01:00:00,60,manual,\n",
+            timetrack_core::CSV_HEADER
+        );
+        let dest = std::env::temp_dir().join(format!(
+            "tt-portal-overwrite-{}-week.csv",
+            std::process::id()
+        ));
+        let dest_str = dest.to_string_lossy().into_owned();
+        let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::write(&dest, "old bytes").unwrap();
+        match export_write_msg(&csv, &dest_str, "week", "2026-W41") {
+            Msg::Status(text) => assert_eq!(
+                text,
+                format!("exported 1 entries (week 2026-W41) to {basename}")
+            ),
+            Msg::Error(_) => panic!("an existing destination must be overwritten, not refused"),
+            _ => panic!("overwrite must report success"),
+        }
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), csv);
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[test]
+    fn write_failure_is_a_local_error_naming_path_and_reason() {
+        // A granted path that cannot be written and a failing sandboxed
+        // fallback share one outcome: a local error naming the path plus the
+        // reason, never a service or validation failure.
+        let dir = std::env::temp_dir().join(format!("tt-portal-fail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.to_string_lossy().into_owned();
+        let csv = format!("{}\n", timetrack_core::CSV_HEADER);
+        match export_write_msg(&csv, &dest, "week", "2026-W41") {
+            Msg::Error(note) => {
+                assert_eq!(note.kind, StatusKind::Local);
+                assert!(
+                    note.text.starts_with(&format!("could not write {dest}")),
+                    "must name the path first: {}",
+                    note.text
+                );
+                assert!(
+                    note.text.contains(": "),
+                    "must name the reason too: {}",
+                    note.text
+                );
+                for banned in ["service", "validation", "invalid", "unknown", "version"] {
+                    assert!(
+                        !note.text.to_ascii_lowercase().contains(banned),
+                        "must never read as a service or validation failure ({banned}): {}",
+                        note.text
+                    );
+                }
+            }
+            Msg::Status(_) => panic!("an unwritable destination must report a local error"),
+            _ => panic!("an unwritable destination must report a local error"),
+        }
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn portal_stub_cancel_flag_returns_cancelled() {
+        // Headless cancel pin (no live portal): with `<log>.cancel` present,
+        // the stub still logs the requested dialog name but answers
+        // Cancelled, so the quiet no-op path runs without a dialog.
+        let log = std::env::temp_dir().join(format!(
+            "tt-portal-cancel-{}-{}.log",
+            std::process::id(),
+            "cancel-flag"
+        ));
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.cancel", log.to_string_lossy()));
+        std::fs::write(format!("{}.cancel", log.to_string_lossy()), "").unwrap();
+        assert_eq!(
+            portal_stub_outcome(
+                &format!("record:{}", log.to_string_lossy()),
+                "timetrack-export-week-2026-W41.csv",
+            ),
+            Some(PortalOutcome::Cancelled)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "timetrack-export-week-2026-W41.csv\n"
+        );
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.cancel", log.to_string_lossy()));
+    }
+
+    #[test]
+    fn portal_stub_fail_flag_returns_an_unwritable_grant() {
+        // Headless failure pin (no live portal): with `<log>.fail` present,
+        // the stub still logs the requested dialog name but grants a path
+        // that cannot be written, so the local-error path runs without a
+        // dialog.
+        let log = std::env::temp_dir().join(format!(
+            "tt-portal-fail-{}-{}.log",
+            std::process::id(),
+            "fail-flag"
+        ));
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
+        std::fs::write(format!("{}.fail", log.to_string_lossy()), "").unwrap();
+        match portal_stub_outcome(
+            &format!("record:{}", log.to_string_lossy()),
+            "timetrack-export-week-2026-W41.csv",
+        ) {
+            Some(PortalOutcome::Granted(dest)) => {
+                assert!(
+                    dest.contains("timetrack-export-week-2026-W41.csv"),
+                    "granted path must carry the dialog name: {dest}"
+                );
+                assert!(
+                    std::fs::write(&dest, "probe").is_err(),
+                    "granted path must be unwritable: {dest}"
+                );
+            }
+            other => panic!("fail flag must grant an unwritable path"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "timetrack-export-week-2026-W41.csv\n"
+        );
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
     }
 }
