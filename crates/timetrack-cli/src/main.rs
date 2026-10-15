@@ -206,9 +206,16 @@ enum Command {
 
     /// Export entries as CSV (REQUIREMENTS §10).
     Export {
-        /// What to export: `week` (current ISO week), `month` or `all`.
+        /// What to export: `week` (the ISO week), `month` or `all`.
+        /// Old spellings (`this-week`, `current-week`, `all-time`, ...) keep
+        /// working via the shared scope table.
         #[arg(long, default_value = "all")]
         scope: String,
+        /// Day inside the week or month to export (`YYYY-MM-DD`, alongside
+        /// the existing moment spellings). Omitted means now; ignored by
+        /// `all` without warning.
+        #[arg(long, allow_hyphen_values = true)]
+        at: Option<String>,
         /// Write to this file instead of stdout.
         #[arg(short, long)]
         out: Option<std::path::PathBuf>,
@@ -514,8 +521,29 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
 
         Command::List { limit } => print_list(&client.snapshot().await?, limit),
 
-        Command::Export { scope, out } => {
-            let csv = client.export_csv(&scope).await?;
+        Command::Export { scope, at, out } => {
+            // Scope first, so a typo is refused before touching the bus.
+            let parsed = parse_export_scope(&scope)?;
+            let csv = if parsed == timetrack_core::ExportScope::All {
+                // All time ignores the anchor entirely: no parse, no warning,
+                // so a stale `--at` never narrows a full export and old
+                // services keep serving it over the old call.
+                client.export_csv(&scope).await?
+            } else if let Some(at_text) = at {
+                // Chosen week/month: parse the day to an instant in the
+                // snapshot zone, then use the anchored call. Against an old
+                // service this answers unknown-method/interface, which the
+                // proto sorts as a version refusal -- a version message,
+                // never a wrong file (reuses the ticket-23 wording as-is).
+                let snap = client.snapshot().await?;
+                let tz = snapshot_tz(&snap);
+                let anchor_ms = parse_export_anchor(&at_text, &tz)?;
+                client.export_csv_at(&scope, anchor_ms).await?
+            } else {
+                // Current week/month: the old call, anchored at now by the
+                // service, so old clients and old services keep working.
+                client.export_csv(&scope).await?
+            };
             match out {
                 Some(path) => {
                     std::fs::write(&path, &csv)?;
@@ -648,6 +676,22 @@ fn now_ms() -> i64 {
 /// GUI cannot disagree; this is a thin wrapper that supplies the clock.
 fn parse_when(text: &str, what: &str, tz: &timetrack_core::Tz) -> Result<i64> {
     timetrack_core::parse_moment(text, what, now_ms(), tz).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Parse an export scope, refusing unknown spellings with the service's own
+/// sentence so scripts match one string either side of the bus.
+fn parse_export_scope(scope: &str) -> Result<timetrack_core::ExportScope> {
+    timetrack_core::ExportScope::parse(scope)
+        .ok_or_else(|| anyhow::anyhow!("unknown export scope '{scope}' (use week, month or all)"))
+}
+
+/// Parse an export anchor (`--at`) to an instant, in the snapshot zone.
+///
+/// Accepts the calendar-day spelling (`YYYY-MM-DD`, resolving to local
+/// midday so midnight/DST edges cannot shift it) alongside the existing
+/// moment spellings, via the shared core parser.
+fn parse_export_anchor(text: &str, tz: &timetrack_core::Tz) -> Result<i64> {
+    parse_when(text, "at", tz)
 }
 
 /// The snapshot's zone: prefer the name, fall back to the fixed offset for
@@ -812,5 +856,99 @@ mod tests {
         // someone's alias should fail here, not at runtime.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn export_accepts_scope_at_and_out() {
+        // `timetrack export --scope week --at <day> --out <file>`: the chosen
+        // export surface (spec #19, ticket #24).
+        let cli =
+            Cli::try_parse_from(["timetrack", "export", "--scope", "week", "--at", "2026-10-12"])
+                .expect("export args must parse");
+        match cli.command {
+            Some(Command::Export { scope, at, out }) => {
+                assert_eq!(scope, "week");
+                assert_eq!(at.as_deref(), Some("2026-10-12"));
+                assert!(out.is_none());
+            }
+            other => panic!("expected export, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "timetrack",
+            "export",
+            "--scope",
+            "month",
+            "--at",
+            "2026-09-15",
+            "--out",
+            "/tmp/x.csv",
+        ])
+        .expect("export --out must parse");
+        match cli.command {
+            Some(Command::Export { scope, at, out }) => {
+                assert_eq!(scope, "month");
+                assert_eq!(at.as_deref(), Some("2026-09-15"));
+                assert_eq!(
+                    out,
+                    Some(std::path::PathBuf::from("/tmp/x.csv")),
+                    "explicit file lands where the caller says"
+                );
+            }
+            other => panic!("expected export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_old_scope_spellings_keep_working() {
+        // `ExportScope::parse` is the single spelling table; the CLI must not
+        // narrow it (compat per ADR-0001).
+        for ok in [
+            "week",
+            "this-week",
+            "current-week",
+            "month",
+            "this-month",
+            "current-month",
+            "all",
+            "all-time",
+        ] {
+            assert!(
+                parse_export_scope(ok).is_ok(),
+                "{ok:?} must keep working"
+            );
+        }
+    }
+
+    #[test]
+    fn export_bad_scope_is_refused_with_the_service_wording() {
+        // Same sentence the service uses, so scripts match one string.
+        let e = parse_export_scope("bogus").unwrap_err().to_string();
+        assert!(
+            e.contains("unknown export scope 'bogus'"),
+            "must name the scope, got: {e}"
+        );
+        assert!(e.contains("week, month or all"), "must name the choices: {e}");
+    }
+
+    #[test]
+    fn export_anchor_day_resolves_to_local_midday() {
+        // 2026-10-12 at midday UTC, the independent literal from the core
+        // anchor tests (ticket #20 pins the same instant).
+        let anchor = parse_export_anchor("2026-10-12", &timetrack_core::Tz::utc()).unwrap();
+        assert_eq!(anchor, 1_791_806_400_000);
+        assert_eq!(
+            timetrack_core::format_local_hm(anchor, &timetrack_core::Tz::utc()),
+            "12:00"
+        );
+    }
+
+    #[test]
+    fn export_bad_anchor_names_the_value() {
+        for bad in ["2026-13-01", "not-a-day"] {
+            let e = parse_export_anchor(bad, &timetrack_core::Tz::utc())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(bad), "{bad:?} must name the value: {e}");
+        }
     }
 }
