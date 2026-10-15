@@ -94,8 +94,16 @@ enum Action {
     /// before sending this.
     MergeEntries { ids: Vec<String> },
     /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
-    /// the CSV over D-Bus and writes it to `path`.
-    ExportCsv { scope: String, path: String },
+    /// the CSV over D-Bus and writes it to `path`: `anchor_ms` selects which
+    /// week or month when `Some` (the scope-plus-anchor call), while `None`
+    /// keeps the old scope-only call for all time and current scopes so old
+    /// services keep serving them. `period_id` feeds the saved status line.
+    ExportCsv {
+        scope: String,
+        path: String,
+        anchor_ms: Option<i64>,
+        period_id: String,
+    },
     /// Launch the service binary. The GUI is a flatpak and cannot run host
     /// binaries itself, so this asks the session bus to activate it, which
     /// works when a D-Bus activation file is installed on the host.
@@ -210,16 +218,39 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         Ok(Action::MergeEntries { ids }) => {
                             report(&tx, client.merge(&ids).await.map(|_| ()));
                         }
-                        Ok(Action::ExportCsv { scope, path }) => {
+                        Ok(Action::ExportCsv {
+                            scope,
+                            path,
+                            anchor_ms,
+                            period_id,
+                        }) => {
                             // The service refusal stays typed; a local write
                             // failure is a local note, not a service error.
-                            match client.export_csv(&scope).await {
+                            // All time and current scopes travel over the old
+                            // scope-only call (`None`), so old services keep
+                            // serving them; only a chosen week or month needs
+                            // the scope-plus-anchor call, which against an old
+                            // service refuses with a version message rather
+                            // than writing a wrong file.
+                            let fetched = match anchor_ms {
+                                Some(at) => client.export_csv_at(&scope, at).await,
+                                None => client.export_csv(&scope).await,
+                            };
+                            match fetched {
                                 Ok(csv) => match std::fs::write(&path, &csv) {
                                     Ok(()) => {
-                                        let _ = tx.send(Msg::Status(format!(
-                                            "exported {} entries ({scope}) to {path}",
-                                            csv.lines().count().saturating_sub(1)
-                                        )));
+                                        let count = csv.lines().count().saturating_sub(1);
+                                        let basename = path.rsplit('/').next().unwrap_or(&path);
+                                        let status =
+                                            match timetrack_core::ExportScope::parse(&scope) {
+                                                Some(parsed) => export_saved_status(
+                                                    count, parsed, &period_id, basename,
+                                                ),
+                                                None => format!(
+                                                    "exported {count} entries to {basename}"
+                                                ),
+                                            };
+                                        let _ = tx.send(Msg::Status(status));
                                     }
                                     Err(e) => {
                                         let _ = tx.send(Msg::Error(StatusMsg {
@@ -799,9 +830,9 @@ fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String>
 /// One shared anchor selects which week or month the stepper and the typed
 /// day point at; all time ignores it. The typed day accepts the terminal day
 /// spelling (`YYYY-MM-DD`) parsed with the snapshot zone, exactly like the
-/// CLI's `--at`. The three export buttons below keep calling the old
-/// scope-only path in this ticket (preview/save move in 26+), so this edits
-/// shared anchor state only.
+/// CLI's `--at`. The preview shows the first rows of the scoped export
+/// oldest first following this scope plus anchor, and the export buttons
+/// below save that scope with this anchor (all time ignores it on both).
 ///
 /// Plain state over values like the entry dialog, so every transition is
 /// unit-testable without a window.
@@ -1091,14 +1122,99 @@ pub struct TimetrackView {
     export_picker: ExportPicker,
 }
 
-/// Where a GUI export lands by default.
+/// Where a GUI export lands until the portal save dialog lands (ticket 27).
 ///
-/// The GUI is a flatpak with no file picker yet, so exports go to a
-/// predictable name the status line can report. A portal save dialog is the
-/// follow-up; until then this is a working button rather than a dead one.
-fn default_export_path(scope: &str) -> String {
+/// The GUI is a flatpak, so `$HOME` is the sandbox, never the host home.
+/// The name carries the week or month id so one week never silently
+/// overwrites the last; all time ignores the anchor and keeps the plain
+/// name. The label below says sandboxed, never host home.
+fn default_export_path(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{home}/timetrack-export-{scope}.csv")
+    let name = timetrack_core::default_export_filename(scope, anchor_ms, tz);
+    format!("{home}/{name}")
+}
+
+/// The honest interim label for the export buttons: the flatpak writes
+/// inside its sandbox, and the system save dialog (ticket 27) is what will
+/// reach host files. Never names the host home.
+fn export_location_label() -> &'static str {
+    "Sandboxed save: writes inside the app sandbox"
+}
+
+/// Status line after an interim save: entry count, scope, week or month id,
+/// and file base name, in the shared core wording.
+fn export_saved_status(
+    entry_count: usize,
+    scope: timetrack_core::ExportScope,
+    period_id: &str,
+    basename: &str,
+) -> String {
+    timetrack_core::format_export_status(entry_count, scope, period_id, basename)
+}
+
+/// Which service call an interim save uses: `None` is the old scope-only
+/// call (anchored at now by the service), `Some(anchor)` the scope-plus-
+/// anchor call. All time always takes the old call however stale the anchor
+/// is, and a current week or month does too, so old services keep serving
+/// the common case; only a chosen week or month needs the new call.
+fn export_anchor_for_save(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    now_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> Option<i64> {
+    match scope {
+        timetrack_core::ExportScope::All => None,
+        _ if export_period_label(scope, anchor_ms, tz)
+            == export_period_label(scope, now_ms, tz) =>
+        {
+            None
+        }
+        _ => Some(anchor_ms),
+    }
+}
+
+/// The rows the scoped export will hold, oldest first, over the snapshot's
+/// entries with the snapshot zone (spec #19).
+///
+/// The same bucketing as the service (`started_at` wins per ADR-0002, all
+/// time ignores the anchor), so the preview shows what the file will hold
+/// without a second service call. The snapshot arrives newest first; the
+/// preview re-sorts oldest first, the order a stakeholder reads.
+fn export_preview_entries<'a>(
+    snapshot: &'a Snapshot,
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> Vec<&'a timetrack_proto::EntryView> {
+    let mut out: Vec<&timetrack_proto::EntryView> = match scope {
+        timetrack_core::ExportScope::All => snapshot.entries.iter().collect(),
+        timetrack_core::ExportScope::Week => {
+            let week = timetrack_core::iso_week_of(tz.day_of(anchor_ms));
+            snapshot
+                .entries
+                .iter()
+                .filter(|e| {
+                    let d = tz.day_of(e.started_at);
+                    d >= week.start_day && d < week.start_day + 7
+                })
+                .collect()
+        }
+        timetrack_core::ExportScope::Month => {
+            let (year, month) = timetrack_core::month_of(tz.day_of(anchor_ms));
+            snapshot
+                .entries
+                .iter()
+                .filter(|e| timetrack_core::month_of(tz.day_of(e.started_at)) == (year, month))
+                .collect()
+        }
+    };
+    out.sort_by_key(|e| e.started_at);
+    out
 }
 
 impl TimetrackView {
@@ -2699,8 +2815,8 @@ impl TimetrackView {
         )));
 
         // Scope plus anchor: the stepper and the typed day edit one shared
-        // anchor, and all time visibly ignores it. The export buttons below
-        // keep calling the old scope-only path until tickets 26+.
+        // anchor, and all time visibly ignores it. The preview and the
+        // export buttons below follow this scope plus anchor.
         let tz = snapshot_tz(&self.snapshot);
         let picker_active = self.export_picker.is_active();
         body = body.child(
@@ -2834,15 +2950,24 @@ impl TimetrackView {
         );
 
         // Export actions: fetch the CSV over D-Bus and write it to a
-        // predictable path the status line reports. Scopes match the CLI's
-        // `timetrack export --scope week|month|all`.
+        // period-stamped name the status line reports. Scopes match the
+        // CLI's `timetrack export --scope week|month|all`; each button saves
+        // its own scope with the shared anchor (all time ignores it), so the
+        // buttons keep working while the preview follows the picker.
         {
             let mut row = div().flex().gap_2().pt_3();
-            for (i, scope) in ["week", "month", "all"].iter().enumerate() {
+            for (i, button_scope) in [
+                timetrack_core::ExportScope::Week,
+                timetrack_core::ExportScope::Month,
+                timetrack_core::ExportScope::All,
+            ]
+            .iter()
+            .enumerate()
+            {
                 let entity = self.entity.clone();
-                let path = default_export_path(scope);
-                let label = format!("Export {scope}");
-                let scope = scope.to_string();
+                let button_scope = *button_scope;
+                let path = default_export_path(button_scope, self.export_picker.anchor_ms, &tz);
+                let label = format!("Export {}", button_scope.as_str());
                 row = row.child(
                     div()
                         .id(ElementId::from(("export", i as u64)))
@@ -2855,10 +2980,26 @@ impl TimetrackView {
                         .child(label)
                         .when_some(entity, move |el, entity| {
                             el.on_click(move |_ev, _window, cx| {
-                                let scope = scope.clone();
                                 let path = path.clone();
                                 entity.update(cx, |view, cx| {
-                                    view.send(Action::ExportCsv { scope, path });
+                                    let tz = snapshot_tz(&view.snapshot);
+                                    let anchor_ms = export_anchor_for_save(
+                                        button_scope,
+                                        view.export_picker.anchor_ms,
+                                        now_ms(),
+                                        &tz,
+                                    );
+                                    let period_id = export_period_label(
+                                        button_scope,
+                                        view.export_picker.anchor_ms,
+                                        &tz,
+                                    );
+                                    view.send(Action::ExportCsv {
+                                        scope: button_scope.as_str().to_string(),
+                                        path,
+                                        anchor_ms,
+                                        period_id,
+                                    });
                                     cx.notify();
                                 });
                             })
@@ -2871,12 +3012,13 @@ impl TimetrackView {
                     .pt_1()
                     .text_sm()
                     .text_color(rgb(0x6a6a80))
-                    .child("Writes ~/timetrack-export-<week|month|all>.csv"),
+                    .child(export_location_label()),
             );
         }
 
-        // A preview of the first few rows, so the export can be sanity-checked
-        // on screen.
+        // A preview of the first rows of the scoped export, so what is seen
+        // is what the stakeholder gets: the picker's scope plus anchor,
+        // oldest first (all time ignores the anchor).
         body = body.child(
             div()
                 .pt_4()
@@ -2884,7 +3026,13 @@ impl TimetrackView {
                 .text_color(rgb(0x7a7a90))
                 .child("PREVIEW"),
         );
-        for e in self.snapshot.entries.iter().take(20) {
+        let preview = export_preview_entries(
+            &self.snapshot,
+            self.export_picker.scope,
+            self.export_picker.anchor_ms,
+            &tz,
+        );
+        for e in preview.iter().take(20) {
             let project = self
                 .snapshot
                 .projects
@@ -2904,13 +3052,13 @@ impl TimetrackView {
                     .child(e.label().to_string()),
             );
         }
-        if self.snapshot.entries.len() > 20 {
+        if preview.len() > 20 {
             body = body.child(
                 div()
                     .pt_1()
                     .text_sm()
                     .text_color(rgb(0x6a6a80))
-                    .child(format!("… and {} more", self.snapshot.entries.len() - 20)),
+                    .child(format!("… and {} more", preview.len() - 20)),
             );
         }
         body.into_any_element()
@@ -3691,6 +3839,259 @@ mod tests {
             ),
             day_anchor("2026-09-15"),
             "all time ignores the anchor entirely"
+        );
+    }
+
+    // --- scoped preview plus honest interim save (ticket #26) ---
+
+    /// Three entries, newest first as the service sends them: one in
+    /// 2026-W40 (30 Sep) and two in 2026-W41 (6 and 7 Oct).
+    fn preview_snapshot() -> Snapshot {
+        Snapshot {
+            entries: vec![
+                entry_on(
+                    "e3",
+                    "p1",
+                    day_anchor("2026-10-07"),
+                    day_anchor("2026-10-07") + 3_600_000,
+                ),
+                entry_on(
+                    "e2",
+                    "p1",
+                    day_anchor("2026-10-06"),
+                    day_anchor("2026-10-06") + 3_600_000,
+                ),
+                entry_on(
+                    "e1",
+                    "p1",
+                    day_anchor("2026-09-30"),
+                    day_anchor("2026-09-30") + 3_600_000,
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn preview_ids(
+        snap: &Snapshot,
+        scope: timetrack_core::ExportScope,
+        anchor_ms: i64,
+    ) -> Vec<String> {
+        export_preview_entries(snap, scope, anchor_ms, &utc_tz())
+            .iter()
+            .map(|e| e.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn preview_lists_the_scoped_rows_oldest_first() {
+        // The service sends newest first; the preview shows what the file
+        // will hold: the anchored week's rows oldest first.
+        let snap = preview_snapshot();
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08")
+            ),
+            vec!["e2".to_string(), "e3".to_string()]
+        );
+    }
+
+    #[test]
+    fn preview_changes_with_the_anchor() {
+        let snap = preview_snapshot();
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-09-30")
+            ),
+            vec!["e1".to_string()]
+        );
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-09-30")
+            ),
+            vec!["e1".to_string()]
+        );
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-10-08")
+            ),
+            vec!["e2".to_string(), "e3".to_string()]
+        );
+    }
+
+    #[test]
+    fn all_time_preview_ignores_the_anchor() {
+        // A stale anchor must never narrow a full export, on screen or in
+        // the file: both anchors preview every entry oldest first.
+        let snap = preview_snapshot();
+        let all = vec!["e1".to_string(), "e2".to_string(), "e3".to_string()];
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-09-30")
+            ),
+            all
+        );
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-10-08")
+            ),
+            all
+        );
+    }
+
+    #[test]
+    fn interim_save_uses_period_stamped_names() {
+        // One file per week or month so weeks never overwrite each other;
+        // all time keeps the plain name whatever the anchor is.
+        let week = default_export_path(
+            timetrack_core::ExportScope::Week,
+            day_anchor("2026-10-08"),
+            &utc_tz(),
+        );
+        assert!(
+            week.ends_with("timetrack-export-week-2026-W41.csv"),
+            "week file carries its week id: {week}"
+        );
+        let month = default_export_path(
+            timetrack_core::ExportScope::Month,
+            day_anchor("2026-09-15"),
+            &utc_tz(),
+        );
+        assert!(
+            month.ends_with("timetrack-export-month-2026-09.csv"),
+            "month file carries its month id: {month}"
+        );
+        for anchor in [day_anchor("2026-09-15"), day_anchor("2026-10-08")] {
+            let all = default_export_path(timetrack_core::ExportScope::All, anchor, &utc_tz());
+            assert!(
+                all.ends_with("timetrack-export-all.csv"),
+                "all time ignores the anchor: {all}"
+            );
+        }
+    }
+
+    #[test]
+    fn interim_location_is_labelled_sandboxed() {
+        // The flatpak's home is the sandbox, never the host home: the label
+        // must say so until the portal dialog lands.
+        let label = export_location_label();
+        assert!(
+            label.contains("sandbox"),
+            "label names the sandbox: {label}"
+        );
+        assert!(
+            !label.contains("~/"),
+            "label never claims the host home: {label}"
+        );
+    }
+
+    #[test]
+    fn saved_status_names_count_scope_period_and_name() {
+        // End to end of the interim save wording: the period-stamped path's
+        // basename plus the picker's period label, in the shared core
+        // wording. The literals are the independent truth, not a recompute.
+        let scope = timetrack_core::ExportScope::Week;
+        let anchor = day_anchor("2026-10-08");
+        let path = default_export_path(scope, anchor, &utc_tz());
+        let basename = path.rsplit('/').next().unwrap();
+        let period = export_period_label(scope, anchor, &utc_tz());
+        assert_eq!(
+            export_saved_status(2, scope, &period, basename),
+            "exported 2 entries (week 2026-W41) to timetrack-export-week-2026-W41.csv"
+        );
+        let all_path = default_export_path(
+            timetrack_core::ExportScope::All,
+            day_anchor("2026-10-08"),
+            &utc_tz(),
+        );
+        let all_basename = all_path.rsplit('/').next().unwrap();
+        assert_eq!(
+            export_saved_status(
+                3,
+                timetrack_core::ExportScope::All,
+                "all time",
+                all_basename
+            ),
+            "exported 3 entries (all time) to timetrack-export-all.csv"
+        );
+    }
+
+    #[test]
+    fn all_time_save_ignores_the_anchor() {
+        // All time travels over the old scope-only call whatever the anchor
+        // is, so old services keep serving full exports.
+        for anchor in [day_anchor("2026-09-15"), day_anchor("2026-10-08")] {
+            assert_eq!(
+                export_anchor_for_save(
+                    timetrack_core::ExportScope::All,
+                    anchor,
+                    day_anchor("2026-10-08"),
+                    &utc_tz()
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn current_scope_save_uses_the_old_call() {
+        // The old call is anchored at now by the service, so a current
+        // anchor needs no new call and keeps working against old services.
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08"),
+                day_anchor("2026-10-06"),
+                &utc_tz()
+            ),
+            None
+        );
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-10-08"),
+                day_anchor("2026-10-01"),
+                &utc_tz()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn chosen_scope_save_uses_the_anchored_call() {
+        // A week or month outside the current one needs the scope-plus-anchor
+        // call; against an old service that call refuses with a version
+        // message rather than writing a wrong file.
+        let anchor = day_anchor("2026-09-30");
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Week,
+                anchor,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            Some(anchor)
+        );
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Month,
+                anchor,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            Some(anchor)
         );
     }
 }

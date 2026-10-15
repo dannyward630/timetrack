@@ -29,8 +29,11 @@
 #     confirmation, Escape cancels it with nothing deleted, and `d` `d`
 #     removes the entry and moves the total.
 #   - switches to the Export tab with `Tab` `Tab`, presses `[` and `]`
-#     asserting the anchor stepper repainted and returned, then clicks
-#     "Export all" and asserts the CSV file landed with the spec header.
+#     asserting the anchor stepper repainted and returned, steps to an
+#     empty week asserting the scoped preview emptied, then clicks
+#     "Export week" and asserts each period-stamped file landed with the
+#     right rows plus a footer status, and clicks "Export all" and asserts
+#     the CSV file landed with the spec header.
 #   - cycles the three tabs with `Tab`, asserting the window changed and
 #     that three presses return it pixel-identical to Home.
 #
@@ -502,8 +505,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # The anchor picker (scope pills, stepper, typed day) is neutral, never
   # action green, so the count above still holds with the picker painted.
   # One press back a period must repaint the tab (the period label moves),
-  # and one press forward must bring it back pixel-identical. No save
-  # assertions here: preview and saving move in tickets 26+.
+  # and one press forward must bring it back pixel-identical.
   "$WORK/xtest" "$DISP" key bracketleft
   sleep 1.5
   shot export-prev.png
@@ -522,6 +524,61 @@ elif "$WORK/xtest" "$DISP" key 1; then
   else
     bad "stepping back and forth returned the tab" "$DIFF pixels differ"
   fi
+  # Scoped preview plus interim save: the preview shows the scoped rows
+  # oldest first, so stepping to a week with no entries must empty it (the
+  # tab repaints again), and saving there must write that week's
+  # period-stamped file with the header alone. No portal assertions: the
+  # save is still the sandboxed interim write; the dialog lands later.
+  "$WORK/xtest" "$DISP" key bracketleft
+  sleep 1.5
+  shot export-empty-week.png
+  DIFF=$(magick compare -metric AE "$WORK/export-tab.png" "$WORK/export-empty-week.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the scoped preview repainted for the empty week ($DIFF pixels changed)"
+  else
+    bad "the scoped preview repainted for the empty week" "the tab is pixel-identical with no rows in scope"
+  fi
+  # The leftmost button is "Export week": with last week's anchor it saves
+  # that week's period-stamped name.
+  CLICK=$(blobs export-empty-week.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK)"
+  shot export-before-save.png
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  for _ in $(seq 1 30); do [ "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)" = "1" ] && break; sleep 0.3; done
+  check "the scoped save wrote one period-stamped week file" "1" "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)"
+  PREV_WEEK_FILE=$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | head -1)
+  check "the empty week file holds the header alone" "1" "$(wc -l <"$PREV_WEEK_FILE" 2>/dev/null)"
+  check "the empty week file has the spec header" "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note" "$(head -1 "$PREV_WEEK_FILE" 2>/dev/null)"
+  if [ -f "$WORK/timetrack-export-week.csv" ]; then
+    bad "no un-stamped week file was written" "found $WORK/timetrack-export-week.csv"
+  else
+    ok "no un-stamped week file was written"
+  fi
+  # A save reports a status in the footer: the footer band must repaint.
+  # The exact wording is pinned by unit test; pixels only prove it appeared.
+  shot export-after-save.png
+  WINDOW_H=$(echo "$WINDOW" | awk '{print $2}')
+  FOOT="$(echo "$WINDOW" | awk '{print $1}')x40+${WINDOW_X}+$(( WINDOW_Y + WINDOW_H - 40 ))"
+  magick "$WORK/export-before-save.png" -crop "$FOOT" +repage "$WORK/foot-before.png" 2>/dev/null
+  magick "$WORK/export-after-save.png" -crop "$FOOT" +repage "$WORK/foot-after.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/foot-before.png" "$WORK/foot-after.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the save reported a status ($DIFF pixels changed)"
+  else
+    bad "the save reported a status" "the footer is pixel-identical after the save"
+  fi
+  # Back to the current week: saving again must land a second
+  # period-stamped file, this one holding both remaining entries.
+  "$WORK/xtest" "$DISP" key bracketright
+  sleep 1.5
+  shot export-current-week.png
+  CLICK=$(blobs export-current-week.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK)"
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  for _ in $(seq 1 30); do [ "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)" = "2" ] && break; sleep 0.3; done
+  check "the current week saved a second period-stamped file" "2" "$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)"
+  CUR_WEEK_FILE=$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | grep -vF "$PREV_WEEK_FILE" | head -1)
+  check "the current week file holds both remaining entries" "3" "$(wc -l <"$CUR_WEEK_FILE" 2>/dev/null)"
   # The rightmost button is "Export all".
   CLICK=$(blobs export-tab.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '3p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
   echo "  clicking ($CLICK)"
