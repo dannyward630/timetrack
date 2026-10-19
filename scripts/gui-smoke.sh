@@ -35,7 +35,7 @@
 #     right rows plus a footer status, and clicks "Export all" and asserts
 #     the CSV file landed with the spec header. A portal stub records each
 #     save dialog's prefilled name, asserting the dialog wiring without a
-#     live portal (the files still land via the sandboxed fallback).
+#     live portal (the files still land via the home-directory fallback).
 #   - cycles the three tabs with `Tab`, asserting the window changed and
 #     that three presses return it pixel-identical to Home.
 #
@@ -215,7 +215,7 @@ echo "== the window paints =="
 (
   export DISPLAY=$DISP WAYLAND_DISPLAY= DBUS_SESSION_BUS_ADDRESS TZ=UTC HOME=$WORK
   # Portal stub (ticket 27): no live portal exists headless, so the dialog
-  # records its prefilled name here and the sandboxed fallback runs on.
+  # records its prefilled name here and the home-directory fallback runs on.
   export TIMETRACK_PORTAL_STUB="record:$WORK/portal-names.log"
   # Empty WAYLAND_DISPLAY is deliberate: gpui picks Wayland when it is set and
   # non-empty, and there is no Wayland compositor on this display.

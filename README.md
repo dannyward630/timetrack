@@ -15,7 +15,7 @@ the terminal never loses anything, and both can be open at once.
 ## Architecture
 
 ```
-  timetrack-gui (flatpak)         timetrack (CLI, static binary)      timetrack-tray (host only)
+  timetrack-gui (AppImage)          timetrack (CLI, static binary)      timetrack-tray (host only)
   gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands     SNI item: week-total tooltip,
                                                                             per-project quick-add/undo/delete
         |                                  |                                   |
@@ -33,7 +33,7 @@ the terminal never loses anything, and both can be open at once.
 | `timetrack-proto` | The D-Bus contract and a client. All front ends depend on this. |
 | `timetrack-service` | D-Bus server. Owns the store, resolves the clock and timezone, persists on every change. |
 | `timetrack-cli` | Terminal client: a ratatui TUI plus one-shot subcommands. |
-| `timetrack-gui` | Desktop client, built on gpui (upstream, from crates.io). Ships as the flatpak. |
+| `timetrack-gui` | Desktop client, built on gpui (upstream, from crates.io). Ships as the AppImage. |
 | `timetrack-tray` | Host-only tray item (StatusNotifierItem): service presence, week total, per-project menu. |
 
 The core takes an explicit timestamp and never reads the clock, so the rules are
@@ -60,7 +60,8 @@ The GUI Export tab picks the period with a previous/next stepper (labelled
 exactly what the file will hold (scoped rows, oldest first), and saves through
 the system save dialog — `timetrack-export-week-2026-W41.csv` and siblings by
 default, so one week never overwrites the last. Cancelling the dialog does
-nothing; without a portal it falls back to a sandboxed save that says so.
+nothing; without a portal it falls back to saving directly in your home
+directory.
 
 ## Building
 
@@ -102,7 +103,7 @@ Start the service once, then any client:
 ```sh
 timetrack-service &
 timetrack                      # TUI
-timetrack-gui                  # desktop GUI (host build; or the flatpak below)
+timetrack-gui                  # desktop GUI (host build; or the AppImage below)
 timetrack-tray &               # system tray (host only)
 timetrack quick -m 15          # or a one-shot command
 timetrack status
@@ -140,30 +141,28 @@ install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.config/autostart/org.sequ
 
 D-Bus activation is unchanged by all of this: the tray connects anonymously
 and never owns `org.sequ.timetrack`, so it can neither steal the service's
-name nor keep a stale service alive — it only reads. The flatpak ships no
-tray in v1 (its manifest installs only the app desktop file); the tray is
-host-only until sandboxing is settled.
+name nor keep a stale service alive — it only reads. The AppImage ships no
+tray in v1 (it bundles only the GUI and the service); the tray is
+host-only until it is decided whether it belongs in the image.
 
-### Tray on GNOME, and why the flatpak ships none
+### Tray on GNOME, and why the AppImage ships none
 
 GNOME Shell provides no StatusNotifier watcher, so the tray icon has nowhere
 to appear there unless a tray extension (e.g. an AppIndicator extension)
 registers one. KDE, XFCE and MATE ship a watcher, and the icon shows as-is.
 
-The tray is host-only in v1, deliberately: it must reach the session bus both
-to register with the watcher (`org.kde.StatusNotifierWatcher`) and to call
-the service (`org.sequ.timetrack`), and neither fits today's sandbox. The
-flatpak manifests grant `--talk-name=org.sequ.timetrack` for the GUI but no
-watcher name — a sandboxed tray would need both
-`--talk-name=org.kde.StatusNotifierWatcher` and
-`--talk-name=org.sequ.timetrack`, plus a host-side watcher to talk to. Until
-that is settled, the tray runs on the host next to the service.
+The tray is host-only in v1, deliberately: it runs on the host next to the
+service and is installed with the autostart file below. Until it is decided
+whether the tray belongs inside the AppImage, run it from a host build.
 
-### The service has to be installed once
+### The service has to be installed once (host builds)
 
-The GUI is a flatpak and cannot run host binaries, so it cannot start the service
-itself. Install the service and a D-Bus activation file on the host; after that
-the session bus starts it on demand and the GUI never has to:
+The AppImage needs none of this: it bundles the service and starts it in
+the background when the app launches, so the session bus always finds one.
+The steps below are only for running the GUI from a host `cargo build`,
+where no bundle exists to start the service. Install the service and a
+D-Bus activation file on the host; after that the session bus starts it on
+demand:
 
 ```sh
 install -Dm755 target/release/timetrack-service ~/.local/bin/timetrack-service
@@ -195,7 +194,7 @@ must be an absolute path to a real executable -- `sh -c ...` does not work.
 
 ## The terminal client
 
-`timetrack` is not a flatpak — it is an ordinary binary:
+`timetrack` is a separate download from the AppImage — it is an ordinary binary:
 
 ```sh
 cargo install --git https://github.com/sequ-r/timetrack.git timetrack-cli
@@ -243,44 +242,37 @@ that segfault at startup on anything that hashes — `std`'s `HashMap`, which
 zbus' D-Bus address parser needs. Rust's default linker for musl targets is
 correct; the override is the bug. See `.cargo/config.toml`.
 
-## Flatpak
+## AppImage
 
-`org.sequ.timetrack.json` builds against **GNOME 50**; `org.sequ.timetrack.beta.json`
-targets **GNOME 51**. Both build the same tree.
+The GUI ships as a single portable file bundling `timetrack-gui` and
+`timetrack-service`, built with linuxdeploy + appimagetool (fetched on
+demand). It needs no install and no service setup: its AppRun starts the
+bundled service in the background, then the GUI. If a service is already
+running (a host install, or a second copy of the AppImage), the extra copy
+fails to own the bus name and exits, and the GUI talks to whichever holds
+it.
 
 ```sh
-./build-flatpak.sh            # GNOME 50 (stable)
-./build-flatpak.sh beta       # GNOME 51
+./build-appimage.sh            # produces TimeTrack-<arch>.AppImage
+chmod +x TimeTrack-x86_64.AppImage
+./TimeTrack-x86_64.AppImage
 ```
 
 Or by hand:
 
 ```sh
-rm -rf .flatpak-builder build   # this step matters, see below
-flatpak-builder --user --install --force-clean build org.sequ.timetrack.json
+cargo build --release --package timetrack-gui --package timetrack-service
+# ... see build-appimage.sh for the AppDir layout and tool invocations
 ```
 
-**Clear `.flatpak-builder` after pulling.** It mirrors the git source into
-`.flatpak-builder/git/` and reuses that clone, so it can lag behind
-`origin/main` — the build then fails on a file that exists in your checkout,
-which looks like the manifest is wrong when it is the cache. A stale cache is
-also how a build can report `Success!` while shipping a binary from an older
-commit. The helper script does the clearing for you.
-
-A note on the toolchain: the manifest does **not** use
-`org.freedesktop.Sdk.Extension.rust-stable`, because Flathub publishes that
-extension only for the freedesktop `25.08` and `26.08` branches — there is no
-`//50` or `//51`, and `flatpak-builder` appends the runtime branch, so asking
-for `//26.08` resolves to `//26.08/50`, which does not exist. Instead the
-build vendors a pinned rustup (1.98.0, `--profile minimal`). This costs a
-toolchain download per build; the version is pinned so builds stay
-reproducible.
+Release tags publish the AppImage alongside the static CLI tarballs, so one
+download covers the desktop app on any Linux. The GUI's build needs the
+same system libraries as above (`libxkbcommon-dev`,
+`libxkbcommon-x11-dev`, `libfreetype-dev`, `libfontconfig-dev` on
+Debian/Ubuntu); linuxdeploy bundles the linked ones into the image, so the
+runtime needs nothing installed.
 
 ## Known issues
-
-**The GNOME 51 beta manifest is unbuilt.** `org.sequ.timetrack.beta.json`
-is identical to the GNOME 50 one apart from `runtime-version`, and the GNOME
-50 build succeeds, but the 51 build has not been run.
 
 ## Licence
 

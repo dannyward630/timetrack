@@ -8,8 +8,7 @@ repository.workspace = true
 description = "TimeTrack desktop client (gpui)"
 
 # Named distinctly from the CLI's `timetrack` so the two workspace
-# binaries do not collide in the shared target directory. The
-# flatpak installs it as `timetrack`.
+# binaries do not collide in the shared target directory.
 [[bin]]
 name = "timetrack-gui"
 path = "src/main.rs"
@@ -20,7 +19,7 @@ timetrack-proto = { workspace = true }
 gpui = { workspace = true }
 anyhow = { workspace = true }
 async-io = "2"
-# System save dialog via the desktop portal (no sandbox widening). Same
+# System save dialog via the desktop portal. Same
 # backend as gpui itself: `async-std` selects zbus' async-io backend, never
 # tokio (see the workspace manifest for why tokio is load-bearing absent).
 ashpd = { version = "0.11", default-features = false, features = ["async-std"] }

@@ -8,7 +8,7 @@
 //! The wire contract and a client for the TimeTrack service.
 //!
 //! Both front ends depend on this rather than on each other, so the GUI
-//! (a flatpak) and the CLI (a static binary) agree on one definition. It
+//! (an AppImage) and the CLI (a static binary) agree on one definition. It
 //! carries no GUI and no storage code, which keeps the CLI's static build
 //! small.
 //!

@@ -47,8 +47,8 @@ enum Msg {
     /// never clear feedback, so this survives until the next action.
     Status(String),
     /// An export save completed: the footer status plus where the bytes went
-    /// and whether the portal granted it, so the Export tab can label a host
-    /// path differently from the sandboxed fallback.
+    /// and whether the portal granted it, so the Export tab can label a
+    /// chosen path differently from the direct fallback.
     ExportSaved {
         status: String,
         dest: String,
@@ -67,7 +67,7 @@ enum Msg {
 #[derive(Debug, Clone)]
 struct ExportRequest {
     scope: timetrack_core::ExportScope,
-    /// Sandboxed fallback path when no portal answers.
+    /// Direct-save fallback path when no portal answers.
     path: String,
     /// `None` is the old scope-only call; `Some` the scope-plus-anchor call.
     anchor_ms: Option<i64>,
@@ -123,12 +123,13 @@ enum Action {
     /// (the scope-plus-anchor call), while `None` keeps the old scope-only
     /// call for all time and current scopes so old services keep serving
     /// them. `suggested_name` is the period-stamped name prefilled in the
-    /// dialog; `path` is the sandboxed fallback when no portal answers.
+    /// dialog; `path` is the direct-save fallback when no portal answers.
     /// `period_id` feeds the saved status line.
     ExportCsv(ExportRequest),
-    /// Launch the service binary. The GUI is a flatpak and cannot run host
-    /// binaries itself, so this asks the session bus to activate it, which
-    /// works when a D-Bus activation file is installed on the host.
+    /// Launch the service. From a host build this asks the session bus to
+    /// activate it, which works when a D-Bus activation file is installed;
+    /// the AppImage starts its bundled service on launch, so the bus
+    /// already owns the name there.
     StartService,
 }
 
@@ -260,7 +261,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                     // service refusal never prompts for a
                                     // location. Cancel is a quiet status that
                                     // writes nothing; no portal falls back to
-                                    // the interim sandboxed write.
+                                    // the direct home-directory write.
                                     let outcome = portal_save_file(&req.suggested_name).await;
                                     let via_portal = matches!(outcome, PortalOutcome::Granted(_));
                                     match resolve_export_destination(outcome, &req.path) {
@@ -1104,8 +1105,8 @@ pub struct TimetrackView {
     export_picker: ExportPicker,
     /// Where the last export save went, and whether the portal granted it.
     /// `None` before the first save. Drives the Export tab's location line:
-    /// a portal grant names its host path, a fallback keeps the sandboxed
-    /// wording.
+    /// a portal grant names its chosen path, anything else (direct save or
+    /// no save yet) keeps the home-directory wording.
     export_last_dest: Option<String>,
     export_last_via_portal: bool,
 }
@@ -1125,19 +1126,19 @@ fn export_suggested_name(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PortalOutcome {
     /// The user confirmed: write through this granted path, never the
-    /// sandboxed fallback.
+    /// direct fallback.
     Granted(String),
     /// The user cancelled: a quiet no-op status, writes nothing, never an
     /// error (ticket 28).
     Cancelled,
-    /// No portal answered (headless CI, non-flatpak run): the interim
-    /// sandboxed write runs on as the automatic fallback.
+    /// No portal answered (headless CI): the direct home-directory save runs
+    /// on as the automatic fallback.
     Unavailable,
 }
 
 /// Where the fetched CSV goes: the granted path on confirm, nowhere on
 /// cancel (`None` means the caller sends the quiet cancel status and writes
-/// nothing), the sandboxed fallback when no portal is available.
+/// nothing), the home-directory fallback when no portal is available.
 fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<String> {
     match outcome {
         PortalOutcome::Granted(granted) => Some(granted),
@@ -1151,7 +1152,7 @@ fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<
 /// When `TIMETRACK_PORTAL_STUB` is `record:<file>`, the requested dialog
 /// name is appended to `<file>` and the portal counts as unavailable, so
 /// headless runs exercise the dialog wiring (which name is requested) while
-/// the sandboxed fallback keeps working. Anything else is not a stub.
+/// the home-directory fallback keeps working. Anything else is not a stub.
 ///
 /// Edge-mode switches for the ticket-28 pins, still with no live portal:
 /// touching `<file>.cancel` makes the next stubbed save answer Cancelled
@@ -1185,7 +1186,7 @@ fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> 
 /// overwrites the last; the portal's own overwrite question governs existing
 /// files, so there is exactly one prompt. Cancel is quiet (`Cancelled`);
 /// anything but a confirm or a cancel — no portal frontend, no session bus
-/// — counts as unavailable and the sandboxed fallback runs.
+/// — counts as unavailable and the direct fallback runs.
 async fn portal_save_file(current_name: &str) -> PortalOutcome {
     if let Ok(stub) = std::env::var("TIMETRACK_PORTAL_STUB") {
         if let Some(outcome) = portal_stub_outcome(&stub, current_name) {
@@ -1231,15 +1232,15 @@ fn export_cancel_msg() -> Msg {
 
 /// Write fetched CSV bytes to `dest` and report the outcome as one message.
 ///
-/// The granted portal path and the sandboxed fallback share this: success
+/// The granted portal path and the direct fallback share this: success
 /// names count, scope, week or month id and file base name in the shared
 /// core wording, while a failed write stays a local note with path and
 /// reason, never a service error. An existing destination is overwritten:
 /// the portal's own overwrite question already governed it, so there is
 /// exactly one prompt, never a second app confirm. The scope travels typed
 /// (nothing re-parses it); `via_portal` records whether the portal granted
-/// the path so the Export tab can label a host path differently from the
-/// sandboxed fallback.
+/// the path so the Export tab can label a chosen path differently from the
+/// direct fallback.
 fn export_write_msg(
     csv: &str,
     dest: &str,
@@ -1268,10 +1269,10 @@ fn export_write_msg(
 /// Where a GUI export lands while the portal is unreachable (ticket 27
 /// fallback).
 ///
-/// The GUI is a flatpak, so `$HOME` is the sandbox, never the host home.
+/// The app runs unsandboxed, so `$HOME` is the real home directory.
 /// The name carries the week or month id so one week never silently
 /// overwrites the last; all time ignores the anchor and keeps the plain
-/// name. The label below says sandboxed, never host home.
+/// name.
 fn default_export_path(
     scope: timetrack_core::ExportScope,
     anchor_ms: i64,
@@ -1282,16 +1283,16 @@ fn default_export_path(
     format!("{home}/{name}")
 }
 
-/// The honest interim label for the export buttons: the flatpak writes
-/// inside its sandbox, and the system save dialog (ticket 27) is what will
-/// reach host files. Never names the host home.
+/// The label for the export buttons: without a portal the app writes
+/// directly to the home directory, and the system save dialog (ticket 27)
+/// is what offers any other location.
 fn export_location_label() -> &'static str {
-    "Sandboxed save: writes inside the app sandbox"
+    "Direct save: writes to ~/"
 }
 
 /// The Export tab's location line given the last save: a portal grant wrote
-/// to a host path, so it says so with the path; anything else (fallback save
-/// or no save yet) keeps the sandboxed wording.
+/// to the chosen path, so it says so with the path; anything else (direct
+/// save or no save yet) keeps the home-directory wording.
 fn export_location_text(last: Option<(&str, bool)>) -> String {
     match last {
         Some((dest, true)) => format!("Saved via system dialog: {dest}"),
@@ -2006,8 +2007,8 @@ impl TimetrackView {
         self.export_picker.step(delta, &tz);
     }
 
-    /// The Export tab's location line: a portal grant names its host path,
-    /// anything else keeps the sandboxed wording.
+    /// The Export tab's location line: a portal grant names its chosen path,
+    /// anything else keeps the home-directory wording.
     fn export_location_text(&self) -> String {
         export_location_text(
             self.export_last_dest
@@ -4053,14 +4054,14 @@ mod tests {
 
     #[test]
     fn location_line_names_a_portal_grant_path() {
-        // After a portal grant the tab names the host path it wrote to;
-        // fallback saves (and no save yet) keep the sandboxed wording.
+        // After a portal grant the tab names the chosen path it wrote to;
+        // fallback saves (and no save yet) keep the home-directory wording.
         assert_eq!(
-            export_location_text(Some(("/host/chosen.csv", true))),
-            "Saved via system dialog: /host/chosen.csv"
+            export_location_text(Some(("/home/user/chosen.csv", true))),
+            "Saved via system dialog: /home/user/chosen.csv"
         );
         assert_eq!(
-            export_location_text(Some(("/sandbox/timetrack-export-all.csv", false))),
+            export_location_text(Some(("/home/user/timetrack-export-all.csv", false))),
             export_location_label()
         );
         assert_eq!(export_location_text(None), export_location_label());
@@ -4207,17 +4208,14 @@ mod tests {
     }
 
     #[test]
-    fn interim_location_is_labelled_sandboxed() {
-        // The flatpak's home is the sandbox, never the host home: the label
-        // must say so until the portal dialog lands.
+    fn interim_location_is_labelled_home_dir() {
+        // The app runs unsandboxed, so the fallback writes to the real
+        // home: the label must say so until the portal dialog lands.
         let label = export_location_label();
+        assert!(label.contains("~/"), "label names the home dir: {label}");
         assert!(
-            label.contains("sandbox"),
-            "label names the sandbox: {label}"
-        );
-        assert!(
-            !label.contains("~/"),
-            "label never claims the host home: {label}"
+            !label.contains("sandbox"),
+            "label never claims a sandbox: {label}"
         );
     }
 
@@ -4354,14 +4352,14 @@ mod tests {
 
     #[test]
     fn confirmed_save_writes_through_the_granted_path() {
-        // A confirmed dialog wins over the sandboxed fallback: the bytes go
-        // to the path the portal granted, never to the fallback.
+        // A confirmed dialog wins over the home-directory fallback: the
+        // bytes go to the path the portal granted, never to the fallback.
         assert_eq!(
             resolve_export_destination(
-                PortalOutcome::Granted("/host/chosen.csv".to_string()),
-                "/sandbox/timetrack-export-week-2026-W41.csv",
+                PortalOutcome::Granted("/home/user/chosen.csv".to_string()),
+                "/home/user/timetrack-export-week-2026-W41.csv",
             ),
-            Some("/host/chosen.csv".to_string())
+            Some("/home/user/chosen.csv".to_string())
         );
     }
 
@@ -4372,23 +4370,22 @@ mod tests {
         assert_eq!(
             resolve_export_destination(
                 PortalOutcome::Cancelled,
-                "/sandbox/timetrack-export-week-2026-W41.csv",
+                "/home/user/timetrack-export-week-2026-W41.csv",
             ),
             None
         );
     }
 
     #[test]
-    fn unavailable_portal_falls_back_to_the_sandboxed_path() {
-        // No portal (headless CI, non-flatpak run): the interim sandboxed
-        // write runs on, so the workflow never breaks where no dialog can
-        // open.
+    fn unavailable_portal_falls_back_to_the_home_dir_path() {
+        // No portal (headless CI): the direct home-directory write runs on,
+        // so the workflow never breaks where no dialog can open.
         assert_eq!(
             resolve_export_destination(
                 PortalOutcome::Unavailable,
-                "/sandbox/timetrack-export-week-2026-W41.csv",
+                "/home/user/timetrack-export-week-2026-W41.csv",
             ),
-            Some("/sandbox/timetrack-export-week-2026-W41.csv".to_string())
+            Some("/home/user/timetrack-export-week-2026-W41.csv".to_string())
         );
     }
 
@@ -4439,7 +4436,7 @@ mod tests {
     #[test]
     fn portal_stub_records_the_dialog_name() {
         // Headless-test seam: `record:<file>` logs the requested dialog
-        // name and reports the portal unavailable, so the sandboxed
+        // name and reports the portal unavailable, so the direct
         // fallback runs where no live portal exists.
         let log = std::env::temp_dir().join(format!("tt-portal-stub-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&log);
@@ -4509,7 +4506,7 @@ mod tests {
 
     #[test]
     fn write_failure_is_a_local_error_naming_path_and_reason() {
-        // A granted path that cannot be written and a failing sandboxed
+        // A granted path that cannot be written and a failing direct
         // fallback share one outcome: a local error naming the path plus the
         // reason, never a service or validation failure.
         let dir = std::env::temp_dir().join(format!("tt-portal-fail-{}", std::process::id()));
