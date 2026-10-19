@@ -7,13 +7,15 @@
   <summary>Track time on tasks</summary>
   <description>
     <p>
-      TimeTrack records where your time goes. Start a timer, stop it, and
-      keep a history you can review.
+      TimeTrack records where your time goes: log finished work with
+      quick-add buttons or manual entries, then review week totals,
+      per-project breakdowns and recent entries.
     </p>
     <p>Features:</p>
     <ul>
-      <li>Start and stop timers with a description</li>
-      <li>Review tracked entries and totals</li>
+      <li>Quick-add 5, 15, 30 or 60 minutes to a project</li>
+      <li>Manual entries with explicit start and end times</li>
+      <li>Week totals, per-project history and CSV export</li>
       <li>A graphical interface and a terminal client, both talking to one service</li>
     </ul>
   </description>

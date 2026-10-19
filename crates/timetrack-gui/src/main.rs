@@ -21,7 +21,10 @@
 mod app;
 
 use app::TimetrackView;
-use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Application, Bounds, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, px, size,
+};
 
 fn main() {
     Application::new().run(|cx: &mut App| {
@@ -32,9 +35,25 @@ fn main() {
         let _ = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // No system title bar: the minimize, maximize and close
+                // buttons live in the app's own header (see
+                // `TimetrackView::render_titlebar`). Client decorations ask
+                // the compositor to skip its frame; `titlebar: None` drops
+                // the native title everywhere else.
+                titlebar: None,
+                window_decorations: Some(WindowDecorations::Client),
+                // `Transparent` gives the window an alpha channel, so the
+                // rounded content below actually cuts the corners out.
+                // Without it the corners would paint black.
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
-            |_, cx| cx.new(TimetrackView::new),
+            |window, cx| {
+                // Still names the window for the taskbar and pager, which
+                // read this even with no frame drawn around it.
+                window.set_window_title("TimeTrack");
+                cx.new(TimetrackView::new)
+            },
         );
     });
 }

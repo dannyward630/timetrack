@@ -28,8 +28,9 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement, Render,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
+    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement,
+    MouseButton, Render, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
+    rgb, rgba,
 };
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
@@ -2121,21 +2122,27 @@ impl Render for TimetrackView {
 
         let this = cx.entity();
         self.entity = Some(this.clone());
+        let maximized = window.is_maximized();
 
-        // The tab strip is the only chrome above the content, and it is chrome
+        // The titlebar is the only chrome above the content, and it is chrome
         // rather than data -- the week total is still the first *number* on
         // screen and nothing of substance sits above it.
         //
         // The `.id()` and `.track_focus()` are load-bearing, not decoration:
         // gpui dispatches key events along the ancestor path of the focused
         // node, and an element with no id is not in the dispatch tree at all.
+        //
+        // The window itself is transparent (see `main.rs`). When floating,
+        // the panel below rounds all four corners; the titlebar rounds
+        // its own top because the panel clip does not round children. A
+        // maximized window stays square and full-bleed: rounded corners
+        // would leave gaps at the screen edges.
         div()
             .id("root")
             .track_focus(&self.focus)
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x11111b))
             .text_color(rgb(0xe6e6f0))
             .on_key_down(move |ev, _window, cx| {
                 // `update` alone never repaints: it only runs the closure,
@@ -2149,20 +2156,108 @@ impl Render for TimetrackView {
                     }
                 });
             })
-            .child(self.render_tabs())
-            .child(match self.tab {
-                Tab::Home => self.render_home().into_any_element(),
-                Tab::Projects => self.render_projects().into_any_element(),
-                Tab::Export => self.render_export().into_any_element(),
-            })
-            .child(self.render_footer())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .w_full()
+                    .bg(rgb(0x11111b))
+                    .when(!maximized, |el| el.rounded_xl().overflow_hidden())
+                    .child(self.render_titlebar(window))
+                    .child(match self.tab {
+                        Tab::Home => self.render_home().into_any_element(),
+                        Tab::Projects => self.render_projects().into_any_element(),
+                        Tab::Export => self.render_export().into_any_element(),
+                    })
+                    .child(self.render_footer()),
+            )
     }
 }
 
+/// A region of the integrated titlebar that drags the undecorated window.
+///
+/// Left-drag moves the window, right-click opens the window menu, and a
+/// double-click toggles maximize, like a system title bar. The platform
+/// ignores `window_control_area` on Linux, so the move starts here
+/// explicitly; where the marker is honoured it does the same job.
+fn titlebar_drag(id: &'static str, stretch: bool, label: &str) -> impl IntoElement {
+    let mut region = div()
+        .id(ElementId::from(id))
+        .px_2()
+        .py_1()
+        .text_sm()
+        .text_color(rgb(0x7a7a90))
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, |_, window, _| {
+            window.start_window_move();
+        })
+        .on_mouse_down(MouseButton::Right, |ev, window, _| {
+            window.show_window_menu(ev.position);
+        })
+        .on_click(|ev, window, _| {
+            if ev.click_count() == 2 {
+                window.zoom_window();
+            }
+        });
+    if stretch {
+        region = region.flex_1();
+    }
+    region.child(label.to_string())
+}
+
+/// The maximize button's glyph: a square to expand, nested squares to
+/// restore, following the window's current state.
+fn maximize_glyph(is_maximized: bool) -> &'static str {
+    if is_maximized { "▣" } else { "□" }
+}
+
+/// One of the integrated window controls: minimize, maximize or close.
+///
+/// Neutral grey, never the action green (which the smoke check counts), with
+/// the close glyph in red. The `window_control_area` marker is honoured on
+/// platforms with native hit-testing; the click handler below is what acts on
+/// Linux, where the marker is ignored.
+fn window_button(
+    id: &'static str,
+    label: &str,
+    area: WindowControlArea,
+    danger: bool,
+    on_click: impl Fn(&mut Window) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(ElementId::from(id))
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(if danger { rgb(0xe06c75) } else { rgb(0x9a9ab0) })
+        .child(label.to_string())
+        .window_control_area(area)
+        .on_click(move |_, window, _| on_click(window))
+}
+
 impl TimetrackView {
-    /// The tab strip.
-    fn render_tabs(&self) -> impl IntoElement {
-        let mut row = div().flex().gap_1().px_6().pt_3();
+    /// The integrated titlebar: the window has no system title bar (see
+    /// `main.rs`), so this row is the drag handle, the tab strip and the
+    /// minimize/maximize/close buttons in one.
+    ///
+    /// Only the title and the spacer drag. The tabs and buttons are siblings
+    /// of those regions, never children, so pressing one can never start a
+    /// move as a side effect of the event bubbling up to a draggable parent.
+    fn render_titlebar(&self, window: &Window) -> impl IntoElement {
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .bg(rgb(0x1a1a26))
+            // The panel clip does not round children, so the titlebar
+            // rounds its own top to meet the panel's corners. Square when
+            // maximized, like the panel itself.
+            .when(!window.is_maximized(), |el| el.rounded_t_xl());
+        row = row.child(titlebar_drag("titlebar-drag", false, "TimeTrack"));
         for tab in Tab::all() {
             let is_selected = tab == self.tab;
             row = row.child(
@@ -2196,6 +2291,29 @@ impl TimetrackView {
                     }),
             );
         }
+        row = row.child(titlebar_drag("titlebar-spacer", true, ""));
+        row = row
+            .child(window_button(
+                "window-min",
+                "−",
+                WindowControlArea::Min,
+                false,
+                |window| window.minimize_window(),
+            ))
+            .child(window_button(
+                "window-max",
+                maximize_glyph(window.is_maximized()),
+                WindowControlArea::Max,
+                false,
+                |window| window.zoom_window(),
+            ))
+            .child(window_button(
+                "window-close",
+                "×",
+                WindowControlArea::Close,
+                true,
+                |window| window.remove_window(),
+            ));
         row
     }
 
@@ -3840,6 +3958,14 @@ mod tests {
         assert_eq!(cycle_tab(Tab::Home, true), Tab::Export);
         assert_eq!(cycle_tab(Tab::Export, true), Tab::Projects);
         assert_eq!(cycle_tab(Tab::Projects, true), Tab::Home);
+    }
+
+    #[test]
+    fn maximize_button_names_the_action_it_will_take() {
+        // A square to expand, nested squares to restore: the button always
+        // states what pressing it does, following the window's state.
+        assert_eq!(maximize_glyph(false), "□");
+        assert_eq!(maximize_glyph(true), "▣");
     }
 
     #[test]
