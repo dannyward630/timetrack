@@ -317,14 +317,28 @@ impl EntryService {
         self.mutate(|s, _ids, _| core::delete_project(s, id).map(|_| ()))
     }
 
-    /// CSV export (REQUIREMENTS §10): one row per entry in `scope`, with a
+    /// CSV export anchored at `anchor_ms` (REQUIREMENTS §10): one row per
+    /// entry in `scope` for the week or month containing the anchor, with a
     /// header, ISO 8601 local timestamps, `HH:MM:SS` + minutes, and `source`.
-    pub fn export_csv(&self, scope: &str) -> Result<String, ServiceError> {
+    /// All time ignores the anchor entirely. The anchor is already an instant
+    /// (the client parsed the day to midday in the snapshot zone); the
+    /// service buckets it with its own zone, so no new timezone logic lives
+    /// here.
+    pub fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, ServiceError> {
         let scope = core::ExportScope::parse(scope)
             .ok_or_else(|| ServiceError::UnknownExportScope(scope.to_string()))?;
         let g = self.inner.lock().expect("service state mutex poisoned");
-        let now = now_ms();
-        Ok(core::export_csv(&g.data, scope, now, &g.tz))
+        Ok(core::export_csv_at(&g.data, scope, anchor_ms, &g.tz))
+    }
+
+    /// CSV export (REQUIREMENTS §10): one row per entry in `scope`, with a
+    /// header, ISO 8601 local timestamps, `HH:MM:SS` + minutes, and `source`.
+    ///
+    /// Backward-compat wrapper over [`EntryService::export_csv_at`],
+    /// anchored at now: old clients keep current-period behaviour unchanged
+    /// against a new service.
+    pub fn export_csv(&self, scope: &str) -> Result<String, ServiceError> {
+        self.export_csv_at(scope, now_ms())
     }
 }
 
@@ -920,6 +934,104 @@ mod tests {
     fn export_rejects_an_unknown_scope() {
         let (svc, _) = service("export-scope");
         assert!(svc.export_csv("everything").is_err());
+    }
+
+    fn utc_service(name: &str) -> EntryService {
+        let dir = std::env::temp_dir().join(format!("tt-svc-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        EntryService::new_with_tz(JsonStore::new(path), core::Tz::utc()).unwrap()
+    }
+
+    #[test]
+    fn export_at_returns_the_chosen_week() {
+        // ISO week 41 of 2026 runs Mon 5 Oct - Sun 11 Oct (UTC).
+        let svc = utc_service("export-at-week");
+        let p = svc.snapshot().projects.first().cloned().unwrap();
+        svc.add(&p.id, "mon", 1_791_194_400_000, 1_791_198_000_000)
+            .unwrap();
+        svc.add(&p.id, "sun", 1_791_712_800_000, 1_791_716_400_000)
+            .unwrap();
+        svc.add(&p.id, "next", 1_791_799_200_000, 1_791_802_800_000)
+            .unwrap();
+        let csv = svc.export_csv_at("week", 1_791_460_800_000).unwrap();
+        assert!(csv.contains("mon"), "chosen week must hold Monday:\n{csv}");
+        assert!(csv.contains("sun"), "chosen week must hold Sunday:\n{csv}");
+        assert!(
+            !csv.contains("next"),
+            "next week must not leak in:\n{csv}"
+        );
+    }
+
+    #[test]
+    fn export_at_returns_the_chosen_month() {
+        let svc = utc_service("export-at-month");
+        let p = svc.snapshot().projects.first().cloned().unwrap();
+        svc.add(&p.id, "sep", 1_789_466_400_000, 1_789_470_000_000)
+            .unwrap();
+        svc.add(&p.id, "oct", 1_790_848_800_000, 1_790_852_400_000)
+            .unwrap();
+        let sep = svc.export_csv_at("month", 1_789_473_600_000).unwrap();
+        assert!(sep.contains("sep"), "September must hold its entry:\n{sep}");
+        assert!(
+            !sep.contains("oct"),
+            "October must not leak into September:\n{sep}"
+        );
+        let oct = svc.export_csv_at("month", 1_791_460_800_000).unwrap();
+        assert!(oct.contains("oct"), "October must hold its entry:\n{oct}");
+        assert!(
+            !oct.contains("sep"),
+            "September must not leak into October:\n{oct}"
+        );
+    }
+
+    #[test]
+    fn export_at_all_ignores_the_anchor() {
+        let svc = utc_service("export-at-all");
+        let p = svc.snapshot().projects.first().cloned().unwrap();
+        svc.add(&p.id, "sep", 1_789_466_400_000, 1_789_470_000_000)
+            .unwrap();
+        svc.add(&p.id, "oct", 1_790_848_800_000, 1_790_852_400_000)
+            .unwrap();
+        let a = svc.export_csv_at("all", 1_789_473_600_000).unwrap();
+        let b = svc.export_csv_at("all", 1_791_460_800_000).unwrap();
+        assert_eq!(
+            a, b,
+            "a stale anchor must never narrow a full export"
+        );
+    }
+
+    #[test]
+    fn export_at_rejects_an_unknown_scope_with_the_established_wording() {
+        let svc = utc_service("export-at-scope");
+        assert_eq!(
+            svc.export_csv_at("everything", 0).unwrap_err(),
+            ServiceError::UnknownExportScope("everything".into())
+        );
+        assert_eq!(
+            svc.export_csv_at("everything", 0)
+                .unwrap_err()
+                .to_string(),
+            "unknown export scope 'everything' (use week, month or all)"
+        );
+    }
+
+    #[test]
+    fn export_scope_only_keeps_current_period_behaviour() {
+        // The old scope-only call is the now-anchored wrapper: for `all`
+        // (which ignores the anchor) it must byte-match the anchored call.
+        let svc = utc_service("export-compat");
+        let p = svc.snapshot().projects.first().cloned().unwrap();
+        svc.add(&p.id, "sep", 1_789_466_400_000, 1_789_470_000_000)
+            .unwrap();
+        assert_eq!(
+            svc.export_csv("all").unwrap(),
+            svc.export_csv_at("all", 1_791_460_800_000).unwrap()
+        );
+        assert_eq!(
+            svc.export_csv("everything").unwrap_err().to_string(),
+            "unknown export scope 'everything' (use week, month or all)"
+        );
     }
 
     // --- description editing ---

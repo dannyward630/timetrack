@@ -1,10 +1,8 @@
 name: release
 
-# Publishes statically linked `timetrack` binaries for the terminal client.
-#
-# The flatpak is NOT built here: Flathub builds and signs it against the same
-# tree. Keeping the two pipelines separate stops each from being
-# half-maintained.
+# Publishes the terminal client as statically linked `timetrack` binaries
+# plus the desktop GUI as a self-contained AppImage bundling
+# `timetrack-gui` and `timetrack-service` (see build-appimage.sh).
 
 on:
   push:
@@ -115,3 +113,35 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
+
+  appimage:
+    name: TimeTrack-x86_64.AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # linuxdeploy bundles these from the build host into the image, but
+      # building the GUI still needs their headers, same as the test job.
+      - name: Install the GUI's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev file
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the AppImage
+        run: ./build-appimage.sh
+      - name: Checksum
+        run: |
+          mkdir -p dist
+          cp TimeTrack-x86_64.AppImage dist/
+          (cd dist && sha256sum TimeTrack-x86_64.AppImage > TimeTrack-x86_64.AppImage.sha256)
+      - name: Verify the AppImage bundles both binaries
+        run: |
+          ./TimeTrack-x86_64.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/timetrack-gui
+          test -x squashfs-root/usr/bin/timetrack-service
+          test -x squashfs-root/AppRun
+          rm -rf squashfs-root
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/TimeTrack-x86_64.AppImage
+            dist/TimeTrack-x86_64.AppImage.sha256

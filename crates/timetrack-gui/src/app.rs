@@ -46,10 +46,34 @@ enum Msg {
     /// A success worth showing (e.g. where an export was written). Snapshots
     /// never clear feedback, so this survives until the next action.
     Status(String),
+    /// An export save completed: the footer status plus where the bytes went
+    /// and whether the portal granted it, so the Export tab can label a
+    /// chosen path differently from the direct fallback.
+    ExportSaved {
+        status: String,
+        dest: String,
+        via_portal: bool,
+    },
     /// An action succeeded. Snapshots never clear feedback (they arrive
     /// every second and would make errors unreadable), so success arrives as
     /// its own message that dismisses the previous error.
     ActionOk,
+}
+
+/// What an export save needs: the typed scope plus the paths and labels
+/// derived from it. Bundles the five `ExportCsv` fields so the click site,
+/// the action and the service thread pass one value instead of five loose
+/// strings (the scope stays typed end to end — nothing re-parses it).
+#[derive(Debug, Clone)]
+struct ExportRequest {
+    scope: timetrack_core::ExportScope,
+    /// Direct-save fallback path when no portal answers.
+    path: String,
+    /// `None` is the old scope-only call; `Some` the scope-plus-anchor call.
+    anchor_ms: Option<i64>,
+    period_id: String,
+    /// Period-stamped name prefilled in the save dialog.
+    suggested_name: String,
 }
 
 /// A command the UI wants performed. The service thread owns the bus
@@ -94,11 +118,18 @@ enum Action {
     /// before sending this.
     MergeEntries { ids: Vec<String> },
     /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
-    /// the CSV over D-Bus and writes it to `path`.
-    ExportCsv { scope: String, path: String },
-    /// Launch the service binary. The GUI is a flatpak and cannot run host
-    /// binaries itself, so this asks the session bus to activate it, which
-    /// works when a D-Bus activation file is installed on the host.
+    /// the CSV over D-Bus, asks the system save dialog where to put it, and
+    /// writes it there: `anchor_ms` selects which week or month when `Some`
+    /// (the scope-plus-anchor call), while `None` keeps the old scope-only
+    /// call for all time and current scopes so old services keep serving
+    /// them. `suggested_name` is the period-stamped name prefilled in the
+    /// dialog; `path` is the direct-save fallback when no portal answers.
+    /// `period_id` feeds the saved status line.
+    ExportCsv(ExportRequest),
+    /// Launch the service. From a host build this asks the session bus to
+    /// activate it, which works when a D-Bus activation file is installed;
+    /// the AppImage starts its bundled service on launch, so the bus
+    /// already owns the name there.
     StartService,
 }
 
@@ -210,24 +241,44 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         Ok(Action::MergeEntries { ids }) => {
                             report(&tx, client.merge(&ids).await.map(|_| ()));
                         }
-                        Ok(Action::ExportCsv { scope, path }) => {
+                        Ok(Action::ExportCsv(req)) => {
                             // The service refusal stays typed; a local write
                             // failure is a local note, not a service error.
-                            match client.export_csv(&scope).await {
-                                Ok(csv) => match std::fs::write(&path, &csv) {
-                                    Ok(()) => {
-                                        let _ = tx.send(Msg::Status(format!(
-                                            "exported {} entries ({scope}) to {path}",
-                                            csv.lines().count().saturating_sub(1)
-                                        )));
+                            // All time and current scopes travel over the old
+                            // scope-only call (`None`), so old services keep
+                            // serving them; only a chosen week or month needs
+                            // the scope-plus-anchor call, which against an old
+                            // service refuses with a version message rather
+                            // than writing a wrong file.
+                            let scope_str = req.scope.as_str().to_string();
+                            let fetched = match req.anchor_ms {
+                                Some(at) => client.export_csv_at(&scope_str, at).await,
+                                None => client.export_csv(&scope_str).await,
+                            };
+                            match fetched {
+                                Ok(csv) => {
+                                    // The dialog opens after the fetch, so a
+                                    // service refusal never prompts for a
+                                    // location. Cancel is a quiet status that
+                                    // writes nothing; no portal falls back to
+                                    // the direct home-directory write.
+                                    let outcome = portal_save_file(&req.suggested_name).await;
+                                    let via_portal = matches!(outcome, PortalOutcome::Granted(_));
+                                    match resolve_export_destination(outcome, &req.path) {
+                                        Some(dest) => {
+                                            let _ = tx.send(export_write_msg(
+                                                &csv,
+                                                &dest,
+                                                req.scope,
+                                                &req.period_id,
+                                                via_portal,
+                                            ));
+                                        }
+                                        None => {
+                                            let _ = tx.send(export_cancel_msg());
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = tx.send(Msg::Error(StatusMsg {
-                                            text: format!("could not write {path}: {e}"),
-                                            kind: StatusKind::Local,
-                                        }));
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
                                 }
@@ -794,6 +845,172 @@ fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String>
     }
 }
 
+/// The Export tab's scope-plus-anchor picker (spec #19).
+///
+/// One shared anchor selects which week or month the stepper and the typed
+/// day point at; all time ignores it. The typed day accepts the terminal day
+/// spelling (`YYYY-MM-DD`) parsed with the snapshot zone, exactly like the
+/// CLI's `--at`. The preview shows the first rows of the scoped export
+/// oldest first following this scope plus anchor, and the export buttons
+/// below save that scope with this anchor (all time ignores it on both).
+///
+/// Plain state over values like the entry dialog, so every transition is
+/// unit-testable without a window.
+#[derive(Debug, Clone)]
+struct ExportPicker {
+    scope: timetrack_core::ExportScope,
+    /// The instant selecting which week or month; ignored by all time.
+    anchor_ms: i64,
+    /// The typed day as shown in the field; mirrors the anchor's local day.
+    anchor_text: String,
+    /// Whether keystrokes go to the typed day field.
+    editing: bool,
+    /// The last bad day, shown inline; the anchor is unchanged.
+    error: Option<String>,
+}
+
+impl ExportPicker {
+    /// This week anchored at now: the common retrospective needs no typing.
+    /// The typed day starts in UTC (the default snapshot's zone) and is
+    /// re-mirrored from the snapshot zone on arrival via
+    /// [`ExportPicker::refresh_from_snapshot`].
+    fn new(now_ms: i64) -> Self {
+        let utc = timetrack_core::Tz::utc();
+        ExportPicker {
+            scope: timetrack_core::ExportScope::Week,
+            anchor_ms: now_ms,
+            anchor_text: format_anchor_day(now_ms, &utc),
+            editing: false,
+            error: None,
+        }
+    }
+
+    /// All time ignores the anchor, so its controls render inert.
+    fn is_active(&self) -> bool {
+        self.scope != timetrack_core::ExportScope::All
+    }
+
+    fn period_label(&self, tz: &timetrack_core::Tz) -> String {
+        export_period_label(self.scope, self.anchor_ms, tz)
+    }
+
+    /// Switch week/month/all, keeping the shared anchor; the typed day
+    /// re-mirrors it.
+    fn set_scope(&mut self, scope: timetrack_core::ExportScope, tz: &timetrack_core::Tz) {
+        self.scope = scope;
+        self.editing = false;
+        self.error = None;
+        self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+    }
+
+    /// One stepper press. Stepping leaves edit mode: the field mirrors the
+    /// anchor again.
+    fn step(&mut self, delta: i32, tz: &timetrack_core::Tz) {
+        if !self.is_active() {
+            return;
+        }
+        self.anchor_ms = shift_export_anchor(self.scope, self.anchor_ms, delta, tz);
+        self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        self.editing = false;
+        self.error = None;
+    }
+
+    /// Open the typed day field. Never for all time.
+    fn start_editing(&mut self) {
+        if !self.is_active() {
+            return;
+        }
+        self.editing = true;
+        self.error = None;
+    }
+
+    /// Close the field without committing, mirroring the anchor again.
+    fn cancel_editing(&mut self, tz: &timetrack_core::Tz) {
+        self.editing = false;
+        self.error = None;
+        self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+    }
+
+    /// Append typed text to the day field, clearing a stale error.
+    fn type_text(&mut self, ch: &str) {
+        if !self.editing || !self.is_active() {
+            return;
+        }
+        self.anchor_text.push_str(ch);
+        self.error = None;
+    }
+
+    /// Delete the last character of the day field.
+    fn backspace(&mut self) {
+        if !self.editing || !self.is_active() {
+            return;
+        }
+        self.anchor_text.pop();
+        self.error = None;
+    }
+
+    /// Commit the typed day: the terminal spelling parsed with the snapshot
+    /// zone. A bad day stays open with an inline error and the anchor is
+    /// unchanged.
+    fn commit(&mut self, tz: &timetrack_core::Tz) -> bool {
+        if !self.editing || !self.is_active() {
+            return false;
+        }
+        match timetrack_core::parse_anchor_day(&self.anchor_text, "anchor", tz) {
+            Ok(anchor) => {
+                self.anchor_ms = anchor;
+                self.anchor_text = format_anchor_day(anchor, tz);
+                self.error = None;
+                self.editing = false;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Re-mirror the typed day from the snapshot zone after a snapshot
+    /// arrives. Only the just-opened value is fixed: while the field is being
+    /// typed (`editing`) the text is the user's, never the mirror.
+    fn refresh_from_snapshot(&mut self, tz: &timetrack_core::Tz) {
+        if !self.editing {
+            self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        }
+    }
+}
+
+/// The anchor's local day as `YYYY-MM-DD`, the spelling the typed field and
+/// the CLI share. Thin wrapper over the shared core helper so the GUI mirror
+/// and the shifters cannot disagree about the day boundary.
+fn format_anchor_day(anchor_ms: i64, tz: &timetrack_core::Tz) -> String {
+    timetrack_core::anchor_day_string(anchor_ms, tz)
+}
+
+/// What the stepper sits on: the ISO week id, the month id, or all time
+/// (which has no id because its anchor is ignored). Thin wrapper over the
+/// shared scope table so both UIs agree.
+fn export_period_label(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
+    scope.period_id(anchor_ms, tz)
+}
+
+/// Move the anchor one scope step per `delta`. Thin wrapper over the shared
+/// scope table: both week and month resolve through the day spelling, so a
+/// DST edge cannot move the anchor off midday.
+fn shift_export_anchor(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    delta: i32,
+    tz: &timetrack_core::Tz,
+) -> i64 {
+    scope.shift(anchor_ms, delta, tz)
+}
+
 /// The three tabs (REQUIREMENTS §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -883,16 +1100,256 @@ pub struct TimetrackView {
     /// A pending delete confirmation. Only `d` (confirm), escape (cancel)
     /// and `q` (quit) do anything while this is `Some`.
     delete_confirm: Option<DeleteConfirm>,
+    /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
+    /// defaults to now at view creation; all time ignores it.
+    export_picker: ExportPicker,
+    /// Where the last export save went, and whether the portal granted it.
+    /// `None` before the first save. Drives the Export tab's location line:
+    /// a portal grant names its chosen path, anything else (direct save or
+    /// no save yet) keeps the home-directory wording.
+    export_last_dest: Option<String>,
+    export_last_via_portal: bool,
 }
 
-/// Where a GUI export lands by default.
+/// The name prefilled in the system save dialog for a scope plus anchor
+/// (ticket 27): the period-stamped default, so one week never silently
+/// overwrites the last; all time ignores the anchor and keeps the plain name.
+fn export_suggested_name(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
+    timetrack_core::default_export_filename(scope, anchor_ms, tz)
+}
+
+/// What the system save dialog answered (ticket 27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortalOutcome {
+    /// The user confirmed: write through this granted path, never the
+    /// direct fallback.
+    Granted(String),
+    /// The user cancelled: a quiet no-op status, writes nothing, never an
+    /// error (ticket 28).
+    Cancelled,
+    /// No portal answered (headless CI): the direct home-directory save runs
+    /// on as the automatic fallback.
+    Unavailable,
+}
+
+/// Where the fetched CSV goes: the granted path on confirm, nowhere on
+/// cancel (`None` means the caller sends the quiet cancel status and writes
+/// nothing), the home-directory fallback when no portal is available.
+fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<String> {
+    match outcome {
+        PortalOutcome::Granted(granted) => Some(granted),
+        PortalOutcome::Cancelled => None,
+        PortalOutcome::Unavailable => Some(fallback.to_string()),
+    }
+}
+
+/// Headless-test seam for the save dialog (tickets 27-28).
 ///
-/// The GUI is a flatpak with no file picker yet, so exports go to a
-/// predictable name the status line can report. A portal save dialog is the
-/// follow-up; until then this is a working button rather than a dead one.
-fn default_export_path(scope: &str) -> String {
+/// When `TIMETRACK_PORTAL_STUB` is `record:<file>`, the requested dialog
+/// name is appended to `<file>` and the portal counts as unavailable, so
+/// headless runs exercise the dialog wiring (which name is requested) while
+/// the home-directory fallback keeps working. Anything else is not a stub.
+///
+/// Edge-mode switches for the ticket-28 pins, still with no live portal:
+/// touching `<file>.cancel` makes the next stubbed save answer Cancelled
+/// (quiet no-op, writes nothing), and `<file>.fail` grants a path whose
+/// parent does not exist (local error naming path plus reason). Both still
+/// log the requested name first, so the dialog wiring stays pinned. Only
+/// when the stub is active, so production never sees this.
+fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> {
+    let log = stub.strip_prefix("record:")?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()?;
+    use std::io::Write;
+    writeln!(file, "{current_name}").ok()?;
+    if std::path::Path::new(&format!("{log}.cancel")).exists() {
+        return Some(PortalOutcome::Cancelled);
+    }
+    if std::path::Path::new(&format!("{log}.fail")).exists() {
+        return Some(PortalOutcome::Granted(format!(
+            "/nonexistent-timetrack-gui/{current_name}"
+        )));
+    }
+    Some(PortalOutcome::Unavailable)
+}
+
+/// Ask the system save dialog where to write an export (ticket 27).
+///
+/// The period-stamped `current_name` is prefilled so one week never silently
+/// overwrites the last; the portal's own overwrite question governs existing
+/// files, so there is exactly one prompt. Cancel is quiet (`Cancelled`);
+/// anything but a confirm or a cancel — no portal frontend, no session bus
+/// — counts as unavailable and the direct fallback runs.
+async fn portal_save_file(current_name: &str) -> PortalOutcome {
+    if let Ok(stub) = std::env::var("TIMETRACK_PORTAL_STUB") {
+        if let Some(outcome) = portal_stub_outcome(&stub, current_name) {
+            return outcome;
+        }
+    }
+    let request = ashpd::desktop::file_chooser::SelectedFiles::save_file()
+        .title("Save export")
+        .current_name(current_name)
+        .send()
+        .await;
+    let files = match request {
+        Ok(request) => match request.response() {
+            Ok(files) => files,
+            Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
+                return PortalOutcome::Cancelled;
+            }
+            Err(_) => return PortalOutcome::Unavailable,
+        },
+        Err(_) => return PortalOutcome::Unavailable,
+    };
+    let Some(uri) = files.uris().first() else {
+        return PortalOutcome::Cancelled;
+    };
+    match uri.to_file_path() {
+        Ok(path) => PortalOutcome::Granted(path.to_string_lossy().into_owned()),
+        Err(_) => PortalOutcome::Unavailable,
+    }
+}
+
+/// Quiet status after cancelling the system save dialog (ticket 28).
+///
+/// A no-op, never an error: changing your mind is not a failure, so this
+/// travels as `Msg::Status`, writes nothing, and names no path.
+fn export_cancelled_status() -> &'static str {
+    "export cancelled"
+}
+
+/// The cancel outcome as one message: a quiet status, never error-styled.
+fn export_cancel_msg() -> Msg {
+    Msg::Status(export_cancelled_status().to_string())
+}
+
+/// Write fetched CSV bytes to `dest` and report the outcome as one message.
+///
+/// The granted portal path and the direct fallback share this: success
+/// names count, scope, week or month id and file base name in the shared
+/// core wording, while a failed write stays a local note with path and
+/// reason, never a service error. An existing destination is overwritten:
+/// the portal's own overwrite question already governed it, so there is
+/// exactly one prompt, never a second app confirm. The scope travels typed
+/// (nothing re-parses it); `via_portal` records whether the portal granted
+/// the path so the Export tab can label a chosen path differently from the
+/// direct fallback.
+fn export_write_msg(
+    csv: &str,
+    dest: &str,
+    scope: timetrack_core::ExportScope,
+    period_id: &str,
+    via_portal: bool,
+) -> Msg {
+    match std::fs::write(dest, csv) {
+        Ok(()) => {
+            let count = csv.lines().count().saturating_sub(1);
+            let basename = dest.rsplit('/').next().unwrap_or(dest);
+            let status = export_saved_status(count, scope, period_id, basename);
+            Msg::ExportSaved {
+                status,
+                dest: dest.to_string(),
+                via_portal,
+            }
+        }
+        Err(e) => Msg::Error(StatusMsg {
+            text: format!("could not write {dest}: {e}"),
+            kind: StatusKind::Local,
+        }),
+    }
+}
+
+/// Where a GUI export lands while the portal is unreachable (ticket 27
+/// fallback).
+///
+/// The app runs unsandboxed, so `$HOME` is the real home directory.
+/// The name carries the week or month id so one week never silently
+/// overwrites the last; all time ignores the anchor and keeps the plain
+/// name.
+fn default_export_path(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{home}/timetrack-export-{scope}.csv")
+    let name = export_suggested_name(scope, anchor_ms, tz);
+    format!("{home}/{name}")
+}
+
+/// The label for the export buttons: without a portal the app writes
+/// directly to the home directory, and the system save dialog (ticket 27)
+/// is what offers any other location.
+fn export_location_label() -> &'static str {
+    "Direct save: writes to ~/"
+}
+
+/// The Export tab's location line given the last save: a portal grant wrote
+/// to the chosen path, so it says so with the path; anything else (direct
+/// save or no save yet) keeps the home-directory wording.
+fn export_location_text(last: Option<(&str, bool)>) -> String {
+    match last {
+        Some((dest, true)) => format!("Saved via system dialog: {dest}"),
+        _ => export_location_label().to_string(),
+    }
+}
+
+/// Status line after an interim save: entry count, scope, week or month id,
+/// and file base name, in the shared core wording.
+fn export_saved_status(
+    entry_count: usize,
+    scope: timetrack_core::ExportScope,
+    period_id: &str,
+    basename: &str,
+) -> String {
+    timetrack_core::format_export_status(entry_count, scope, period_id, basename)
+}
+
+/// Which service call an interim save uses: `None` is the old scope-only
+/// call (anchored at now by the service), `Some(anchor)` the scope-plus-
+/// anchor call. All time always takes the old call however stale the anchor
+/// is, and a current week or month does too, so old services keep serving
+/// the common case; only a chosen week or month needs the new call.
+fn export_anchor_for_save(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    now_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> Option<i64> {
+    match scope {
+        timetrack_core::ExportScope::All => None,
+        _ if scope.period_id(anchor_ms, tz) == scope.period_id(now_ms, tz) => None,
+        _ => Some(anchor_ms),
+    }
+}
+
+/// The rows the scoped export will hold, oldest first, over the snapshot's
+/// entries with the snapshot zone (spec #19).
+///
+/// Filters with the shared core predicate ([`timetrack_core::entry_in_scope`]:
+/// `started_at` wins per ADR-0002, all time ignores the anchor), so the
+/// preview shows what the file will hold without a second service call and
+/// cannot disagree with the service bucketing. The snapshot arrives newest
+/// first; the preview re-sorts oldest first, the order a stakeholder reads.
+fn export_preview_entries<'a>(
+    snapshot: &'a Snapshot,
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> Vec<&'a timetrack_proto::EntryView> {
+    let mut out: Vec<&timetrack_proto::EntryView> = snapshot
+        .entries
+        .iter()
+        .filter(|e| timetrack_core::entry_in_scope(e.started_at, scope, anchor_ms, tz))
+        .collect();
+    out.sort_by_key(|e| e.started_at);
+    out
 }
 
 impl TimetrackView {
@@ -914,6 +1371,9 @@ impl TimetrackView {
             split_prompt: None,
             merge_confirm: None,
             delete_confirm: None,
+            export_picker: ExportPicker::new(now_ms()),
+            export_last_dest: None,
+            export_last_via_portal: false,
         };
         view.schedule_poll(cx);
         view
@@ -979,6 +1439,16 @@ impl TimetrackView {
                         self.snapshot = *s;
                         changed = true;
                     }
+                    // The typed day mirrors the anchor's local day: re-mirror
+                    // it from the snapshot zone now that a real zone exists.
+                    // User edits stay intact — only the just-opened value is
+                    // fixed (see `refresh_from_snapshot`).
+                    let tz = snapshot_tz(&self.snapshot);
+                    let before = self.export_picker.anchor_text.clone();
+                    self.export_picker.refresh_from_snapshot(&tz);
+                    if self.export_picker.anchor_text != before {
+                        changed = true;
+                    }
                     // A routine snapshot must not wipe feedback from the last
                     // action: snapshots arrive every second, so clearing here
                     // made error reports from the service thread unreadable.
@@ -1010,6 +1480,20 @@ impl TimetrackView {
                 Ok(Msg::Error(note)) => set_status(&mut self.status, note, &mut changed),
                 Ok(Msg::Status(note)) => {
                     set_status(&mut self.status, StatusMsg::local(note), &mut changed)
+                }
+                Ok(Msg::ExportSaved {
+                    status,
+                    dest,
+                    via_portal,
+                }) => {
+                    set_status(&mut self.status, StatusMsg::local(status), &mut changed);
+                    if self.export_last_dest.as_deref() != Some(dest.as_str())
+                        || self.export_last_via_portal != via_portal
+                    {
+                        self.export_last_dest = Some(dest);
+                        self.export_last_via_portal = via_portal;
+                        changed = true;
+                    }
                 }
                 Ok(Msg::ActionOk) => {
                     // A success dismisses the previous error -- but only one
@@ -1068,6 +1552,11 @@ impl TimetrackView {
         if self.split_prompt.is_some() {
             return self.on_split_key(ev);
         }
+        // The anchor day field owns the keyboard while it is being typed
+        // in, like the modal prompts do.
+        if self.export_picker.editing {
+            return self.on_anchor_key(ev);
+        }
         // A pending merge only listens for its own answer.
         if self.merge_confirm.is_some() {
             return self.on_merge_key(ev);
@@ -1115,6 +1604,25 @@ impl TimetrackView {
             // Split and merge (REQUIREMENTS §8).
             "s" => self.open_split_prompt(),
             "m" => self.open_merge_confirm(),
+
+            // Export anchor picker (spec #19): one press moves one period,
+            // and `t` opens the typed day. Only on the Export tab; elsewhere
+            // these keys stay unbound.
+            "[" => {
+                if self.tab == Tab::Export {
+                    self.step_export_anchor(-1);
+                }
+            }
+            "]" => {
+                if self.tab == Tab::Export {
+                    self.step_export_anchor(1);
+                }
+            }
+            "t" => {
+                if self.tab == Tab::Export {
+                    self.export_picker.start_editing();
+                }
+            }
 
             "h" => self.project_cursor = self.project_cursor.saturating_sub(1),
             "l" => {
@@ -1493,6 +2001,51 @@ impl TimetrackView {
         }
     }
 
+    /// Move the export anchor one period in `delta` (±1 per press).
+    fn step_export_anchor(&mut self, delta: i32) {
+        let tz = snapshot_tz(&self.snapshot);
+        self.export_picker.step(delta, &tz);
+    }
+
+    /// The Export tab's location line: a portal grant names its chosen path,
+    /// anything else keeps the home-directory wording.
+    fn export_location_text(&self) -> String {
+        export_location_text(
+            self.export_last_dest
+                .as_deref()
+                .map(|dest| (dest, self.export_last_via_portal)),
+        )
+    }
+
+    /// Handle a key press while the anchor day field is open. Always returns
+    /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_anchor_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                let tz = snapshot_tz(&self.snapshot);
+                self.export_picker.cancel_editing(&tz);
+            }
+            "enter" => {
+                let tz = snapshot_tz(&self.snapshot);
+                self.export_picker.commit(&tz);
+            }
+            "backspace" => self.export_picker.backspace(),
+            // Tab stays in the field: enter sets the day, escape cancels.
+            "tab" => {}
+            _ => {
+                // Printable text, and only that: same gate as the dialogs, so
+                // shortcuts and special keys never leak into the day.
+                let m = &ev.keystroke.modifiers;
+                if !m.control && !m.alt && !m.platform {
+                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
+                        self.export_picker.type_text(ch);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Add one of the quick-add buckets to the selected project.
     fn quick_add(&mut self, duration_ms: i64) {
         match self.current_project() {
@@ -1539,6 +2092,8 @@ impl TimetrackView {
                 "d to confirm the delete · esc to cancel".to_string()
             } else if self.project_prompt.is_some() {
                 "type a name · enter save · esc cancel".to_string()
+            } else if self.export_picker.editing {
+                "type a day YYYY-MM-DD · enter set · esc cancel".to_string()
             } else {
                 "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · tab tabs · j/k move · h/l project · q quit"
                     .to_string()
@@ -2337,6 +2892,79 @@ impl TimetrackView {
             .into_any_element()
     }
 
+    /// One scope pill on the Export tab. Neutral rather than green: green is
+    /// the export-action colour the smoke check counts.
+    fn render_scope_pill(
+        &self,
+        scope: timetrack_core::ExportScope,
+        id: &'static str,
+        label: &'static str,
+    ) -> impl IntoElement {
+        let selected = self.export_picker.scope == scope;
+        let entity = self.entity.clone();
+        div()
+            .id(ElementId::from(id))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(if selected {
+                rgba(0x2a2a3aff)
+            } else {
+                rgba(0x00000000)
+            })
+            .text_color(if selected {
+                rgb(0xffffff)
+            } else {
+                rgb(0x7a7a90)
+            })
+            .child(label)
+            .when_some(entity, move |el, entity| {
+                el.on_click(move |_ev, _window, cx| {
+                    entity.update(cx, |view, cx| {
+                        let tz = snapshot_tz(&view.snapshot);
+                        view.export_picker.set_scope(scope, &tz);
+                        cx.notify();
+                    });
+                })
+            })
+    }
+
+    /// One anchor stepper button. Inert (present but clickless) for all time,
+    /// which ignores the anchor. Neutral rather than green, as above.
+    fn render_step_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        delta: i32,
+    ) -> impl IntoElement {
+        let active = self.export_picker.is_active();
+        let entity = self.entity.clone();
+        let mut button = div()
+            .id(ElementId::from(id))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgba(0x3a3a4aff))
+            .text_color(if active { rgb(0xc8c8d8) } else { rgb(0x6a6a80) })
+            .child(label);
+        if active {
+            button = button
+                .cursor_pointer()
+                .when_some(entity, move |el, entity| {
+                    el.on_click(move |_ev, _window, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.step_export_anchor(delta);
+                            cx.notify();
+                        });
+                    })
+                });
+        } else {
+            button = button.cursor_default();
+        }
+        button
+    }
+
     /// Export. The service owns aggregation, so what is shown here is exactly
     /// what a CSV would contain, rather than a second aggregation that could
     /// disagree with the totals on Home.
@@ -2357,6 +2985,125 @@ impl TimetrackView {
             timetrack_core::format_duration(self.snapshot.total_ms),
         )));
 
+        // Scope plus anchor: the stepper and the typed day edit one shared
+        // anchor, and all time visibly ignores it. The preview and the
+        // export buttons below follow this scope plus anchor.
+        let tz = snapshot_tz(&self.snapshot);
+        let picker_active = self.export_picker.is_active();
+        body = body.child(
+            div()
+                .pt_4()
+                .text_sm()
+                .text_color(rgb(0x7a7a90))
+                .child("SCOPE"),
+        );
+        {
+            let mut row = div().flex().gap_2().pt_1();
+            for (scope, id, label) in [
+                (timetrack_core::ExportScope::Week, "scope-week", "Week"),
+                (timetrack_core::ExportScope::Month, "scope-month", "Month"),
+                (timetrack_core::ExportScope::All, "scope-all", "All"),
+            ] {
+                row = row.child(self.render_scope_pill(scope, id, label));
+            }
+            body = body.child(row);
+        }
+        body = body.child(
+            div()
+                .pt_3()
+                .text_sm()
+                .text_color(rgb(0x7a7a90))
+                .child("ANCHOR"),
+        );
+        {
+            let mut row = div().flex().items_center().gap_2().pt_1();
+            row = row.child(self.render_step_button("anchor-prev", "< prev", -1));
+            row = row.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_color(if picker_active {
+                        rgb(0xffffff)
+                    } else {
+                        rgb(0x6a6a80)
+                    })
+                    .child(self.export_picker.period_label(&tz)),
+            );
+            row = row.child(self.render_step_button("anchor-next", "next >", 1));
+            body = body.child(row);
+        }
+        {
+            let field_text = if self.export_picker.editing {
+                format!("{}_", self.export_picker.anchor_text)
+            } else {
+                self.export_picker.anchor_text.clone()
+            };
+            let entity = self.entity.clone();
+            let mut field = div()
+                .id(ElementId::from("anchor-field"))
+                .flex_1()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(if self.export_picker.editing {
+                    rgba(0x2a2a3aff)
+                } else {
+                    rgba(0x00000000)
+                })
+                .text_color(if picker_active {
+                    rgb(0xe6e6f0)
+                } else {
+                    rgb(0x6a6a80)
+                })
+                .child(format!("day {field_text}"));
+            if picker_active {
+                field = field.cursor_pointer().when_some(entity, |el, entity| {
+                    el.on_click(move |_ev, _window, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.export_picker.start_editing();
+                            cx.notify();
+                        });
+                    })
+                });
+            } else {
+                field = field.cursor_default();
+            }
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pt_1()
+                    .child(field)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x6a6a80))
+                            .child("(YYYY-MM-DD)"),
+                    ),
+            );
+        }
+        if picker_active {
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("t type a day · [ previous period · ] next period"),
+            );
+        } else {
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("anchor ignored for all time"),
+            );
+        }
+        if let Some(err) = &self.export_picker.error {
+            body = body.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+        }
+
         // The columns a CSV export will carry, shown as a header so the shape
         // is visible without opening a file.
         body = body.child(
@@ -2374,15 +3121,26 @@ impl TimetrackView {
         );
 
         // Export actions: fetch the CSV over D-Bus and write it to a
-        // predictable path the status line reports. Scopes match the CLI's
-        // `timetrack export --scope week|month|all`.
+        // period-stamped name the status line reports. Scopes match the
+        // CLI's `timetrack export --scope week|month|all`; each button saves
+        // its own scope with the shared anchor (all time ignores it), so the
+        // buttons keep working while the preview follows the picker.
         {
             let mut row = div().flex().gap_2().pt_3();
-            for (i, scope) in ["week", "month", "all"].iter().enumerate() {
+            for (i, button_scope) in [
+                timetrack_core::ExportScope::Week,
+                timetrack_core::ExportScope::Month,
+                timetrack_core::ExportScope::All,
+            ]
+            .iter()
+            .enumerate()
+            {
                 let entity = self.entity.clone();
-                let path = default_export_path(scope);
-                let label = format!("Export {scope}");
-                let scope = scope.to_string();
+                let button_scope = *button_scope;
+                let path = default_export_path(button_scope, self.export_picker.anchor_ms, &tz);
+                let suggested_name =
+                    export_suggested_name(button_scope, self.export_picker.anchor_ms, &tz);
+                let label = format!("Export {}", button_scope.as_str());
                 row = row.child(
                     div()
                         .id(ElementId::from(("export", i as u64)))
@@ -2395,10 +3153,28 @@ impl TimetrackView {
                         .child(label)
                         .when_some(entity, move |el, entity| {
                             el.on_click(move |_ev, _window, cx| {
-                                let scope = scope.clone();
                                 let path = path.clone();
+                                let suggested_name = suggested_name.clone();
                                 entity.update(cx, |view, cx| {
-                                    view.send(Action::ExportCsv { scope, path });
+                                    let tz = snapshot_tz(&view.snapshot);
+                                    let anchor_ms = export_anchor_for_save(
+                                        button_scope,
+                                        view.export_picker.anchor_ms,
+                                        now_ms(),
+                                        &tz,
+                                    );
+                                    let period_id = export_period_label(
+                                        button_scope,
+                                        view.export_picker.anchor_ms,
+                                        &tz,
+                                    );
+                                    view.send(Action::ExportCsv(ExportRequest {
+                                        scope: button_scope,
+                                        path,
+                                        anchor_ms,
+                                        period_id,
+                                        suggested_name,
+                                    }));
                                     cx.notify();
                                 });
                             })
@@ -2411,12 +3187,13 @@ impl TimetrackView {
                     .pt_1()
                     .text_sm()
                     .text_color(rgb(0x6a6a80))
-                    .child("Writes ~/timetrack-export-<week|month|all>.csv"),
+                    .child(self.export_location_text()),
             );
         }
 
-        // A preview of the first few rows, so the export can be sanity-checked
-        // on screen.
+        // A preview of the first rows of the scoped export, so what is seen
+        // is what the stakeholder gets: the picker's scope plus anchor,
+        // oldest first (all time ignores the anchor).
         body = body.child(
             div()
                 .pt_4()
@@ -2424,7 +3201,13 @@ impl TimetrackView {
                 .text_color(rgb(0x7a7a90))
                 .child("PREVIEW"),
         );
-        for e in self.snapshot.entries.iter().take(20) {
+        let preview = export_preview_entries(
+            &self.snapshot,
+            self.export_picker.scope,
+            self.export_picker.anchor_ms,
+            &tz,
+        );
+        for e in preview.iter().take(20) {
             let project = self
                 .snapshot
                 .projects
@@ -2444,13 +3227,13 @@ impl TimetrackView {
                     .child(e.label().to_string()),
             );
         }
-        if self.snapshot.entries.len() > 20 {
+        if preview.len() > 20 {
             body = body.child(
                 div()
                     .pt_1()
                     .text_sm()
                     .text_color(rgb(0x6a6a80))
-                    .child(format!("… and {} more", self.snapshot.entries.len() - 20)),
+                    .child(format!("… and {} more", preview.len() - 20)),
             );
         }
         body.into_any_element()
@@ -3066,5 +3849,766 @@ mod tests {
         assert_eq!(bar_width(0, 3_600_000), 0.0);
         // No entries (or no time) anywhere: zero width, never NaN.
         assert_eq!(bar_width(0, 0), 0.0);
+    }
+
+    // --- export anchor picker (ticket #25) ---
+
+    fn utc_tz() -> timetrack_core::Tz {
+        timetrack_core::Tz::utc()
+    }
+
+    fn day_anchor(text: &str) -> i64 {
+        timetrack_core::parse_anchor_day(text, "anchor", &utc_tz()).unwrap()
+    }
+
+    #[test]
+    fn anchor_picker_defaults_to_this_week_at_now() {
+        // The anchor is now at view creation; week is the default scope, and
+        // the typed day mirrors the anchor's local day.
+        let now = 1_791_460_800_000; // Thu 8 Oct 2026 12:00 UTC
+        let picker = ExportPicker::new(now);
+        assert_eq!(picker.scope, timetrack_core::ExportScope::Week);
+        assert_eq!(picker.anchor_ms, now);
+        assert_eq!(picker.anchor_text, "2026-10-08");
+        assert!(picker.is_active());
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W41");
+    }
+
+    #[test]
+    fn week_stepper_moves_one_week_per_press_across_year_boundary() {
+        // 2026-01-01 was a Thursday opening ISO week 2026-W01; one press back
+        // lands in 2025-W52, and the label follows the core week id.
+        let mut picker = ExportPicker::new(day_anchor("2026-01-01"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W01");
+        picker.step(-1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2025-12-25"));
+        assert_eq!(picker.anchor_text, "2025-12-25");
+        assert_eq!(picker.period_label(&utc_tz()), "2025-W52");
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-01-01"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W01");
+    }
+
+    #[test]
+    fn month_stepper_moves_one_month_per_press_across_year_boundary() {
+        let mut picker = ExportPicker::new(day_anchor("2026-01-15"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W03");
+        picker.set_scope(timetrack_core::ExportScope::Month, &utc_tz());
+        assert_eq!(picker.period_label(&utc_tz()), "2026-01");
+        picker.step(-1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2025-12-15"));
+        assert_eq!(picker.anchor_text, "2025-12-15");
+        assert_eq!(picker.period_label(&utc_tz()), "2025-12");
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-01-15"));
+        assert_eq!(picker.period_label(&utc_tz()), "2026-01");
+    }
+
+    #[test]
+    fn month_stepper_clamps_to_short_months() {
+        // 2026 is not a leap year, so stepping back from 31 March lands on
+        // 28 February rather than spilling into March.
+        let mut picker = ExportPicker::new(day_anchor("2026-03-31"));
+        picker.set_scope(timetrack_core::ExportScope::Month, &utc_tz());
+        picker.step(-1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-02-28"));
+        assert_eq!(picker.anchor_text, "2026-02-28");
+    }
+
+    #[test]
+    fn typed_day_and_stepper_share_one_anchor() {
+        // Typing a day moves the same anchor the stepper moves: after the
+        // commit the label follows, and the next press steps from there.
+        let mut picker = ExportPicker::new(day_anchor("2026-10-08"));
+        picker.start_editing();
+        picker.anchor_text = "2026-10-12".to_string();
+        assert!(picker.commit(&utc_tz()));
+        assert_eq!(picker.anchor_ms, day_anchor("2026-10-12"));
+        assert_eq!(picker.anchor_text, "2026-10-12");
+        assert_eq!(picker.error, None);
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W42");
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, day_anchor("2026-10-19"));
+        assert_eq!(picker.anchor_text, "2026-10-19");
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W43");
+    }
+
+    #[test]
+    fn bad_day_leaves_the_anchor_alone() {
+        let before = day_anchor("2026-10-08");
+        let mut picker = ExportPicker::new(before);
+        for bad in ["2026-13-01", "2026-02-30", "not-a-day", "2026-10"] {
+            picker.start_editing();
+            picker.anchor_text = bad.to_string();
+            assert!(!picker.commit(&utc_tz()), "{bad:?} must not commit");
+            assert_eq!(
+                picker.anchor_ms, before,
+                "{bad:?} must leave the anchor alone"
+            );
+            let err = picker.error.clone().expect("an inline error is shown");
+            assert!(err.contains("anchor"), "must name the field: {err}");
+            assert!(err.contains(bad), "must name the bad day: {err}");
+        }
+    }
+
+    #[test]
+    fn all_time_leaves_the_anchor_controls_inert() {
+        // All time ignores the anchor, so the stepper is a no-op and the
+        // field never opens there; the anchor itself is kept, not cleared.
+        let before = day_anchor("2026-10-08");
+        let mut picker = ExportPicker::new(before);
+        picker.set_scope(timetrack_core::ExportScope::All, &utc_tz());
+        assert!(!picker.is_active());
+        assert_eq!(picker.period_label(&utc_tz()), "all time");
+        picker.step(-1, &utc_tz());
+        picker.step(1, &utc_tz());
+        assert_eq!(picker.anchor_ms, before, "stepping all time moves nothing");
+        picker.start_editing();
+        assert!(!picker.editing, "the day field never opens for all time");
+        assert_eq!(picker.anchor_ms, before);
+    }
+
+    #[test]
+    fn switching_scope_keeps_the_anchor() {
+        let anchor = day_anchor("2026-09-15");
+        let mut picker = ExportPicker::new(anchor);
+        assert_eq!(picker.period_label(&utc_tz()), "2026-W38");
+        picker.set_scope(timetrack_core::ExportScope::Month, &utc_tz());
+        assert_eq!(picker.anchor_ms, anchor);
+        assert_eq!(picker.anchor_text, "2026-09-15");
+        assert_eq!(picker.period_label(&utc_tz()), "2026-09");
+    }
+
+    #[test]
+    fn period_labels_use_the_core_week_and_month_ids() {
+        assert_eq!(
+            export_period_label(
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            "2026-W41"
+        );
+        assert_eq!(
+            export_period_label(
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-09-15"),
+                &utc_tz()
+            ),
+            "2026-09"
+        );
+        assert_eq!(
+            export_period_label(
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-09-15"),
+                &utc_tz()
+            ),
+            "all time"
+        );
+        assert_eq!(
+            shift_export_anchor(
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-09-15"),
+                1,
+                &utc_tz()
+            ),
+            day_anchor("2026-09-15"),
+            "all time ignores the anchor entirely"
+        );
+    }
+
+    #[test]
+    fn week_stepper_stays_at_midday_across_dst() {
+        // GUI pin of the core DST fix: stepping a week across Rome's spring
+        // forward must land at midday, not 11:00 drifting off the day.
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        let before = timetrack_core::parse_anchor_day("2026-03-22", "anchor", &rome).unwrap();
+        let after = shift_export_anchor(timetrack_core::ExportScope::Week, before, 1, &rome);
+        assert_eq!(format_anchor_day(after, &rome), "2026-03-29");
+        assert_eq!(timetrack_core::format_local_hm(after, &rome), "12:00");
+        let back = shift_export_anchor(timetrack_core::ExportScope::Week, after, -1, &rome);
+        assert_eq!(format_anchor_day(back, &rome), "2026-03-22");
+        assert_eq!(timetrack_core::format_local_hm(back, &rome), "12:00");
+    }
+
+    #[test]
+    fn typed_day_refreshes_from_the_snapshot_zone() {
+        // The picker opens on UTC (the default snapshot's zone); the first
+        // real snapshot re-mirrors the just-opened value, but never a day
+        // being typed.
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        // 2026-07-05 23:30 UTC is 2026-07-06 in Rome (+2): the UTC mirror
+        // shows the 5th, the Rome mirror the 6th.
+        let anchor = 1_783_294_200_000;
+        assert_eq!(format_anchor_day(anchor, &utc_tz()), "2026-07-05");
+        let mut picker = ExportPicker::new(anchor);
+        assert_eq!(picker.anchor_text, "2026-07-05");
+        picker.refresh_from_snapshot(&rome);
+        assert_eq!(picker.anchor_text, "2026-07-06");
+        // While typing, the user's text wins.
+        picker.start_editing();
+        picker.anchor_text = "2026-10-".to_string();
+        picker.refresh_from_snapshot(&utc_tz());
+        assert_eq!(picker.anchor_text, "2026-10-");
+    }
+
+    #[test]
+    fn location_line_names_a_portal_grant_path() {
+        // After a portal grant the tab names the chosen path it wrote to;
+        // fallback saves (and no save yet) keep the home-directory wording.
+        assert_eq!(
+            export_location_text(Some(("/home/user/chosen.csv", true))),
+            "Saved via system dialog: /home/user/chosen.csv"
+        );
+        assert_eq!(
+            export_location_text(Some(("/home/user/timetrack-export-all.csv", false))),
+            export_location_label()
+        );
+        assert_eq!(export_location_text(None), export_location_label());
+    }
+
+    // --- scoped preview plus honest interim save (ticket #26) ---
+
+    /// Three entries, newest first as the service sends them: one in
+    /// 2026-W40 (30 Sep) and two in 2026-W41 (6 and 7 Oct).
+    fn preview_snapshot() -> Snapshot {
+        Snapshot {
+            entries: vec![
+                entry_on(
+                    "e3",
+                    "p1",
+                    day_anchor("2026-10-07"),
+                    day_anchor("2026-10-07") + 3_600_000,
+                ),
+                entry_on(
+                    "e2",
+                    "p1",
+                    day_anchor("2026-10-06"),
+                    day_anchor("2026-10-06") + 3_600_000,
+                ),
+                entry_on(
+                    "e1",
+                    "p1",
+                    day_anchor("2026-09-30"),
+                    day_anchor("2026-09-30") + 3_600_000,
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn preview_ids(
+        snap: &Snapshot,
+        scope: timetrack_core::ExportScope,
+        anchor_ms: i64,
+    ) -> Vec<String> {
+        export_preview_entries(snap, scope, anchor_ms, &utc_tz())
+            .iter()
+            .map(|e| e.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn preview_lists_the_scoped_rows_oldest_first() {
+        // The service sends newest first; the preview shows what the file
+        // will hold: the anchored week's rows oldest first.
+        let snap = preview_snapshot();
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08")
+            ),
+            vec!["e2".to_string(), "e3".to_string()]
+        );
+    }
+
+    #[test]
+    fn preview_changes_with_the_anchor() {
+        let snap = preview_snapshot();
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-09-30")
+            ),
+            vec!["e1".to_string()]
+        );
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-09-30")
+            ),
+            vec!["e1".to_string()]
+        );
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-10-08")
+            ),
+            vec!["e2".to_string(), "e3".to_string()]
+        );
+    }
+
+    #[test]
+    fn all_time_preview_ignores_the_anchor() {
+        // A stale anchor must never narrow a full export, on screen or in
+        // the file: both anchors preview every entry oldest first.
+        let snap = preview_snapshot();
+        let all = vec!["e1".to_string(), "e2".to_string(), "e3".to_string()];
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-09-30")
+            ),
+            all
+        );
+        assert_eq!(
+            preview_ids(
+                &snap,
+                timetrack_core::ExportScope::All,
+                day_anchor("2026-10-08")
+            ),
+            all
+        );
+    }
+
+    #[test]
+    fn interim_save_uses_period_stamped_names() {
+        // One file per week or month so weeks never overwrite each other;
+        // all time keeps the plain name whatever the anchor is.
+        let week = default_export_path(
+            timetrack_core::ExportScope::Week,
+            day_anchor("2026-10-08"),
+            &utc_tz(),
+        );
+        assert!(
+            week.ends_with("timetrack-export-week-2026-W41.csv"),
+            "week file carries its week id: {week}"
+        );
+        let month = default_export_path(
+            timetrack_core::ExportScope::Month,
+            day_anchor("2026-09-15"),
+            &utc_tz(),
+        );
+        assert!(
+            month.ends_with("timetrack-export-month-2026-09.csv"),
+            "month file carries its month id: {month}"
+        );
+        for anchor in [day_anchor("2026-09-15"), day_anchor("2026-10-08")] {
+            let all = default_export_path(timetrack_core::ExportScope::All, anchor, &utc_tz());
+            assert!(
+                all.ends_with("timetrack-export-all.csv"),
+                "all time ignores the anchor: {all}"
+            );
+        }
+    }
+
+    #[test]
+    fn interim_location_is_labelled_home_dir() {
+        // The app runs unsandboxed, so the fallback writes to the real
+        // home: the label must say so until the portal dialog lands.
+        let label = export_location_label();
+        assert!(label.contains("~/"), "label names the home dir: {label}");
+        assert!(
+            !label.contains("sandbox"),
+            "label never claims a sandbox: {label}"
+        );
+    }
+
+    #[test]
+    fn saved_status_names_count_scope_period_and_name() {
+        // End to end of the interim save wording: the period-stamped path's
+        // basename plus the picker's period label, in the shared core
+        // wording. The literals are the independent truth, not a recompute.
+        let scope = timetrack_core::ExportScope::Week;
+        let anchor = day_anchor("2026-10-08");
+        let path = default_export_path(scope, anchor, &utc_tz());
+        let basename = path.rsplit('/').next().unwrap();
+        let period = export_period_label(scope, anchor, &utc_tz());
+        assert_eq!(
+            export_saved_status(2, scope, &period, basename),
+            "exported 2 entries (week 2026-W41) to timetrack-export-week-2026-W41.csv"
+        );
+        let all_path = default_export_path(
+            timetrack_core::ExportScope::All,
+            day_anchor("2026-10-08"),
+            &utc_tz(),
+        );
+        let all_basename = all_path.rsplit('/').next().unwrap();
+        assert_eq!(
+            export_saved_status(
+                3,
+                timetrack_core::ExportScope::All,
+                "all time",
+                all_basename
+            ),
+            "exported 3 entries (all time) to timetrack-export-all.csv"
+        );
+    }
+
+    #[test]
+    fn all_time_save_ignores_the_anchor() {
+        // All time travels over the old scope-only call whatever the anchor
+        // is, so old services keep serving full exports.
+        for anchor in [day_anchor("2026-09-15"), day_anchor("2026-10-08")] {
+            assert_eq!(
+                export_anchor_for_save(
+                    timetrack_core::ExportScope::All,
+                    anchor,
+                    day_anchor("2026-10-08"),
+                    &utc_tz()
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn current_scope_save_uses_the_old_call() {
+        // The old call is anchored at now by the service, so a current
+        // anchor needs no new call and keeps working against old services.
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08"),
+                day_anchor("2026-10-06"),
+                &utc_tz()
+            ),
+            None
+        );
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-10-08"),
+                day_anchor("2026-10-01"),
+                &utc_tz()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn chosen_scope_save_uses_the_anchored_call() {
+        // A week or month outside the current one needs the scope-plus-anchor
+        // call; against an old service that call refuses with a version
+        // message rather than writing a wrong file.
+        let anchor = day_anchor("2026-09-30");
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Week,
+                anchor,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            Some(anchor)
+        );
+        assert_eq!(
+            export_anchor_for_save(
+                timetrack_core::ExportScope::Month,
+                anchor,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            Some(anchor)
+        );
+    }
+
+    // --- portal save dialog (ticket #27) ---
+
+    #[test]
+    fn portal_suggests_period_stamped_names() {
+        // The system save dialog opens with the period-stamped default name
+        // prefilled: the week or month id for scoped exports so one week
+        // never silently overwrites the last, the plain name for all time
+        // whatever the anchor is. The literals are the independent truth, not
+        // a recompute of the core naming.
+        assert_eq!(
+            export_suggested_name(
+                timetrack_core::ExportScope::Week,
+                day_anchor("2026-10-08"),
+                &utc_tz()
+            ),
+            "timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            export_suggested_name(
+                timetrack_core::ExportScope::Month,
+                day_anchor("2026-09-15"),
+                &utc_tz()
+            ),
+            "timetrack-export-month-2026-09.csv"
+        );
+        for anchor in [day_anchor("2026-09-15"), day_anchor("2026-10-08")] {
+            assert_eq!(
+                export_suggested_name(timetrack_core::ExportScope::All, anchor, &utc_tz()),
+                "timetrack-export-all.csv"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_save_writes_through_the_granted_path() {
+        // A confirmed dialog wins over the home-directory fallback: the
+        // bytes go to the path the portal granted, never to the fallback.
+        assert_eq!(
+            resolve_export_destination(
+                PortalOutcome::Granted("/home/user/chosen.csv".to_string()),
+                "/home/user/timetrack-export-week-2026-W41.csv",
+            ),
+            Some("/home/user/chosen.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn cancelled_save_is_a_quiet_no_op() {
+        // Cancelling the dialog resolves to no destination at all: the
+        // caller sends the quiet cancel status instead and writes nothing.
+        assert_eq!(
+            resolve_export_destination(
+                PortalOutcome::Cancelled,
+                "/home/user/timetrack-export-week-2026-W41.csv",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_portal_falls_back_to_the_home_dir_path() {
+        // No portal (headless CI): the direct home-directory write runs on,
+        // so the workflow never breaks where no dialog can open.
+        assert_eq!(
+            resolve_export_destination(
+                PortalOutcome::Unavailable,
+                "/home/user/timetrack-export-week-2026-W41.csv",
+            ),
+            Some("/home/user/timetrack-export-week-2026-W41.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn granted_path_write_lands_bytes_and_reports_status() {
+        // A confirmed save writes the already-fetched scoped CSV through the
+        // granted path and reports count, scope, week id and file base name
+        // in the shared core wording.
+        let csv = format!(
+            "{}\ne1,p1,review,2026-10-06T12:00:00,2026-10-06T13:00:00,01:00:00,60,manual,\ne2,p1,review,2026-10-07T12:00:00,2026-10-07T13:00:00,01:00:00,60,manual,\n",
+            timetrack_core::CSV_HEADER
+        );
+        let dest =
+            std::env::temp_dir().join(format!("tt-portal-granted-{}-week.csv", std::process::id()));
+        let dest_str = dest.to_string_lossy().into_owned();
+        let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
+        match export_write_msg(
+            &csv,
+            &dest_str,
+            timetrack_core::ExportScope::Week,
+            "2026-W41",
+            true,
+        ) {
+            Msg::ExportSaved {
+                status,
+                dest: saved_dest,
+                via_portal,
+            } => {
+                assert_eq!(
+                    status,
+                    format!("exported 2 entries (week 2026-W41) to {basename}")
+                );
+                assert_eq!(saved_dest, dest_str);
+                assert!(via_portal);
+            }
+            _ => panic!("a granted write reports success"),
+        }
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), csv);
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[test]
+    fn portal_stub_ignores_anything_else() {
+        assert_eq!(portal_stub_outcome("bogus", "x.csv"), None);
+        assert_eq!(portal_stub_outcome("", "x.csv"), None);
+    }
+
+    #[test]
+    fn portal_stub_records_the_dialog_name() {
+        // Headless-test seam: `record:<file>` logs the requested dialog
+        // name and reports the portal unavailable, so the direct
+        // fallback runs where no live portal exists.
+        let log = std::env::temp_dir().join(format!("tt-portal-stub-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(
+            portal_stub_outcome(
+                &format!("record:{}", log.to_string_lossy()),
+                "timetrack-export-week-2026-W41.csv",
+            ),
+            Some(PortalOutcome::Unavailable)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "timetrack-export-week-2026-W41.csv\n"
+        );
+        std::fs::remove_file(&log).unwrap();
+    }
+
+    // --- portal cancel, overwrite, and failure behavior (ticket #28) ---
+
+    #[test]
+    fn cancel_reports_a_quiet_status() {
+        // Cancelling the save dialog is a quiet no-op status, never an
+        // error: changing your mind is not a failure, so this travels as
+        // `Msg::Status`, not `Msg::Error`, and writes nothing (the
+        // `cancelled_save_is_a_quiet_no_op` pin above proves no destination).
+        assert_eq!(export_cancelled_status(), "export cancelled");
+        match export_cancel_msg() {
+            Msg::Status(text) => assert_eq!(text, "export cancelled"),
+            Msg::Error(_) => panic!("cancel must be a quiet status, not an error"),
+            _ => panic!("cancel must be a quiet status"),
+        }
+    }
+
+    #[test]
+    fn existing_destination_is_overwritten_without_a_second_prompt() {
+        // The portal's own overwrite question already governed an existing
+        // destination, so the app writes straight through it: no existence
+        // check, no second confirm, just the new bytes plus the saved status.
+        let csv = format!(
+            "{}\nnew,p1,review,2026-10-06T12:00:00,2026-10-06T13:00:00,01:00:00,60,manual,\n",
+            timetrack_core::CSV_HEADER
+        );
+        let dest = std::env::temp_dir().join(format!(
+            "tt-portal-overwrite-{}-week.csv",
+            std::process::id()
+        ));
+        let dest_str = dest.to_string_lossy().into_owned();
+        let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
+        std::fs::write(&dest, "old bytes").unwrap();
+        match export_write_msg(
+            &csv,
+            &dest_str,
+            timetrack_core::ExportScope::Week,
+            "2026-W41",
+            true,
+        ) {
+            Msg::ExportSaved { status, .. } => assert_eq!(
+                status,
+                format!("exported 1 entries (week 2026-W41) to {basename}")
+            ),
+            Msg::Error(_) => panic!("an existing destination must be overwritten, not refused"),
+            _ => panic!("overwrite must report success"),
+        }
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), csv);
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[test]
+    fn write_failure_is_a_local_error_naming_path_and_reason() {
+        // A granted path that cannot be written and a failing direct
+        // fallback share one outcome: a local error naming the path plus the
+        // reason, never a service or validation failure.
+        let dir = std::env::temp_dir().join(format!("tt-portal-fail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.to_string_lossy().into_owned();
+        let csv = format!("{}\n", timetrack_core::CSV_HEADER);
+        match export_write_msg(
+            &csv,
+            &dest,
+            timetrack_core::ExportScope::Week,
+            "2026-W41",
+            false,
+        ) {
+            Msg::Error(note) => {
+                assert_eq!(note.kind, StatusKind::Local);
+                assert!(
+                    note.text.starts_with(&format!("could not write {dest}")),
+                    "must name the path first: {}",
+                    note.text
+                );
+                assert!(
+                    note.text.contains(": "),
+                    "must name the reason too: {}",
+                    note.text
+                );
+                for banned in ["service", "validation", "invalid", "unknown", "version"] {
+                    assert!(
+                        !note.text.to_ascii_lowercase().contains(banned),
+                        "must never read as a service or validation failure ({banned}): {}",
+                        note.text
+                    );
+                }
+            }
+            Msg::Status(_) => panic!("an unwritable destination must report a local error"),
+            _ => panic!("an unwritable destination must report a local error"),
+        }
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn portal_stub_cancel_flag_returns_cancelled() {
+        // Headless cancel pin (no live portal): with `<log>.cancel` present,
+        // the stub still logs the requested dialog name but answers
+        // Cancelled, so the quiet no-op path runs without a dialog.
+        let log = std::env::temp_dir().join(format!(
+            "tt-portal-cancel-{}-{}.log",
+            std::process::id(),
+            "cancel-flag"
+        ));
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.cancel", log.to_string_lossy()));
+        std::fs::write(format!("{}.cancel", log.to_string_lossy()), "").unwrap();
+        assert_eq!(
+            portal_stub_outcome(
+                &format!("record:{}", log.to_string_lossy()),
+                "timetrack-export-week-2026-W41.csv",
+            ),
+            Some(PortalOutcome::Cancelled)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "timetrack-export-week-2026-W41.csv\n"
+        );
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.cancel", log.to_string_lossy()));
+    }
+
+    #[test]
+    fn portal_stub_fail_flag_returns_an_unwritable_grant() {
+        // Headless failure pin (no live portal): with `<log>.fail` present,
+        // the stub still logs the requested dialog name but grants a path
+        // that cannot be written, so the local-error path runs without a
+        // dialog.
+        let log = std::env::temp_dir().join(format!(
+            "tt-portal-fail-{}-{}.log",
+            std::process::id(),
+            "fail-flag"
+        ));
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
+        std::fs::write(format!("{}.fail", log.to_string_lossy()), "").unwrap();
+        match portal_stub_outcome(
+            &format!("record:{}", log.to_string_lossy()),
+            "timetrack-export-week-2026-W41.csv",
+        ) {
+            Some(PortalOutcome::Granted(dest)) => {
+                assert!(
+                    dest.contains("timetrack-export-week-2026-W41.csv"),
+                    "granted path must carry the dialog name: {dest}"
+                );
+                assert!(
+                    std::fs::write(&dest, "probe").is_err(),
+                    "granted path must be unwritable: {dest}"
+                );
+            }
+            _other => panic!("fail flag must grant an unwritable path"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "timetrack-export-week-2026-W41.csv\n"
+        );
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
     }
 }

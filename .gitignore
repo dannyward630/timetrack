@@ -2,10 +2,12 @@
 /target/
 **/*.rs.bk
 
-# flatpak-builder
-/.flatpak-builder/
-/build-flatpak/
-/tt-repo/
+# AppImage
+/AppDir/
+/TimeTrack-*.AppImage
+/linuxdeploy-*.AppImage
+/appimagetool-*.AppImage
+/squashfs-root/
 
 # Editor / OS
 *.swp

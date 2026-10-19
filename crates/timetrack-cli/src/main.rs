@@ -206,9 +206,16 @@ enum Command {
 
     /// Export entries as CSV (REQUIREMENTS §10).
     Export {
-        /// What to export: `week` (current ISO week), `month` or `all`.
+        /// What to export: `week` (the ISO week), `month` or `all`.
+        /// Old spellings (`this-week`, `current-week`, `all-time`, ...) keep
+        /// working via the shared scope table.
         #[arg(long, default_value = "all")]
         scope: String,
+        /// Day inside the week or month to export (`YYYY-MM-DD`, alongside
+        /// the existing moment spellings). Omitted means now; ignored by
+        /// `all` without warning.
+        #[arg(long, allow_hyphen_values = true)]
+        at: Option<String>,
         /// Write to this file instead of stdout.
         #[arg(short, long)]
         out: Option<std::path::PathBuf>,
@@ -514,12 +521,48 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
 
         Command::List { limit } => print_list(&client.snapshot().await?, limit),
 
-        Command::Export { scope, out } => {
-            let csv = client.export_csv(&scope).await?;
+        Command::Export { scope, at, out } => {
+            // Scope first, so a typo is refused before touching the bus.
+            let parsed = parse_export_scope(&scope)?;
+            // The file status needs the period id, which needs the snapshot
+            // zone plus the anchor the CSV was fetched with. All time needs
+            // no zone (its anchor is ignored); chosen scopes already fetch
+            // the snapshot for the anchor; current scopes fetch it here only
+            // when writing to a file.
+            let (csv, period_id) = if parsed == timetrack_core::ExportScope::All {
+                // All time ignores the anchor entirely: no parse, no warning,
+                // so a stale `--at` never narrows a full export and old
+                // services keep serving it over the old call.
+                let csv = client.export_csv(&scope).await?;
+                (csv, parsed.period_id(0, &timetrack_core::Tz::utc()))
+            } else if let Some(at_text) = at {
+                // Chosen week/month: parse the day to an instant in the
+                // snapshot zone, then use the anchored call. Against an old
+                // service this answers unknown-method/interface, which the
+                // proto sorts as a version refusal -- a version message,
+                // never a wrong file (reuses the ticket-23 wording as-is).
+                let snap = client.snapshot().await?;
+                let tz = snapshot_tz(&snap);
+                let anchor_ms = parse_export_anchor(&at_text, &tz)?;
+                let csv = client.export_csv_at(&scope, anchor_ms).await?;
+                (csv, parsed.period_id(anchor_ms, &tz))
+            } else {
+                // Current week/month: the old call, anchored at now by the
+                // service, so old clients and old services keep working.
+                let csv = client.export_csv(&scope).await?;
+                let period_id = match &out {
+                    Some(_) => {
+                        let snap = client.snapshot().await?;
+                        parsed.period_id(now_ms(), &snapshot_tz(&snap))
+                    }
+                    None => String::new(),
+                };
+                (csv, period_id)
+            };
             match out {
                 Some(path) => {
                     std::fs::write(&path, &csv)?;
-                    println!("exported to {}", path.display());
+                    println!("{}", export_file_status(&csv, parsed, &period_id, &path));
                 }
                 None => print!("{csv}"),
             }
@@ -648,6 +691,59 @@ fn now_ms() -> i64 {
 /// GUI cannot disagree; this is a thin wrapper that supplies the clock.
 fn parse_when(text: &str, what: &str, tz: &timetrack_core::Tz) -> Result<i64> {
     timetrack_core::parse_moment(text, what, now_ms(), tz).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Parse an export scope, refusing unknown spellings with the service's own
+/// sentence so scripts match one string either side of the bus.
+fn parse_export_scope(scope: &str) -> Result<timetrack_core::ExportScope> {
+    timetrack_core::ExportScope::parse(scope)
+        .ok_or_else(|| anyhow::anyhow!("unknown export scope '{scope}' (use week, month or all)"))
+}
+
+/// Parse an export anchor (`--at`) to an instant, in the snapshot zone.
+///
+/// The calendar-day spelling (`YYYY-MM-DD`, resolving to local midday so
+/// midnight/DST edges cannot shift it) goes through the export-only
+/// [`timetrack_core::parse_anchor_day`]; the existing moment spellings go
+/// through [`timetrack_core::parse_moment`]. Days never reach the moment
+/// parser, so `add -S` keeps refusing them while `--at` accepts both.
+fn parse_export_anchor(text: &str, tz: &timetrack_core::Tz) -> Result<i64> {
+    if let Ok(anchor) = timetrack_core::parse_anchor_day(text, "at", tz) {
+        return Ok(anchor);
+    }
+    match timetrack_core::parse_moment(text, "at", now_ms(), tz) {
+        Ok(at) => Ok(at),
+        Err(moment_err) => {
+            // Both spellings failed: a day-shaped value must report the day
+            // error (naming the value as a day), anything else the moment
+            // error. Relative moments like `-90` never reach here — they
+            // succeed via `parse_moment` above.
+            let trimmed = text.trim();
+            if trimmed.contains('-') || trimmed.contains('/') {
+                timetrack_core::parse_anchor_day(text, "at", tz).map_err(|e| anyhow::anyhow!("{e}"))
+            } else {
+                Err(anyhow::anyhow!("{moment_err}"))
+            }
+        }
+    }
+}
+
+/// Status line after a `--out` save: entry count, scope, period and file.
+///
+/// Counts the CSV rows minus the header and reuses the shared core wording,
+/// so the CLI and the GUI report the same sentence for the same file.
+fn export_file_status(
+    csv: &str,
+    scope: timetrack_core::ExportScope,
+    period_id: &str,
+    path: &std::path::Path,
+) -> String {
+    let count = csv.lines().count().saturating_sub(1);
+    let basename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    timetrack_core::format_export_status(count, scope, period_id, &basename)
 }
 
 /// The snapshot's zone: prefer the name, fall back to the fixed offset for
@@ -812,5 +908,173 @@ mod tests {
         // someone's alias should fail here, not at runtime.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn export_accepts_scope_at_and_out() {
+        // `timetrack export --scope week --at <day> --out <file>`: the chosen
+        // export surface (spec #19, ticket #24).
+        let cli = Cli::try_parse_from([
+            "timetrack",
+            "export",
+            "--scope",
+            "week",
+            "--at",
+            "2026-10-12",
+        ])
+        .expect("export args must parse");
+        match cli.command {
+            Some(Command::Export { scope, at, out }) => {
+                assert_eq!(scope, "week");
+                assert_eq!(at.as_deref(), Some("2026-10-12"));
+                assert!(out.is_none());
+            }
+            other => panic!("expected export, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "timetrack",
+            "export",
+            "--scope",
+            "month",
+            "--at",
+            "2026-09-15",
+            "--out",
+            "/tmp/x.csv",
+        ])
+        .expect("export --out must parse");
+        match cli.command {
+            Some(Command::Export { scope, at, out }) => {
+                assert_eq!(scope, "month");
+                assert_eq!(at.as_deref(), Some("2026-09-15"));
+                assert_eq!(
+                    out,
+                    Some(std::path::PathBuf::from("/tmp/x.csv")),
+                    "explicit file lands where the caller says"
+                );
+            }
+            other => panic!("expected export, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_old_scope_spellings_keep_working() {
+        // `ExportScope::parse` is the single spelling table; the CLI must not
+        // narrow it (compat per ADR-0001).
+        for ok in [
+            "week",
+            "this-week",
+            "current-week",
+            "month",
+            "this-month",
+            "current-month",
+            "all",
+            "all-time",
+        ] {
+            assert!(parse_export_scope(ok).is_ok(), "{ok:?} must keep working");
+        }
+    }
+
+    #[test]
+    fn export_bad_scope_is_refused_with_the_service_wording() {
+        // Same sentence the service uses, so scripts match one string.
+        let e = parse_export_scope("bogus").unwrap_err().to_string();
+        assert!(
+            e.contains("unknown export scope 'bogus'"),
+            "must name the scope, got: {e}"
+        );
+        assert!(
+            e.contains("week, month or all"),
+            "must name the choices: {e}"
+        );
+    }
+
+    #[test]
+    fn export_anchor_day_resolves_to_local_midday() {
+        // 2026-10-12 at midday UTC, the independent literal from the core
+        // anchor tests (ticket #20 pins the same instant).
+        let anchor = parse_export_anchor("2026-10-12", &timetrack_core::Tz::utc()).unwrap();
+        assert_eq!(anchor, 1_791_806_400_000);
+        assert_eq!(
+            timetrack_core::format_local_hm(anchor, &timetrack_core::Tz::utc()),
+            "12:00"
+        );
+    }
+
+    #[test]
+    fn export_bad_anchor_names_the_value() {
+        for bad in ["2026-13-01", "not-a-day"] {
+            let e = parse_export_anchor(bad, &timetrack_core::Tz::utc())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(bad), "{bad:?} must name the value: {e}");
+        }
+    }
+
+    #[test]
+    fn entry_moments_refuse_calendar_days() {
+        // Regression: days leaked into every moment field, so `add -S
+        // 2026-10-12` parsed as midday instead of refusing. Days belong to
+        // `--at` only; entry moments keep main-branch behaviour.
+        let utc = timetrack_core::Tz::utc();
+        for what in ["start", "end", "at"] {
+            let e = parse_when("2026-10-12", what, &utc)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(what), "must name the field: {e}");
+            assert!(e.contains("2026-10-12"), "must name the value: {e}");
+        }
+    }
+
+    #[test]
+    fn export_anchor_accepts_days_and_moments() {
+        // `--at` is the one path that accepts both: days via the anchor
+        // parser, moments via the shared moment parser.
+        let utc = timetrack_core::Tz::utc();
+        assert_eq!(
+            parse_export_anchor("2026-10-12", &utc).unwrap(),
+            1_791_806_400_000
+        );
+        assert!(parse_export_anchor("now", &utc).is_ok());
+        assert!(parse_export_anchor("-90", &utc).is_ok());
+        assert!(parse_export_anchor("09:30", &utc).is_ok());
+    }
+
+    #[test]
+    fn file_status_names_count_scope_period_and_name() {
+        // Spec: the `--out` status names entry count, scope, period id and
+        // file base name in the shared core wording — never bare
+        // `exported to {path}`.
+        let csv = format!(
+            "{}\na,p1,x,2026-10-06T12:00:00,2026-10-06T13:00:00,01:00:00,60,manual,\nb,p1,y,2026-10-07T12:00:00,2026-10-07T13:00:00,01:00:00,60,manual,\n",
+            timetrack_core::CSV_HEADER
+        );
+        assert_eq!(
+            export_file_status(
+                &csv,
+                timetrack_core::ExportScope::Week,
+                "2026-W41",
+                std::path::Path::new("/tmp/timetrack-export-week-2026-W41.csv"),
+            ),
+            "exported 2 entries (week 2026-W41) to timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            export_file_status(
+                &csv,
+                timetrack_core::ExportScope::All,
+                "all time",
+                std::path::Path::new("/tmp/timetrack-export-all.csv"),
+            ),
+            "exported 2 entries (all time) to timetrack-export-all.csv"
+        );
+        // Header alone counts zero.
+        assert_eq!(
+            export_file_status(
+                timetrack_core::CSV_HEADER,
+                timetrack_core::ExportScope::Month,
+                "2026-09",
+                std::path::Path::new("timetrack-export-month-2026-09.csv"),
+            ),
+            "exported 0 entries (month 2026-09) to timetrack-export-month-2026-09.csv"
+        );
     }
 }

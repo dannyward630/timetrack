@@ -42,16 +42,20 @@ pub mod storage;
 pub mod tz;
 
 pub use aggregate::{
-    IsoWeek, Totals, all_totals, iso_week_of, month_of, month_totals, totals_in_day_range,
-    week_totals,
+    IsoWeek, Totals, all_totals, days_in_month, is_leap_year, iso_week_of, month_of, month_totals,
+    totals_in_day_range, week_totals,
 };
 pub use export::{
-    CSV_HEADER, ExportScope, entries_in_scope, escape_field, export_csv, format_local_iso8601,
+    CSV_HEADER, ExportScope, anchor_day_string, default_export_filename, entries_in_scope,
+    entries_in_scope_at, entry_in_scope, escape_field, export_csv, export_csv_at,
+    format_export_status, format_local_iso8601, month_id, week_id,
 };
 pub use model::{
     Entry, EntrySource, MS_PER_DAY, Project, STORE_VERSION, Store, local_day_of, local_day_start,
 };
-pub use parse::{ParseError, ParseResult, format_local_hm, parse_duration, parse_moment};
+pub use parse::{
+    ParseError, ParseResult, format_local_hm, parse_anchor_day, parse_duration, parse_moment,
+};
 pub use rules::{
     Counter, Ids, QUICK_ADD_MS, RuleError, RuleResult, create_duration, create_entry,
     create_project, days_exceeding_24h, delete_entry, delete_project, format_merge_delta,
