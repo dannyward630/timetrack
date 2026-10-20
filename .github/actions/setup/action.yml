@@ -1,0 +1,51 @@
+name: Set up the build environment
+description: >-
+  Install system packages, a Rust toolchain and the crate registry cache. Both
+  workflows go through this, so the dependency list and the caching rule live
+  in one place instead of being repeated per job.
+
+inputs:
+  apt-packages:
+    description: Space-separated apt packages to install; empty installs nothing.
+    required: false
+    default: ""
+  components:
+    description: Comma-separated rustup components, e.g. clippy,rustfmt.
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated rustup targets, e.g. x86_64-unknown-linux-musl.
+    required: false
+    default: ""
+  cache:
+    description: Cache the crate registry across runs.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install system packages
+      if: inputs.apt-packages != ''
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.apt-packages }}
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # Only the crate registry and the git checkouts are cached. A target
+    # directory for this workspace runs to several gigabytes per job (gpui is
+    # the bulk of it), and the whole repository gets 10 GB of cache, so caching
+    # those would evict the registry caches that are actually cheap to reuse.
+    - uses: actions/cache@v4
+      if: inputs.cache == 'true'
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-${{ runner.os }}-

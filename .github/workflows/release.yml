@@ -3,82 +3,68 @@ name: release
 # Publishes the terminal client as statically linked `timetrack` binaries
 # plus the desktop GUI as a self-contained AppImage bundling
 # `timetrack-gui` and `timetrack-service` (see build-appimage.sh).
+#
+# A tag is the only thing that publishes. `workflow_dispatch` runs the same
+# build and the same verification with `dry_run` on by default: the artifacts
+# land as run artifacts and no release is created, which is how the packaging
+# path can be checked without cutting a version.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify the artifacts, but publish no release
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  GUI_LIBS: libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
 
 jobs:
-  test:
-    name: tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # `--workspace` builds timetrack-gui too, and gpui links the system
-      # libraries below. Without them the test job fails at build time, which
-      # reads as a broken test rather than a missing -dev package.
-      - name: Install the GUI's system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --locked
-
-  lint:
-    name: lints
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Clippy builds the whole workspace including the GUI, so it needs the
-      # same system libraries as the test job.
-      - name: Install the GUI's system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      # `--all-targets` covers the test helpers too, where the last batch of
-      # warnings lived. `-D warnings` makes any new one fail the build.
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo fmt --all -- --check
+  # ci.yml is the single definition of what "green" means, so a tag cannot
+  # publish a tree that rustfmt, clippy, the tests, the e2e rig or the GUI
+  # smoke check reject.
+  checks:
+    name: checks
+    uses: ./.github/workflows/ci.yml
 
   build:
     name: ${{ matrix.target }}
+    needs: checks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64
+            packages: musl-tools
+          # The aarch64 binary is cross-compiled, so running it in the
+          # verification step below needs an emulator on the runner.
           - target: aarch64-unknown-linux-musl
             arch: aarch64
+            packages: musl-tools gcc-aarch64-linux-gnu qemu-user-static binfmt-support
 
     steps:
       - uses: actions/checkout@v4
 
       # `musl-tools` is the Debian/Ubuntu package name for the musl cross
-      # toolchain. Deliberately NO CARGO_TARGET_*_LINKER override: rust's
-      # default linker (rust-lld) for musl targets is what works. Some
-      # distros' musl-gcc (GCC 16.x on Arch as of 2026-09) produces binaries
-      # that segfault on anything that hashes -- std's HashMap, and therefore
-      # zbus' D-Bus address parser. See .cargo/config.toml.
-      - name: Install the musl cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # toolchain; the aarch64 build needs its cross gcc as well. Deliberately
+      # NO CARGO_TARGET_*_LINKER override: rust's default linker (rust-lld) for
+      # musl targets is what works. Some distros' musl-gcc (GCC 16.x on Arch as
+      # of 2026-09) produces binaries that segfault on anything that hashes --
+      # std's HashMap, and therefore zbus' D-Bus address parser. See
+      # .cargo/config.toml.
+      - uses: ./.github/actions/setup
         with:
+          apt-packages: ${{ matrix.packages }}
           targets: ${{ matrix.target }}
 
       - name: Build
@@ -107,7 +93,14 @@ jobs:
           # argument parsing and the hash map that zbus needs.
           "$BIN" --version
 
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run }}
+        with:
+          name: timetrack-${{ matrix.arch }}
+          path: dist/
+
       - uses: softprops/action-gh-release@v2
+        if: ${{ !inputs.dry_run }}
         with:
           files: |
             dist/*.tar.gz
@@ -116,16 +109,16 @@ jobs:
 
   appimage:
     name: TimeTrack-x86_64.AppImage
+    needs: checks
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       # linuxdeploy bundles these from the build host into the image, but
       # building the GUI still needs their headers, same as the test job.
-      - name: Install the GUI's system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev file
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup
+        with:
+          apt-packages: ${{ env.GUI_LIBS }} file
       - name: Build the AppImage
         run: ./build-appimage.sh
       - name: Checksum
@@ -140,8 +133,15 @@ jobs:
           test -x squashfs-root/usr/bin/timetrack-service
           test -x squashfs-root/AppRun
           rm -rf squashfs-root
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run }}
+        with:
+          name: TimeTrack-x86_64.AppImage
+          path: dist/
       - uses: softprops/action-gh-release@v2
+        if: ${{ !inputs.dry_run }}
         with:
           files: |
             dist/TimeTrack-x86_64.AppImage
             dist/TimeTrack-x86_64.AppImage.sha256
+

@@ -1,0 +1,110 @@
+name: ci
+
+# The checks a change has to pass: rustfmt, clippy, the unit tests, the service
+# end-to-end rig, and the headless GUI smoke check. This workflow is the only
+# definition of them -- `release.yml` calls it, so a tag publishes nothing
+# until these jobs pass on the tagged commit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # gpui links these, and both clippy and `cargo test --workspace` build the GUI
+  # crate along with the rest of the workspace, so every job that compiles the
+  # workspace needs them -- without them the build fails, which reads as a
+  # broken test rather than as a missing -dev package (README, "Building").
+  GUI_LIBS: libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
+  # The e2e rig drives a real service on a private session bus and reads
+  # aggregate snapshots back through gdbus.
+  RIG_TOOLS: dbus libglib2.0-bin
+  # gui-smoke drives the real GUI on a headless X server, so it needs: Xvfb
+  # itself; xdpyinfo to wait for it; setxkbmap, because an Xvfb server has no
+  # keymap and every keysym lookup would otherwise return 0; ImageMagick to
+  # read the pixels back; libXtst for the XTest helper the script compiles;
+  # fonts for gpui to shape text with; and a software Vulkan driver, because
+  # Xvfb implements no DRI3 and Mesa's GPU drivers need it to present.
+  GUI_RIG: >-
+    xvfb x11-utils x11-xserver-utils imagemagick libxtst-dev fonts-dejavu-core
+    mesa-vulkan-drivers
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          components: rustfmt
+          cache: "false" # formatting reads no dependencies
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          apt-packages: ${{ env.GUI_LIBS }}
+          components: clippy
+      # `--all-targets` covers the test helpers too, where the last batch of
+      # warnings lived. `-D warnings` makes any new one fail the build.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          apt-packages: ${{ env.GUI_LIBS }}
+      - run: cargo test --workspace --locked
+
+  e2e:
+    name: e2e (service on a private bus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          apt-packages: ${{ env.RIG_TOOLS }}
+      # The rig drives the release binaries, which is how the README tells a
+      # person to run them. Neither the CLI nor the service pulls in gpui, so
+      # this build is a fraction of the GUI one.
+      - run: cargo build --release --locked --package timetrack-cli --package timetrack-service
+      - run: bash scripts/e2e.sh
+
+  gui-smoke:
+    name: gui-smoke (headless GUI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          apt-packages: ${{ env.GUI_LIBS }} ${{ env.GUI_RIG }}
+      # The smoke check starts all three binaries itself, so this is the whole
+      # workspace in release mode -- the long build, and the one check that can
+      # say the toolkit still paints, hit-tests and reads the keyboard.
+      - run: >-
+          cargo build --release --locked
+          --package timetrack-gui --package timetrack-service --package timetrack-cli
+      - run: bash scripts/gui-smoke.sh

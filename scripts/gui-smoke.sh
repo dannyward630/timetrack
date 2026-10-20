@@ -46,9 +46,10 @@
 #
 # Run it after `cargo build --release`.
 #
-# Needs: Xvfb, dbus-daemon, ImageMagick (magick/import), xdpyinfo, setxkbmap,
-# gcc and libXtst. Xvfb implements no DRI3, and Mesa's GPU drivers require it
-# to present, so the app needs a software Vulkan driver:
+# Needs: Xvfb, dbus-daemon, ImageMagick (magick, or convert/compare/import on
+# ImageMagick 6), xdpyinfo, setxkbmap, gcc and libXtst. Xvfb implements no DRI3,
+# and Mesa's GPU drivers require it to present, so the app needs a software
+# Vulkan driver:
 #
 #   - a distro package (Arch: vulkan-swrast, Debian/Ubuntu: mesa-vulkan-drivers)
 #     provides one, or
@@ -92,9 +93,22 @@ trap cleanup EXIT
 for f in "$GUI" "$SVC" "$CLI"; do
   [ -x "$f" ] || { echo "missing $f -- run 'cargo build --release' first"; exit 2; }
 done
-for t in Xvfb dbus-daemon magick import xdpyinfo setxkbmap gcc; do
+for t in Xvfb dbus-daemon import xdpyinfo setxkbmap gcc; do
   command -v "$t" >/dev/null || { echo "missing $t"; exit 2; }
 done
+
+# ImageMagick 7 ships one `magick` multiplexer; Debian and Ubuntu still ship
+# ImageMagick 6, where those are separate binaries (`convert`, `compare`). Both
+# spellings do the same work, so which one is installed does not matter here.
+if ! command -v magick >/dev/null; then
+  command -v convert >/dev/null || { echo "missing ImageMagick (magick, or convert/compare)"; exit 2; }
+  magick() {
+    case "$1" in
+      compare) shift; command compare "$@";;
+      *)       shift; command convert "$@";;
+    esac
+  }
+fi
 
 # A software Vulkan driver, if the caller pointed us at one.
 SOFTWARE_VULKAN=""

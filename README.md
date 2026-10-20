@@ -1,5 +1,7 @@
 # TimeTrack
 
+[![ci](https://github.com/sequ-r/timetrack/actions/workflows/ci.yml/badge.svg)](https://github.com/sequ-r/timetrack/actions/workflows/ci.yml)
+
 A time tracker for GNOME. You **enter** time — a quick tap for the common case,
 or an explicit interval when you are reconstructing the day — and the app tells
 you where a week went.
@@ -73,6 +75,15 @@ cargo test --workspace        # 320+ unit tests (GUI tests need the system libs 
 bash scripts/e2e.sh           # 139 end-to-end checks against a real service
 bash scripts/gui-smoke.sh     # 61 headless GUI checks: paint, quick-add click, keyboard, confirm dialogs, tabs, export picker/preview/save
 ```
+
+CI runs those same five commands on every pull request and on `main`
+(`.github/workflows/ci.yml`: rustfmt, clippy, `cargo test --workspace`, then the
+service rig and the GUI smoke check, each job on its own so a red run names the
+one that failed). Pushing a `v*` tag runs `release.yml`, which calls that
+workflow first and builds the CLI tarballs and the AppImage only afterwards;
+dispatching `release.yml` by hand runs the same build and verification with
+`dry_run` on by default, so the packaging path can be checked without cutting a
+release.
 
 On Linux the GUI additionally needs the system libraries gpui links against:
 
