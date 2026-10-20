@@ -47,11 +47,12 @@
 # Run it after `cargo build --release`.
 #
 # Needs: Xvfb, dbus-daemon, ImageMagick (convert, compare, import), xdpyinfo,
-# xwininfo, setxkbmap, gcc and libXtst. This spells the ImageMagick commands
-# the way both major versions ship them: 6 splits them into separate binaries,
-# 7 still installs those alongside its `magick` multiplexer, so one spelling
-# runs on both. Xvfb implements no DRI3, and Mesa's GPU drivers require it to
-# present, so the app needs a software Vulkan driver:
+# setxkbmap, gcc and libXtst. xwininfo is optional: when it is installed, a
+# failed run also prints the X window tree. This spells the ImageMagick
+# commands the way both major versions ship them: 6 splits them into separate
+# binaries, 7 still installs those alongside its `magick` multiplexer, so one
+# spelling runs on both. Xvfb implements no DRI3, and Mesa's GPU drivers
+# require it to present, so the app needs a software Vulkan driver:
 #
 #   - a distro package (Arch: vulkan-swrast, Debian/Ubuntu: mesa-vulkan-drivers)
 #     provides one, or
@@ -102,7 +103,7 @@ trap cleanup EXIT
 for f in "$GUI" "$SVC" "$CLI"; do
   [ -x "$f" ] || { echo "missing $f -- run 'cargo build --release' first"; exit 2; }
 done
-for t in Xvfb dbus-daemon convert compare import xdpyinfo xwininfo setxkbmap gcc; do
+for t in Xvfb dbus-daemon convert compare import xdpyinfo setxkbmap gcc; do
   command -v "$t" >/dev/null || { echo "missing $t"; exit 2; }
 done
 
@@ -271,8 +272,13 @@ else
   echo "gui log:"; cat "$WORK/gui.log"
   # Whether a window exists at all separates "rendered nothing" from "never
   # created one"; the Vulkan drivers answer the first case, and the background
-  # rows say whether the pixel readback itself worked.
-  echo "x window tree:"; xwininfo -display "$DISP" -root -tree 2>&1
+  # rows say whether the pixel readback itself worked. Only the window tree
+  # needs a tool of its own, so it is the one piece that gives way when absent.
+  if command -v xwininfo >/dev/null; then
+    echo "x window tree:"; xwininfo -display "$DISP" -root -tree 2>&1
+  else
+    echo "x window tree: (no xwininfo installed)"
+  fi
   echo "vulkan drivers:"; ls -1 /usr/share/vulkan/icd.d/ 2>&1
   echo "imagemagick: $(convert -version 2>/dev/null | sed -n 1p)"
   echo "theme-colour rows:"; blobs boot.png '#11111b' | sed -n '1,4p'
