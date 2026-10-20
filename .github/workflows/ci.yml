@@ -75,6 +75,11 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           apt-packages: ${{ env.GUI_LIBS }}
+      # `cargo test` compiles each binary's *test harness*, not the binary: the
+      # tray's round-trip test (crates/timetrack-tray/tests/real_service.rs)
+      # spawns `target/debug/timetrack-service`, so build it first, exactly as
+      # that test's own failure message says to.
+      - run: cargo build --locked --package timetrack-service
       - run: cargo test --workspace --locked
 
   e2e:
@@ -107,4 +112,15 @@ jobs:
       - run: >-
           cargo build --release --locked
           --package timetrack-gui --package timetrack-service --package timetrack-cli
-      - run: bash scripts/gui-smoke.sh
+      - name: Run the smoke check
+        env:
+          # A failed run copies its screenshots and logs here for the step
+          # below: the runner's own /tmp does not outlive the job.
+          TT_SMOKE_ARTIFACTS: ${{ runner.temp }}/gui-smoke-artifacts
+        run: bash scripts/gui-smoke.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gui-smoke-failure
+          path: ${{ runner.temp }}/gui-smoke-artifacts
+          if-no-files-found: ignore

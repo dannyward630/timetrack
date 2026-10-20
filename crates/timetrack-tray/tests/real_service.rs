@@ -9,10 +9,12 @@
 //! store). The fake covers the menu mechanics hermetically; this covers the
 //! real wire, the real seeding, and real persistence.
 //!
-//! Needs the workspace binaries built (`cargo test --workspace` always does:
-//! it compiles every bin to run their unit tests). A bare
-//! `cargo test -p timetrack-tray` without a prior workspace build fails fast
-//! with directions, rather than probing a stale install.
+//! Needs the service binary built first: `cargo build --package
+//! timetrack-service`. `cargo test` compiles each binary's *test harness*, not
+//! the binary itself, so `cargo test --workspace` alone leaves
+//! `target/debug/timetrack-service` missing (CI builds it in the step before
+//! the tests). It fails fast with directions rather than probing a stale
+//! install.
 
 mod common;
 
@@ -90,7 +92,7 @@ fn tray_round_trips_against_the_real_service() {
         let service_bin = workspace_bin("timetrack-service");
         assert!(
             service_bin.exists(),
-            "no service binary at {}: run cargo build --workspace first",
+            "no service binary at {}: run cargo build --package timetrack-service first",
             service_bin.display()
         );
         let svc_log = std::fs::File::create(dir.join("svc.log")).unwrap();

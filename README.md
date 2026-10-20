@@ -71,19 +71,23 @@ Requires Rust 1.85 or newer (the crates are edition 2024).
 
 ```sh
 cargo build --release
+# The tray's round-trip test spawns the debug service binary, which `cargo test`
+# does not build (it compiles test harnesses, not binaries):
+cargo build --package timetrack-service
 cargo test --workspace        # 320+ unit tests (GUI tests need the system libs below)
 bash scripts/e2e.sh           # 139 end-to-end checks against a real service
 bash scripts/gui-smoke.sh     # 61 headless GUI checks: paint, quick-add click, keyboard, confirm dialogs, tabs, export picker/preview/save
 ```
 
-CI runs those same five commands on every pull request and on `main`
+CI runs those same commands on every pull request and on `main`
 (`.github/workflows/ci.yml`: rustfmt, clippy, `cargo test --workspace`, then the
 service rig and the GUI smoke check, each job on its own so a red run names the
-one that failed). Pushing a `v*` tag runs `release.yml`, which calls that
-workflow first and builds the CLI tarballs and the AppImage only afterwards;
-dispatching `release.yml` by hand runs the same build and verification with
-`dry_run` on by default, so the packaging path can be checked without cutting a
-release.
+one that failed). A failed smoke check uploads the screenshots and logs it took
+(`TT_SMOKE_ARTIFACTS`) as a run artifact. Pushing a `v*` tag runs `release.yml`,
+which calls that workflow first and builds the CLI tarballs and the AppImage
+only afterwards; dispatching `release.yml` by hand runs the same build and
+verification with `dry_run` on by default, so the packaging path can be checked
+without cutting a release.
 
 On Linux the GUI additionally needs the system libraries gpui links against:
 

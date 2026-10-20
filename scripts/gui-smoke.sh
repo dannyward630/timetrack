@@ -86,6 +86,13 @@ cleanup() {
   [ -n "${SVC_PID:-}" ] && kill "$SVC_PID" 2>/dev/null
   [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" 2>/dev/null
   wait 2>/dev/null
+  # A failing run is the one worth keeping: the screenshots and the logs are the
+  # evidence, and a CI runner throws its work directory away. Point
+  # TT_SMOKE_ARTIFACTS at a directory to have them copied there first.
+  if [ "$fail" -gt 0 ] && [ -n "${TT_SMOKE_ARTIFACTS:-}" ]; then
+    mkdir -p "$TT_SMOKE_ARTIFACTS"
+    cp "$WORK"/*.png "$WORK"/*.log "$TT_SMOKE_ARTIFACTS"/ 2>/dev/null
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -93,7 +100,7 @@ trap cleanup EXIT
 for f in "$GUI" "$SVC" "$CLI"; do
   [ -x "$f" ] || { echo "missing $f -- run 'cargo build --release' first"; exit 2; }
 done
-for t in Xvfb dbus-daemon import xdpyinfo setxkbmap gcc; do
+for t in Xvfb dbus-daemon import xdpyinfo xwininfo setxkbmap gcc; do
   command -v "$t" >/dev/null || { echo "missing $t"; exit 2; }
 done
 
@@ -241,20 +248,24 @@ echo "== the window paints =="
 ) >"$WORK/gui.log" 2>&1 &
 GUI_PID=$!
 
-sleep 1
 # Xvfb runs no window manager, so no ConfigureNotify ever reaches the window
 # and gpui has nothing to draw its first frame for: the window is mapped, the
 # right size, and stays black until an event arrives. A pointer motion into it
 # is such an event -- and the pointer has to end up over the window for the
 # keyboard below, since without a window manager the input focus is
 # PointerRoot.
-"$WORK/xtest" "$DISP" move $(( ${SCREEN%x*} / 2 )) $(( ${SCREEN#*x} / 2 ))
-
+#
+# The nudge is repeated until something is on screen: a motion sent before the
+# window exists is delivered to nothing, so sending one after a fixed `sleep 1`
+# races window creation -- comfortably won on a warm desktop, lost on a cold CI
+# runner.
+NUDGE_X=$(( ${SCREEN%x*} / 2 )); NUDGE_Y=$(( ${SCREEN#*x} / 2 ))
 WINDOW=""
 for _ in $(seq 1 100); do
   if ! kill -0 "$GUI_PID" 2>/dev/null; then
     echo "the GUI exited before it painted:"; cat "$WORK/gui.log"; exit 1
   fi
+  "$WORK/xtest" "$DISP" move "$NUDGE_X" "$NUDGE_Y"
   shot boot.png
   WINDOW=$(blobs boot.png '#11111b' | awk '$1 > 600 && $2 > 600 {print; exit}')
   [ -n "$WINDOW" ] && break
@@ -268,7 +279,12 @@ else
   else
     bad "the window painted" "nothing of colour #11111b appeared in 20s"
   fi
-  echo "gui log:"; cat "$WORK/gui.log"; exit 1
+  echo "gui log:"; cat "$WORK/gui.log"
+  # Whether a window exists at all separates "rendered nothing" from "never
+  # created one"; which Vulkan drivers the machine offers answers the first.
+  echo "x window tree:"; xwininfo -display "$DISP" -root -tree 2>&1
+  echo "vulkan drivers:"; ls -1 /usr/share/vulkan/icd.d/ 2>&1
+  exit 1
 fi
 
 # The window's own rectangle, from that blob, so the crops below follow the
