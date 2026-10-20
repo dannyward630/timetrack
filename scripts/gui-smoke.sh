@@ -46,10 +46,12 @@
 #
 # Run it after `cargo build --release`.
 #
-# Needs: Xvfb, dbus-daemon, ImageMagick (magick, or convert/compare/import on
-# ImageMagick 6), xdpyinfo, setxkbmap, gcc and libXtst. Xvfb implements no DRI3,
-# and Mesa's GPU drivers require it to present, so the app needs a software
-# Vulkan driver:
+# Needs: Xvfb, dbus-daemon, ImageMagick (convert, compare, import), xdpyinfo,
+# xwininfo, setxkbmap, gcc and libXtst. This spells the ImageMagick commands
+# the way both major versions ship them: 6 splits them into separate binaries,
+# 7 still installs those alongside its `magick` multiplexer, so one spelling
+# runs on both. Xvfb implements no DRI3, and Mesa's GPU drivers require it to
+# present, so the app needs a software Vulkan driver:
 #
 #   - a distro package (Arch: vulkan-swrast, Debian/Ubuntu: mesa-vulkan-drivers)
 #     provides one, or
@@ -100,22 +102,9 @@ trap cleanup EXIT
 for f in "$GUI" "$SVC" "$CLI"; do
   [ -x "$f" ] || { echo "missing $f -- run 'cargo build --release' first"; exit 2; }
 done
-for t in Xvfb dbus-daemon import xdpyinfo xwininfo setxkbmap gcc; do
+for t in Xvfb dbus-daemon convert compare import xdpyinfo xwininfo setxkbmap gcc; do
   command -v "$t" >/dev/null || { echo "missing $t"; exit 2; }
 done
-
-# ImageMagick 7 ships one `magick` multiplexer; Debian and Ubuntu still ship
-# ImageMagick 6, where those are separate binaries (`convert`, `compare`). Both
-# spellings do the same work, so which one is installed does not matter here.
-if ! command -v magick >/dev/null; then
-  command -v convert >/dev/null || { echo "missing ImageMagick (magick, or convert/compare)"; exit 2; }
-  magick() {
-    case "$1" in
-      compare) shift; command compare "$@";;
-      *)       shift; command convert "$@";;
-    esac
-  }
-fi
 
 # A software Vulkan driver, if the caller pointed us at one.
 SOFTWARE_VULKAN=""
@@ -226,8 +215,8 @@ shot() { DISPLAY=$DISP import -window root "$WORK/$1" 2>/dev/null; }
 # used here -- #11111b against black, which is what the window would be if
 # nothing had been drawn. `+fuzz` resets it so the second pass is exact.
 blobs() { # blobs <png> <#rrggbb>
-  magick "$WORK/$1" -fuzz 5% -fill white -opaque "$2" +fuzz -fill black +opaque white "$WORK/mask.png" 2>/dev/null
-  magick "$WORK/mask.png" -define connected-components:verbose=true -connected-components 8 null: 2>&1 |
+  convert "$WORK/$1" -fuzz 5% -fill white -opaque "$2" +fuzz -fill black +opaque white "$WORK/mask.png" 2>/dev/null
+  convert "$WORK/mask.png" -define connected-components:verbose=true -connected-components 8 null: 2>&1 |
     sed -nE 's/^ *[0-9]+: ([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+) [^ ]+ ([0-9]+) gray\(255\)$/\1 \2 \3 \4 \5/p'
 }
 
@@ -281,9 +270,12 @@ else
   fi
   echo "gui log:"; cat "$WORK/gui.log"
   # Whether a window exists at all separates "rendered nothing" from "never
-  # created one"; which Vulkan drivers the machine offers answers the first.
+  # created one"; the Vulkan drivers answer the first case, and the background
+  # rows say whether the pixel readback itself worked.
   echo "x window tree:"; xwininfo -display "$DISP" -root -tree 2>&1
   echo "vulkan drivers:"; ls -1 /usr/share/vulkan/icd.d/ 2>&1
+  echo "imagemagick: $(convert -version 2>/dev/null | sed -n 1p)"
+  echo "theme-colour rows:"; blobs boot.png '#11111b' | sed -n '1,4p'
   exit 1
 fi
 
@@ -316,8 +308,8 @@ fi
 
 # Text, not just boxes. The week total is white and it is the largest white
 # thing on screen; this is also the font-system check -- no fonts, no glyphs.
-magick "$WORK/ready.png" -crop "$HERO" +repage "$WORK/hero.png" 2>/dev/null
-WHITE=$(magick "$WORK/hero.png" -fuzz 5% -fill white -opaque white +fuzz -fill black +opaque white \
+convert "$WORK/ready.png" -crop "$HERO" +repage "$WORK/hero.png" 2>/dev/null
+WHITE=$(convert "$WORK/hero.png" -fuzz 5% -fill white -opaque white +fuzz -fill black +opaque white \
   -format '%[fx:mean*w*h]' info: 2>/dev/null)
 if [ "${WHITE%%.*}" -gt 200 ] 2>/dev/null; then
   ok "the week total is drawn as text (${WHITE%%.*} white pixels)"
@@ -343,8 +335,8 @@ check "it was recorded as a quick add" "1" "$("$CLI" list | grep -c '^+')"
 "$WORK/xtest" "$DISP" move 5 5
 sleep 0.5
 shot after.png
-magick "$WORK/after.png" -crop "$HERO" +repage "$WORK/hero-after.png" 2>/dev/null
-DIFF=$(magick compare -metric AE "$WORK/hero.png" "$WORK/hero-after.png" null: 2>&1 | sed 's/ .*//')
+convert "$WORK/after.png" -crop "$HERO" +repage "$WORK/hero-after.png" 2>/dev/null
+DIFF=$(compare -metric AE "$WORK/hero.png" "$WORK/hero-after.png" null: 2>&1 | sed 's/ .*//')
 if [ "${DIFF:-0}" != "0" ]; then
   ok "the week total on screen re-rendered ($DIFF pixels changed)"
 else
@@ -373,8 +365,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # The dialog panel sits above the week total and pushes it down, so the
   # total's own band must differ while the dialog is open: pixels proving the
   # dialog rendered rather than the key merely doing nothing.
-  magick "$WORK/dialog.png" -crop "$HERO" +repage "$WORK/hero-dialog.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-dialog.png" null: 2>&1 | sed 's/ .*//')
+  convert "$WORK/dialog.png" -crop "$HERO" +repage "$WORK/hero-dialog.png" 2>/dev/null
+  DIFF=$(compare -metric AE "$WORK/hero-after.png" "$WORK/hero-dialog.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the entry dialog painted ($DIFF pixels moved)"
   else
@@ -399,8 +391,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # proves the background poll refreshes the window on its own rather than
   # waiting for the next hover to happen along.
   shot saved.png
-  magick "$WORK/saved.png" -crop "$HERO" +repage "$WORK/hero-saved.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-saved.png" null: 2>&1 | sed 's/ .*//')
+  convert "$WORK/saved.png" -crop "$HERO" +repage "$WORK/hero-saved.png" 2>/dev/null
+  DIFF=$(compare -metric AE "$WORK/hero-after.png" "$WORK/hero-saved.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the window refreshed without any pointer motion ($DIFF pixels changed)"
   else
@@ -422,8 +414,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   shot split.png
   # The prompt sits above the week total and pushes it down, like the
   # dialog: the total's band must differ while it is open.
-  magick "$WORK/split.png" -crop "$HERO" +repage "$WORK/hero-split.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-split.png" null: 2>&1 | sed 's/ .*//')
+  convert "$WORK/split.png" -crop "$HERO" +repage "$WORK/hero-split.png" 2>/dev/null
+  DIFF=$(compare -metric AE "$WORK/hero-after.png" "$WORK/hero-split.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the split prompt painted ($DIFF pixels moved)"
   else
@@ -440,8 +432,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key m
   sleep 1.5
   shot merge.png
-  magick "$WORK/merge.png" -crop "$HERO" +repage "$WORK/hero-merge.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-merge.png" null: 2>&1 | sed 's/ .*//')
+  convert "$WORK/merge.png" -crop "$HERO" +repage "$WORK/hero-merge.png" 2>/dev/null
+  DIFF=$(compare -metric AE "$WORK/hero-after.png" "$WORK/hero-merge.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the merge confirmation painted ($DIFF pixels moved)"
   else
@@ -459,8 +451,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key n
   sleep 1.5
   shot project.png
-  magick "$WORK/project.png" -crop "$HERO" +repage "$WORK/hero-project.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-project.png" null: 2>&1 | sed 's/ .*//')
+  convert "$WORK/project.png" -crop "$HERO" +repage "$WORK/hero-project.png" 2>/dev/null
+  DIFF=$(compare -metric AE "$WORK/hero-after.png" "$WORK/hero-project.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the project prompt painted ($DIFF pixels moved)"
   else
@@ -498,14 +490,14 @@ elif "$WORK/xtest" "$DISP" key 1; then
   for _ in $(seq 1 5); do "$WORK/xtest" "$DISP" key k; done
   "$WORK/xtest" "$DISP" key j
   shot delete-base.png
-  magick "$WORK/delete-base.png" -crop "$HERO" +repage "$WORK/hero-delete-base.png" 2>/dev/null
+  convert "$WORK/delete-base.png" -crop "$HERO" +repage "$WORK/hero-delete-base.png" 2>/dev/null
   # The first `d` only opens the confirmation banner, pushing the total's
   # band down like the other prompts.
   "$WORK/xtest" "$DISP" key d
   sleep 1.5
   shot delete-confirm.png
-  magick "$WORK/delete-confirm.png" -crop "$HERO" +repage "$WORK/hero-delete-confirm.png" 2>/dev/null
-  DIFF=$(magick compare -metric AE "$WORK/hero-delete-base.png" "$WORK/hero-delete-confirm.png" null: 2>&1 | sed 's/ .*//')
+  convert "$WORK/delete-confirm.png" -crop "$HERO" +repage "$WORK/hero-delete-confirm.png" 2>/dev/null
+  DIFF=$(compare -metric AE "$WORK/hero-delete-base.png" "$WORK/hero-delete-confirm.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the delete confirmation painted ($DIFF pixels moved)"
   else
@@ -544,7 +536,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key bracketleft
   sleep 1.5
   shot export-prev.png
-  DIFF=$(magick compare -metric AE "$WORK/export-tab.png" "$WORK/export-prev.png" null: 2>&1 | sed 's/ .*//')
+  DIFF=$(compare -metric AE "$WORK/export-tab.png" "$WORK/export-prev.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the anchor stepper repainted the tab ($DIFF pixels changed)"
   else
@@ -553,7 +545,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key bracketright
   sleep 1.5
   shot export-back.png
-  DIFF=$(magick compare -metric AE "$WORK/export-tab.png" "$WORK/export-back.png" null: 2>&1 | sed 's/ .*//')
+  DIFF=$(compare -metric AE "$WORK/export-tab.png" "$WORK/export-back.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" = "0" ]; then
     ok "stepping back and forth returned the tab"
   else
@@ -568,7 +560,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key bracketleft
   sleep 1.5
   shot export-empty-week.png
-  DIFF=$(magick compare -metric AE "$WORK/export-tab.png" "$WORK/export-empty-week.png" null: 2>&1 | sed 's/ .*//')
+  DIFF=$(compare -metric AE "$WORK/export-tab.png" "$WORK/export-empty-week.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "the scoped preview repainted for the empty week ($DIFF pixels changed)"
   else
@@ -596,12 +588,12 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # poll loop, so one screenshot can beat it on slow software rendering.
   WINDOW_H=$(echo "$WINDOW" | awk '{print $2}')
   FOOT="$(echo "$WINDOW" | awk '{print $1}')x40+${WINDOW_X}+$(( WINDOW_Y + WINDOW_H - 40 ))"
-  magick "$WORK/export-before-save.png" -crop "$FOOT" +repage "$WORK/foot-before.png" 2>/dev/null
+  convert "$WORK/export-before-save.png" -crop "$FOOT" +repage "$WORK/foot-before.png" 2>/dev/null
   DIFF=0
   for _ in $(seq 1 20); do
     shot export-after-save.png
-    magick "$WORK/export-after-save.png" -crop "$FOOT" +repage "$WORK/foot-after.png" 2>/dev/null
-    DIFF=$(magick compare -metric AE "$WORK/foot-before.png" "$WORK/foot-after.png" null: 2>&1 | sed 's/ .*//')
+    convert "$WORK/export-after-save.png" -crop "$FOOT" +repage "$WORK/foot-after.png" 2>/dev/null
+    DIFF=$(compare -metric AE "$WORK/foot-before.png" "$WORK/foot-after.png" null: 2>&1 | sed 's/ .*//')
     [ "${DIFF:-0}" != "0" ] && break
     sleep 0.5
   done
@@ -663,7 +655,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # and was not an error-styled failure).
   touch "$WORK/portal-names.log.cancel"
   shot export-before-cancel.png
-  magick "$WORK/export-before-cancel.png" -crop "$FOOT" +repage "$WORK/foot-before-cancel.png" 2>/dev/null
+  convert "$WORK/export-before-cancel.png" -crop "$FOOT" +repage "$WORK/foot-before-cancel.png" 2>/dev/null
   WEEK_COUNT_BEFORE=$(ls "$WORK"/timetrack-export-week-*.csv 2>/dev/null | wc -l)
   CLICK=$(blobs export-before-cancel.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
   echo "  clicking ($CLICK)"
@@ -674,8 +666,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   DIFF=0
   for _ in $(seq 1 20); do
     shot export-after-cancel.png
-    magick "$WORK/export-after-cancel.png" -crop "$FOOT" +repage "$WORK/foot-after-cancel.png" 2>/dev/null
-    DIFF=$(magick compare -metric AE "$WORK/foot-before-cancel.png" "$WORK/foot-after-cancel.png" null: 2>&1 | sed 's/ .*//')
+    convert "$WORK/export-after-cancel.png" -crop "$FOOT" +repage "$WORK/foot-after-cancel.png" 2>/dev/null
+    DIFF=$(compare -metric AE "$WORK/foot-before-cancel.png" "$WORK/foot-after-cancel.png" null: 2>&1 | sed 's/ .*//')
     [ "${DIFF:-0}" != "0" ] && break
     sleep 0.5
   done
@@ -690,7 +682,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # local error (path plus reason pinned by unit test, never service wording).
   touch "$WORK/portal-names.log.fail"
   shot export-before-fail.png
-  magick "$WORK/export-before-fail.png" -crop "$FOOT" +repage "$WORK/foot-before-fail.png" 2>/dev/null
+  convert "$WORK/export-before-fail.png" -crop "$FOOT" +repage "$WORK/foot-before-fail.png" 2>/dev/null
   CLICK=$(blobs export-before-fail.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
   echo "  clicking ($CLICK)"
   "$WORK/xtest" "$DISP" click ${CLICK}
@@ -700,8 +692,8 @@ elif "$WORK/xtest" "$DISP" key 1; then
   DIFF=0
   for _ in $(seq 1 20); do
     shot export-after-fail.png
-    magick "$WORK/export-after-fail.png" -crop "$FOOT" +repage "$WORK/foot-after-fail.png" 2>/dev/null
-    DIFF=$(magick compare -metric AE "$WORK/foot-before-fail.png" "$WORK/foot-after-fail.png" null: 2>&1 | sed 's/ .*//')
+    convert "$WORK/export-after-fail.png" -crop "$FOOT" +repage "$WORK/foot-after-fail.png" 2>/dev/null
+    DIFF=$(compare -metric AE "$WORK/foot-before-fail.png" "$WORK/foot-after-fail.png" null: 2>&1 | sed 's/ .*//')
     [ "${DIFF:-0}" != "0" ] && break
     sleep 0.5
   done
@@ -721,7 +713,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key Tab
   sleep 1.5
   shot tabs-away.png
-  DIFF=$(magick compare -metric AE "$WORK/tabs-home.png" "$WORK/tabs-away.png" null: 2>&1 | sed 's/ .*//')
+  DIFF=$(compare -metric AE "$WORK/tabs-home.png" "$WORK/tabs-away.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" != "0" ]; then
     ok "tab switched away from home ($DIFF pixels changed)"
   else
@@ -734,7 +726,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key Tab
   sleep 1.5
   shot tabs-back.png
-  DIFF=$(magick compare -metric AE "$WORK/tabs-home.png" "$WORK/tabs-back.png" null: 2>&1 | sed 's/ .*//')
+  DIFF=$(compare -metric AE "$WORK/tabs-home.png" "$WORK/tabs-back.png" null: 2>&1 | sed 's/ .*//')
   if [ "${DIFF:-0}" = "0" ]; then
     ok "three tabs cycled back to home"
   else
