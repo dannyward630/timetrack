@@ -13,7 +13,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # `events` is in the group on purpose: a push to `main` and the release
+  # workflow's call of this one on the same ref are different runs of the same
+  # ref, and without it the push cancels the release's checks -- which skips
+  # publishing entirely, silently. Cancelling only reaches runs of the same
+  # event on the same ref, which is what a superseded push or pull request
+  # update is.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
