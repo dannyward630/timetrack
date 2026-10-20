@@ -43,25 +43,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `linker-env` is a shell statement, empty where the host linker will
+          # do: rustc links musl targets with the host `cc` plus its own musl crt
+          # and libc, which cannot work when the objects are another
+          # architecture's, so the aarch64 build drives the link with the cross
+          # gcc. That is not the musl-gcc override .cargo/config.toml warns
+          # about: this one only chooses the link driver, while rustc still
+          # supplies its own musl crt objects and libc. `emulator` runs the
+          # cross-compiled binary in the verification step, rather than
+          # depending on the runner's binfmt registration.
           - target: x86_64-unknown-linux-musl
             arch: x86_64
             packages: musl-tools
-          # The aarch64 binary is cross-compiled, so running it in the
-          # verification step below needs an emulator on the runner.
+            linker-env: ""
+            emulator: ""
           - target: aarch64-unknown-linux-musl
             arch: aarch64
-            packages: musl-tools gcc-aarch64-linux-gnu qemu-user-static binfmt-support
+            packages: musl-tools gcc-aarch64-linux-gnu qemu-user-static
+            linker-env: export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+            emulator: qemu-aarch64-static
 
     steps:
       - uses: actions/checkout@v4
 
       # `musl-tools` is the Debian/Ubuntu package name for the musl cross
       # toolchain; the aarch64 build needs its cross gcc as well. Deliberately
-      # NO CARGO_TARGET_*_LINKER override: rust's default linker (rust-lld) for
-      # musl targets is what works. Some distros' musl-gcc (GCC 16.x on Arch as
-      # of 2026-09) produces binaries that segfault on anything that hashes --
-      # std's HashMap, and therefore zbus' D-Bus address parser. See
-      # .cargo/config.toml.
+      # NO CARGO_TARGET_*_MUSL_LINKER override to musl-gcc: some distros' musl-gcc
+      # (GCC 16.x on Arch as of 2026-09) produces binaries that segfault on
+      # anything that hashes -- std's HashMap, and therefore zbus' D-Bus
+      # address parser. See .cargo/config.toml.
       - uses: ./.github/actions/setup
         with:
           apt-packages: ${{ matrix.packages }}
@@ -69,6 +79,7 @@ jobs:
 
       - name: Build
         run: |
+          ${{ matrix.linker-env }}
           cargo build --release --locked \
             --package timetrack-cli \
             --target ${{ matrix.target }}
@@ -81,9 +92,14 @@ jobs:
         working-directory: dist
         run: sha256sum *.tar.gz > SHA256SUMS
 
-      - name: Verify the binary is static and actually runs
+      # Unpacked first, because the tarball is what a downloader gets: a
+      # passing check on a loose copy in the workspace would not be evidence
+      # about the file on the release page.
+      - name: Verify the tarball holds a static binary that actually runs
         run: |
-          BIN=dist/timetrack-${{ matrix.arch }}
+          mkdir -p verify
+          tar -xzf dist/timetrack-${{ matrix.arch }}.tar.gz -C verify
+          BIN=verify/timetrack-${{ matrix.arch }}
           file "$BIN"
           # Zero NEEDED entries is what "static" means in practice.
           test "$(readelf -d "$BIN" | grep -c NEEDED)" = "0" \
@@ -91,7 +107,8 @@ jobs:
           # And it must not just link -- it must run. A broken linker can
           # produce a binary that segfaults immediately; `--version` touches
           # argument parsing and the hash map that zbus needs.
-          "$BIN" --version
+          ${{ matrix.emulator }} "$BIN" --version
+          rm -rf verify
 
       - uses: actions/upload-artifact@v4
         if: ${{ inputs.dry_run }}
