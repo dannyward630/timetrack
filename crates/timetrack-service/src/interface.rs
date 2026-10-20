@@ -957,10 +957,7 @@ mod tests {
         let csv = svc.export_csv_at("week", 1_791_460_800_000).unwrap();
         assert!(csv.contains("mon"), "chosen week must hold Monday:\n{csv}");
         assert!(csv.contains("sun"), "chosen week must hold Sunday:\n{csv}");
-        assert!(
-            !csv.contains("next"),
-            "next week must not leak in:\n{csv}"
-        );
+        assert!(!csv.contains("next"), "next week must not leak in:\n{csv}");
     }
 
     #[test]
@@ -995,10 +992,7 @@ mod tests {
             .unwrap();
         let a = svc.export_csv_at("all", 1_789_473_600_000).unwrap();
         let b = svc.export_csv_at("all", 1_791_460_800_000).unwrap();
-        assert_eq!(
-            a, b,
-            "a stale anchor must never narrow a full export"
-        );
+        assert_eq!(a, b, "a stale anchor must never narrow a full export");
     }
 
     #[test]
@@ -1009,9 +1003,7 @@ mod tests {
             ServiceError::UnknownExportScope("everything".into())
         );
         assert_eq!(
-            svc.export_csv_at("everything", 0)
-                .unwrap_err()
-                .to_string(),
+            svc.export_csv_at("everything", 0).unwrap_err().to_string(),
             "unknown export scope 'everything' (use week, month or all)"
         );
     }
