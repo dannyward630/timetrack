@@ -709,6 +709,57 @@ elif "$WORK/xtest" "$DISP" key 1; then
     bad "a failed write reported a status" "the footer is pixel-identical after the failed write"
   fi
   rm -f "$WORK/portal-names.log.fail"
+
+  echo
+  echo "== a prompt opened on the Export tab is drawn there =="
+  # The prompts used to be rendered inside the Home tab only, while the key
+  # handler opened them on every tab. On the Export tab that produced a modal
+  # that was never painted and that took the keyboard anyway: the window
+  # looked frozen and only Escape got out.
+  #
+  # The prompt panel's own background (#1a1a26) is a big block that nothing
+  # else on the Export tab uses, so its area is the signal: before the prompt
+  # there is the titlebar's own strip, after it there is the titlebar plus the
+  # panel.
+  #
+  # The shared `blobs` helper fuzzes 5%, which is wider than the distance
+  # between the panel colour and the window background, so it cannot tell the
+  # two apart. This one matches at 1% -- tight enough to separate them, loose
+  # enough to absorb the rounding the GPU path does.
+  panel_area() {
+    convert "$WORK/$1" -fuzz 1% -fill white -opaque '#1a1a26' +fuzz -fill black +opaque white \
+      "$WORK/panel-mask.png" 2>/dev/null
+    convert "$WORK/panel-mask.png" -define connected-components:verbose=true -connected-components 8 null: 2>&1 |
+      sed -nE 's/^ *[0-9]+: ([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+) [^ ]+ ([0-9]+) gray\(255\)$/\5/p' |
+      awk '{a += $1} END {print a+0}'
+  }
+  # The keystrokes below only reach the app if the pointer is over it: with
+  # no window manager the input focus is PointerRoot.
+  "$WORK/xtest" "$DISP" move $(( WINDOW_X + 20 )) $(( WINDOW_Y + 20 ))
+  shot export-no-prompt.png
+  BEFORE=$(panel_area export-no-prompt.png)
+  "$WORK/xtest" "$DISP" key a
+  sleep 1.5
+  shot export-prompt.png
+  AFTER=$(panel_area export-prompt.png)
+  if [ "$AFTER" -gt "$(( BEFORE + 20000 ))" ]; then
+    ok "the entry dialog painted on the Export tab ($(( AFTER - BEFORE )) pixels)"
+  else
+    bad "the entry dialog painted on the Export tab" \
+      "the prompt panel's area barely changed ($BEFORE -> $AFTER)"
+  fi
+  # Escape must close it again, and the panel must go with it.
+  "$WORK/xtest" "$DISP" key Escape
+  sleep 1.5
+  shot export-prompt-gone.png
+  GONE=$(panel_area export-prompt-gone.png)
+  if [ "$GONE" -lt "$(( BEFORE + 20000 ))" ]; then
+    ok "escape closed the dialog on the Export tab"
+  else
+    bad "escape closed the dialog on the Export tab" \
+      "the prompt panel is still there ($GONE pixels)"
+  fi
+
   # Export -> Home, so the tab test below starts where it expects.
   "$WORK/xtest" "$DISP" key Tab
   sleep 1.5

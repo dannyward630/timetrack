@@ -846,6 +846,53 @@ fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String>
     }
 }
 
+/// Which prompt, if any, currently owns the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenPrompt {
+    Entry,
+    Project,
+    Split,
+    Merge,
+    Delete,
+}
+
+/// Which prompt is open, if one is.
+///
+/// The key handler and the renderer ask this same question, so a prompt that
+/// captures the keyboard is always one that is on screen.
+///
+/// They used to disagree. The key handler dispatched to the prompts on every
+/// tab, while the renderer drew them inside `render_home` -- so opening one on
+/// the Projects or Export tab produced a modal that was never drawn and that
+/// swallowed every keystroke: the window looked frozen and only `Esc` got
+/// out. One question, asked once, is what keeps the two in step.
+///
+/// At most one prompt is open at a time (each one swallows the keys that
+/// would open another), so the order below is the priority the key handler
+/// already used: the entry dialog first, then the project prompt, the split
+/// prompt, the merge confirmation and the delete confirmation.
+fn which_prompt(
+    entry: bool,
+    project: bool,
+    split: bool,
+    merge: bool,
+    delete: bool,
+) -> Option<OpenPrompt> {
+    if entry {
+        Some(OpenPrompt::Entry)
+    } else if project {
+        Some(OpenPrompt::Project)
+    } else if split {
+        Some(OpenPrompt::Split)
+    } else if merge {
+        Some(OpenPrompt::Merge)
+    } else if delete {
+        Some(OpenPrompt::Delete)
+    } else {
+        None
+    }
+}
+
 /// The Export tab's scope-plus-anchor picker (spec #19).
 ///
 /// One shared anchor selects which week or month the stepper and the typed
@@ -1538,33 +1585,45 @@ impl TimetrackView {
         self.active_projects().get(self.project_cursor).copied()
     }
 
+    /// Which prompt is open, if one is.
+    ///
+    /// The key handler and the renderer both ask this, so a prompt that
+    /// captures the keyboard is always one that is drawn -- on whichever tab
+    /// is showing.
+    fn open_prompt(&self) -> Option<OpenPrompt> {
+        which_prompt(
+            self.dialog.is_some(),
+            self.project_prompt.is_some(),
+            self.split_prompt.is_some(),
+            self.merge_confirm.is_some(),
+            self.delete_confirm.is_some(),
+        )
+    }
+
     /// Handle a key press. Returns false when the app should quit.
     fn on_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
-        // Modal: while the entry dialog is open every keystroke belongs to
-        // it, including the letters the app shortcuts are bound to.
-        if self.dialog.is_some() {
-            return self.on_dialog_key(ev);
-        }
-        // The project prompt owns the keyboard the same way.
-        if self.project_prompt.is_some() {
-            return self.on_project_key(ev);
-        }
-        // The split prompt owns the keyboard the same way.
-        if self.split_prompt.is_some() {
-            return self.on_split_key(ev);
+        // A prompt that is open owns the keyboard, including the letters the
+        // app shortcuts are bound to. Which prompt is open is one question
+        // (`open_prompt`), and the renderer asks the same one -- so a prompt
+        // that takes the keyboard is always one that is on screen.
+        match self.open_prompt() {
+            Some(OpenPrompt::Entry) => return self.on_dialog_key(ev),
+            Some(OpenPrompt::Project) => return self.on_project_key(ev),
+            Some(OpenPrompt::Split) => return self.on_split_key(ev),
+            // A merge or a delete waits its turn: the anchor field is typed
+            // into first, and each is answered by its own key handler below.
+            _ => {}
         }
         // The anchor day field owns the keyboard while it is being typed
         // in, like the modal prompts do.
         if self.export_picker.editing {
             return self.on_anchor_key(ev);
         }
-        // A pending merge only listens for its own answer.
-        if self.merge_confirm.is_some() {
-            return self.on_merge_key(ev);
-        }
-        // A pending delete only listens for its own answer.
-        if self.delete_confirm.is_some() {
-            return self.on_delete_key(ev);
+        // A pending merge or delete only listens for its own answer.
+        match self.open_prompt() {
+            Some(OpenPrompt::Merge) => return self.on_merge_key(ev),
+            Some(OpenPrompt::Delete) => return self.on_delete_key(ev),
+            _ => {}
         }
         // Tab cycles the three tabs (§11); shift goes backward. The Tab key
         // carries no printable char, so this keys on the key name, like the
@@ -2165,6 +2224,11 @@ impl Render for TimetrackView {
                     .bg(rgb(0x11111b))
                     .when(!maximized, |el| el.rounded_xl().overflow_hidden())
                     .child(self.render_titlebar(window))
+                    // The prompt panels sit above the tab content, so a prompt
+                    // opened on any tab is on screen. They are drawn here
+                    // rather than inside the tab because the shortcuts that
+                    // open them are global.
+                    .child(self.render_prompts())
                     .child(match self.tab {
                         Tab::Home => self.render_home().into_any_element(),
                         Tab::Projects => self.render_projects().into_any_element(),
@@ -2372,26 +2436,41 @@ impl TimetrackView {
             .flex_1()
             .flex_col()
             .overflow_y_scroll()
-            .when_some(self.dialog.clone(), |el, dlg| {
-                el.child(self.render_entry_dialog(&dlg))
-            })
-            .when_some(self.split_prompt.clone(), |el, prompt| {
-                el.child(self.render_split_prompt(&prompt))
-            })
-            .when_some(self.merge_confirm.clone(), |el, confirm| {
-                el.child(self.render_merge_confirm(&confirm))
-            })
-            .when_some(self.delete_confirm.clone(), |el, confirm| {
-                el.child(self.render_delete_confirm(&confirm))
-            })
-            .when_some(self.project_prompt.clone(), |el, prompt| {
-                el.child(self.render_project_prompt(&prompt))
-            })
             .child(hero)
             .child(warning)
             .child(self.render_quick_add())
             .child(self.render_week_by_project())
             .child(self.render_entries())
+    }
+
+    /// The prompt panels, drawn above the tab content.
+    ///
+    /// They live here, in the shared wrapper, rather than inside
+    /// `render_home`: a prompt can be opened from any tab (the shortcuts are
+    /// global), so drawing it only on Home produced a modal that was never
+    /// painted and that took the keyboard anyway.
+    ///
+    /// Which panel is drawn is the same question the key handler asks
+    /// (`open_prompt`), so the two cannot drift apart.
+    fn render_prompts(&self) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .when_some(self.dialog.as_ref(), |el, dlg| {
+                el.child(self.render_entry_dialog(dlg))
+            })
+            .when_some(self.project_prompt.as_ref(), |el, prompt| {
+                el.child(self.render_project_prompt(prompt))
+            })
+            .when_some(self.split_prompt.as_ref(), |el, prompt| {
+                el.child(self.render_split_prompt(prompt))
+            })
+            .when_some(self.merge_confirm.as_ref(), |el, confirm| {
+                el.child(self.render_merge_confirm(confirm))
+            })
+            .when_some(self.delete_confirm.as_ref(), |el, confirm| {
+                el.child(self.render_delete_confirm(confirm))
+            })
     }
 
     /// The manual-entry dialog (REQUIREMENTS §5 methods 1 and 2, one form).
@@ -3903,6 +3982,59 @@ mod tests {
             ..Default::default()
         };
         assert!(delete_offer(&snap, 99).is_none());
+    }
+
+    // --- which prompt is open ---
+
+    #[test]
+    fn no_open_prompt_means_no_prompt() {
+        assert_eq!(which_prompt(false, false, false, false, false), None);
+    }
+
+    #[test]
+    fn each_open_prompt_is_the_one_that_owns_the_keyboard() {
+        assert_eq!(
+            which_prompt(true, false, false, false, false),
+            Some(OpenPrompt::Entry)
+        );
+        assert_eq!(
+            which_prompt(false, true, false, false, false),
+            Some(OpenPrompt::Project)
+        );
+        assert_eq!(
+            which_prompt(false, false, true, false, false),
+            Some(OpenPrompt::Split)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, true, false),
+            Some(OpenPrompt::Merge)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, false, true),
+            Some(OpenPrompt::Delete)
+        );
+    }
+
+    #[test]
+    fn the_entry_dialog_wins_over_every_other_prompt() {
+        // The key handler used to check the prompts one by one, in this
+        // order; the shared question has to keep it.
+        assert_eq!(
+            which_prompt(true, true, true, true, true),
+            Some(OpenPrompt::Entry)
+        );
+        assert_eq!(
+            which_prompt(false, true, true, true, true),
+            Some(OpenPrompt::Project)
+        );
+        assert_eq!(
+            which_prompt(false, false, true, true, true),
+            Some(OpenPrompt::Split)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, true, true),
+            Some(OpenPrompt::Merge)
+        );
     }
 
     // --- project prompt ---
