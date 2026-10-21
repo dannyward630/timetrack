@@ -7,8 +7,10 @@
 
 //! Library half of the TimeTrack CLI.
 //!
-//! The TUI lives here rather than in `main.rs` so its unit tests are actually
-//! compiled and run: a binary-only crate's `#[cfg(test)]` modules inside
-//! sibling files are never built by `cargo test`.
+//! The TUI lives here and `main.rs` is a thin wrapper around it, so the
+//! one-shot commands and the TUI share one crate. The split is not what
+//! makes the TUI's tests run, though: `cargo test` builds a binary's own
+//! `#[cfg(test)]` modules too, as the binary-only `timetrack-tray` crate
+//! shows with its 27 unit tests.
 
 pub mod tui;

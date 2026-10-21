@@ -5763,8 +5763,6 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
- "serde",
- "serde_json",
  "timetrack-core",
  "timetrack-proto",
  "zbus",
