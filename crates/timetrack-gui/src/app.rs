@@ -1229,13 +1229,17 @@ fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<
 /// touching `<file>.cancel` makes the next stubbed save answer Cancelled
 /// (quiet no-op, writes nothing), and `<file>.fail` grants a path whose
 /// parent does not exist (local error naming path plus reason). Both still
-/// log the requested name first, so the dialog wiring stays pinned. Only
-/// when the stub is active, so production never sees this.
+/// log the requested name first, so the dialog wiring stays pinned.
 ///
 /// `<file>.hold` makes the next stubbed save *wait* before answering, the
 /// way a real dialog waits for a person: the outcome is decided first, so
 /// removing the flag while the stub sleeps does not change it. That is what
 /// pins that the window keeps serving while the dialog is open.
+///
+/// This whole seam is compiled in only with the `portal-stub` feature. A
+/// released binary has no stub to arm, so the system save dialog cannot be
+/// talked out of the way by an environment variable.
+#[cfg(feature = "portal-stub")]
 fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> {
     let log = stub.strip_prefix("record:")?;
     let mut file = std::fs::OpenOptions::new()
@@ -1258,6 +1262,19 @@ fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> 
     Some(outcome)
 }
 
+/// The stubbed answer, if the stub is compiled in and armed.
+#[cfg(feature = "portal-stub")]
+fn stubbed_outcome(current_name: &str) -> Option<PortalOutcome> {
+    let stub = std::env::var("TIMETRACK_PORTAL_STUB").ok()?;
+    portal_stub_outcome(&stub, current_name)
+}
+
+/// The stubbed answer, if the stub is compiled in and armed.
+#[cfg(not(feature = "portal-stub"))]
+fn stubbed_outcome(_current_name: &str) -> Option<PortalOutcome> {
+    None
+}
+
 /// Ask the system save dialog where to write an export (ticket 27).
 ///
 /// The period-stamped `current_name` is prefilled so one week never silently
@@ -1266,10 +1283,8 @@ fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> 
 /// anything but a confirm or a cancel — no portal frontend, no session bus
 /// — counts as unavailable and the direct fallback runs.
 async fn portal_save_file(current_name: &str) -> PortalOutcome {
-    if let Ok(stub) = std::env::var("TIMETRACK_PORTAL_STUB") {
-        if let Some(outcome) = portal_stub_outcome(&stub, current_name) {
-            return outcome;
-        }
+    if let Some(outcome) = stubbed_outcome(current_name) {
+        return outcome;
     }
     let request = ashpd::desktop::file_chooser::SelectedFiles::save_file()
         .title("Save export")
@@ -4716,12 +4731,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "portal-stub")]
     fn portal_stub_ignores_anything_else() {
         assert_eq!(portal_stub_outcome("bogus", "x.csv"), None);
         assert_eq!(portal_stub_outcome("", "x.csv"), None);
     }
 
     #[test]
+    #[cfg(feature = "portal-stub")]
     fn portal_stub_records_the_dialog_name() {
         // Headless-test seam: `record:<file>` logs the requested dialog
         // name and reports the portal unavailable, so the direct
@@ -4835,6 +4852,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "portal-stub")]
     fn portal_stub_cancel_flag_returns_cancelled() {
         // Headless cancel pin (no live portal): with `<log>.cancel` present,
         // the stub still logs the requested dialog name but answers
@@ -4863,6 +4881,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "portal-stub")]
     fn portal_stub_fail_flag_returns_an_unwritable_grant() {
         // Headless failure pin (no live portal): with `<log>.fail` present,
         // the stub still logs the requested dialog name but grants a path

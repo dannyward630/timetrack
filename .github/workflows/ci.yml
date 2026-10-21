@@ -70,7 +70,10 @@ jobs:
           components: clippy
       # `--all-targets` covers the test helpers too, where the last batch of
       # warnings lived. `-D warnings` makes any new one fail the build.
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The `portal-stub` feature compiles in the save-dialog stub the GUI
+      # smoke check drives. It is on here so that code is linted, and it is
+      # off in the release build, so a published binary has no stub to arm.
+      - run: cargo clippy --workspace --all-targets --locked --features timetrack-gui/portal-stub -- -D warnings
 
   test:
     name: cargo test
@@ -86,7 +89,7 @@ jobs:
       # spawns `target/debug/timetrack-service`, so build it first, exactly as
       # that test's own failure message says to.
       - run: cargo build --locked --package timetrack-service
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --features timetrack-gui/portal-stub
 
   e2e:
     name: e2e (service on a private bus)
@@ -115,9 +118,13 @@ jobs:
       # The smoke check starts all three binaries itself, so this is the whole
       # workspace in release mode -- the long build, and the one check that can
       # say the toolkit still paints, hit-tests and reads the keyboard.
+      # The feature is what compiles in the save-dialog stub the smoke check
+      # drives: no live portal exists on a headless X server. The release
+      # workflow builds without it, so a published binary has no stub.
       - run: >-
           cargo build --release --locked
           --package timetrack-gui --package timetrack-service --package timetrack-cli
+          --features timetrack-gui/portal-stub
       - name: Run the smoke check
         env:
           # A failed run copies its screenshots and logs here for the step
