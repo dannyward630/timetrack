@@ -554,7 +554,12 @@ impl Client {
                      It is normally started on demand by the systemd user unit."
                 );
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // `async_io::Timer`, not a tokio sleep: this function runs
+            // inside a program driven by `async_io::block_on` (the CLI and the
+            // TUI), which has no tokio reactor -- a tokio sleep here panicked
+            // with "there is no reactor running" the moment the session bus
+            // was absent, which is exactly when this loop runs.
+            async_io::Timer::after(Duration::from_millis(200)).await;
         }
     }
 }
