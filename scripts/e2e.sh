@@ -131,6 +131,16 @@ PROBE=$(id_of "$out")
 check "both probe entries removed" "0" "$(listed)"
 
 echo
+echo "== the last project cannot be deleted =="
+# The service seeds one project, so right now it is the last one and the core
+# refuses to delete it. This runs before any other project exists, so the
+# refusal needs no cleanup and leaves the ids the later sections use untouched.
+out=$("$CLI" delete-project "General" 2>&1)
+contains "the last project cannot be deleted" "cannot delete the last project" "$out"
+"$CLI" delete-project "General" >/dev/null 2>&1 \
+  && bad "the refusal exits non-zero" "exit 0" || ok "the refusal exits non-zero"
+
+echo
 echo "== projects =="
 out=$("$CLI" project "Work"); contains "create Work" "created project" "$out"
 out=$("$CLI" project "General" 2>&1); contains "duplicate name refused" "already exists" "$out"
@@ -170,6 +180,27 @@ out=$("$CLI" rename p4 "" 2>&1); contains "blank rename refused" "cannot be blan
 out=$("$CLI" rename p4 Work 2>&1); contains "duplicate rename refused" "already exists" "$out"
 out=$("$CLI" recolour p4 zzzzzz 2>&1); contains "bad hex refused" "RRGGBB" "$out"
 out=$("$CLI" recolour p99 2ea043 2>&1); contains "recolour of an unknown id fails" "no project with id" "$out"
+
+echo
+echo "== deleting a project =="
+# A scratch project, created and deleted inside this section: it takes the
+# next free id (p5) and leaves the ids the later sections use untouched.
+out=$("$CLI" project "Scratch"); contains "create Scratch" "created project" "$out"
+out=$("$CLI" add -p Scratch -S -30 -E 0 -d "scratch"); SC=$(id_of "$out"); created=$((created+1))
+# A project that still has entries cannot be deleted, and the refusal says
+# why. The project survives it.
+out=$("$CLI" delete-project "Scratch" 2>&1)
+contains "a project with entries is refused" "still has entries" "$out"
+"$CLI" delete-project "Scratch" >/dev/null 2>&1 \
+  && bad "the refusal exits non-zero" "exit 0" || ok "the refusal exits non-zero"
+# The project survived the refusal: once its entry is gone the same command
+# deletes it.
+"$CLI" delete "$SC" >/dev/null; removed=$((removed+1))
+out=$("$CLI" delete-project "Scratch")
+contains "the scratch project is deleted" "deleted project Scratch" "$out"
+# And it is really gone.
+out=$("$CLI" delete-project "Scratch" 2>&1); contains "the deleted project is gone" "no project with id" "$out"
+check "the scratch entry left nothing behind" "0" "$(listed)"
 
 echo
 echo "== set-text, set-project and unarchive =="
@@ -588,7 +619,7 @@ check "interface is the new one" "org.sequ.timetrack.Entries" \
 printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
   && bad "stopwatch methods are gone" "Start/Stop/Cancel still exposed" \
   || ok "stopwatch methods are gone"
-for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived ExportCsv ExportCsvAt; do
+for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived DeleteProject ExportCsv ExportCsvAt; do
   printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
 done
 
