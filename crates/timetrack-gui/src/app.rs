@@ -1202,7 +1202,6 @@ pub struct TimetrackView {
     /// Whether the one-time focus-on-render has happened. Re-focusing every
     /// frame would steal focus back from anything focusable the user reaches
     /// later, which would break Tab navigation.
-    focused_once: bool,
     /// The manual-entry dialog, when open. Modal: while this is `Some` every
     /// keystroke goes to the dialog and the app shortcuts are suspended.
     dialog: Option<EntryDialog>,
@@ -1504,7 +1503,6 @@ impl TimetrackView {
             project_cursor: 0,
             entity: None,
             focus: cx.focus_handle(),
-            focused_once: false,
             dialog: None,
             project_prompt: None,
             split_prompt: None,
@@ -2269,13 +2267,19 @@ impl Render for TimetrackView {
         // rather than painting one frame stale.
         self.drain();
 
-        // Focus the root on the first frame. `FocusHandle::focus` needs a
-        // `&mut Window`, which `new` does not have, and doing it here is
-        // equivalent: gpui cannot dispatch a key event until a frame exists to
-        // dispatch it against, and the first render is that frame. Without
-        // this the keyboard is dead until the user clicks something focusable.
-        if !self.focused_once {
-            self.focused_once = true;
+        // The root holds the focus. `FocusHandle::focus` needs a
+        // `&mut Window`, which `new` does not have, so it happens here:
+        // gpui cannot dispatch a key event until a frame exists to dispatch
+        // it against, and the first render is that frame. Without this the
+        // keyboard is dead until the user clicks something focusable.
+        //
+        // It is re-asserted on every frame after that, not just the first.
+        // The root is the only focusable node in this window, so re-asserting
+        // cannot take the focus from anything else, and a focus lost to a
+        // platform event would otherwise leave the keyboard dead with no way
+        // back -- gpui dispatches key events along the ancestor path of the
+        // focused node only, and there is no other node to fall back to.
+        if !self.focus.is_focused(window) {
             self.focus.focus(window);
         }
 
