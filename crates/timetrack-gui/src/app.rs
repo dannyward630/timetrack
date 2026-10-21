@@ -356,6 +356,18 @@ enum StatusKind {
     Local,
 }
 
+/// Whether a status is a connection notice: one that a snapshot proves over.
+///
+/// The "service is not running" and "different versions" notices describe the
+/// connection rather than one action, so the first snapshot that arrives
+/// clears them -- the service is back, or it is speaking this client's
+/// interface now. An ordinary error is about one action and survives until
+/// the next one, because snapshots arrive every second and would otherwise
+/// make it unreadable.
+fn is_connection_notice(kind: StatusKind) -> bool {
+    matches!(kind, StatusKind::NoService | StatusKind::VersionMismatch)
+}
+
 /// The footer status line: what to show, and what kind of problem it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusMsg {
@@ -1523,9 +1535,18 @@ impl TimetrackView {
                     // A routine snapshot must not wipe feedback from the last
                     // action: snapshots arrive every second, so clearing here
                     // made error reports from the service thread unreadable.
-                    // Only the "service is not running" notice clears on
-                    // recovery; action errors survive until the next one.
-                    if self.service_missing() {
+                    //
+                    // Two notices are the exception, because a snapshot is
+                    // what proves them over: the service is there again
+                    // ("service is not running"), and it is speaking the
+                    // interface this client speaks ("different versions" --
+                    // the user reinstalled whichever side was older). An
+                    // ordinary action error survives until the next one.
+                    if self
+                        .status
+                        .as_ref()
+                        .is_some_and(|s| is_connection_notice(s.kind))
+                    {
                         self.status = None;
                         changed = true;
                     }
@@ -3996,6 +4017,17 @@ mod tests {
             ..Default::default()
         };
         assert!(delete_offer(&snap, 99).is_none());
+    }
+
+    #[test]
+    fn only_connection_notices_are_cleared_by_a_snapshot() {
+        // A snapshot proves the service is back, and that it is speaking this
+        // client's interface -- so those two notices go. An action error
+        // survives, because snapshots arrive every second.
+        assert!(is_connection_notice(StatusKind::NoService));
+        assert!(is_connection_notice(StatusKind::VersionMismatch));
+        assert!(!is_connection_notice(StatusKind::Service));
+        assert!(!is_connection_notice(StatusKind::Local));
     }
 
     // --- which prompt is open ---
