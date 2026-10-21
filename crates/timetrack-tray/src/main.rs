@@ -22,7 +22,7 @@
 use ksni::TrayMethods as _;
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -236,12 +236,21 @@ fn quick_add_label(duration_ms: i64) -> String {
     format!("+{}m", duration_ms / 60_000)
 }
 
+/// Take a lock without unwrapping it (#51).
+///
+/// A poisoned lock still holds its data: the panic that poisoned it
+/// happened elsewhere, and the data behind it is intact. Unwrapping the
+/// poison turned one failure into a panic loop -- every later render
+/// panicked on the same lock -- so the poison is recovered here and the
+/// caller goes on.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Remember the entry a quick-add created, so undo (#10) targets exactly the
 /// id the service handed back rather than re-deriving it from the list.
 fn record_quick_add(undo: &Arc<Mutex<HashMap<String, String>>>, project_id: &str, entry_id: &str) {
-    undo.lock()
-        .unwrap()
-        .insert(project_id.to_string(), entry_id.to_string());
+    lock(undo).insert(project_id.to_string(), entry_id.to_string());
 }
 
 /// Drop the undo record for `project_id`, but only if it still points at
@@ -252,7 +261,7 @@ fn forget_quick_add_if(
     project_id: &str,
     entry_id: &str,
 ) {
-    let mut guard = undo.lock().unwrap();
+    let mut guard = lock(undo);
     if guard.get(project_id).map(String::as_str) == Some(entry_id) {
         guard.remove(project_id);
     }
@@ -285,15 +294,15 @@ impl TimetrackTray {
     }
 
     fn set_menu(&mut self, menu: MenuModel) {
-        *self.menu.lock().unwrap() = menu;
+        *lock(&self.menu) = menu;
     }
 
     fn set_summary(&mut self, summary: TooltipState) {
-        *self.summary.lock().unwrap() = summary;
+        *lock(&self.summary) = summary;
     }
 
     fn set_unwell(&mut self, unwell: Option<Unwell>) {
-        *self.unwell.lock().unwrap() = unwell;
+        *lock(&self.unwell) = unwell;
     }
 
     /// Ask the poll loop to exit. Touches nothing on the bus: quitting stops
@@ -312,7 +321,7 @@ impl TimetrackTray {
     /// The entry undo should remove for `project_id`, if this session
     /// quick-added to it. `None` disables the undo row.
     fn last_quick_add_for(&self, project_id: &str) -> Option<String> {
-        self.last_quick_add.lock().unwrap().get(project_id).cloned()
+        lock(&self.last_quick_add).get(project_id).cloned()
     }
 
     /// One submenu per project: a disabled week-total row, then one row per
@@ -490,8 +499,8 @@ impl ksni::Tray for TimetrackTray {
         // asset is installed, so a second icon name would render nothing.
         // A missing service flattens the icon; a skew or an over-24h day
         // asks for attention; otherwise the icon sits idle-active.
-        let unwell = self.unwell.lock().unwrap().clone();
-        let attention = self.summary.lock().unwrap().attention;
+        let unwell = lock(&self.unwell).clone();
+        let attention = lock(&self.summary).attention;
         match unwell {
             Some(Unwell::Down) => ksni::Status::Passive,
             Some(Unwell::Skewed) => ksni::Status::NeedsAttention,
@@ -515,8 +524,8 @@ impl ksni::Tray for TimetrackTray {
     /// version_mismatch_hint}`). A refusal shows the service's own wording,
     /// like the GUI's `StatusKind::Service`.
     fn tool_tip(&self) -> ksni::ToolTip {
-        let summary = self.summary.lock().unwrap().clone();
-        let unwell = self.unwell.lock().unwrap().clone();
+        let summary = lock(&self.summary).clone();
+        let unwell = lock(&self.unwell).clone();
         let description = match unwell {
             None => tooltip_text(&summary),
             Some(Unwell::Down) => timetrack_proto::no_service_hint(),
@@ -532,8 +541,12 @@ impl ksni::Tray for TimetrackTray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        let menu = self.menu.lock().unwrap();
-        let undo = self.last_quick_add.lock().unwrap();
+        // Copy the state out and drop the guards before building anything
+        // (#51): the closures built below must not be built with a lock
+        // held, and a panic while they are built must not poison the locks
+        // the next render needs.
+        let menu = lock(&self.menu).clone();
+        let undo = lock(&self.last_quick_add).clone();
         let mut items: Vec<ksni::MenuItem<Self>> = menu
             .visible
             .iter()
@@ -720,7 +733,7 @@ async fn run() -> anyhow::Result<()> {
                     println!("timetrack-tray: week total {minutes} min");
                 }
                 let menu = build_menu_model(&snapshot);
-                let undo = last_quick_add.lock().unwrap().clone();
+                let undo = lock(&last_quick_add).clone();
                 let summary = TooltipState::from_snapshot(&snapshot);
                 // A good snapshot clears any earlier failure state (pushed
                 // above); the menu, undo map and summary gate the rest.
@@ -1443,5 +1456,57 @@ mod tests {
             .expect("menu must end with Quit");
         (quit.activate)(&mut tray);
         assert!(tray.quit_requested());
+    }
+
+    /// Poison a mutex the way a panic inside a guarded window would. The
+    /// panic message is silenced: the panic is the point, and it is caught
+    /// here.
+    fn poison<T>(mutex: &Mutex<T>) {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("a panic inside the guarded window");
+        }));
+        std::panic::set_hook(previous);
+        assert!(poisoned.is_err(), "the lock must really be poisoned");
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_panic_the_render_path() {
+        // #51: a panic while a lock is held poisons it, and the render path
+        // used to unwrap that poison into a panic of its own -- so one
+        // failure turned into a panic loop. The data behind a poisoned lock
+        // is still there, so the render path must go on using it.
+        let mut tray = tray();
+        tray.set_menu(build_menu_model(&snapshot_with(
+            vec![project("p1", "Work", false)],
+            &[("p1", 30 * 60_000)],
+        )));
+        super::record_quick_add(&tray.last_quick_add, "p1", "e1");
+
+        // Every lock the render path takes, poisoned.
+        poison(&tray.menu);
+        poison(&tray.summary);
+        poison(&tray.unwell);
+        poison(&tray.last_quick_add);
+
+        // The menu still renders, with the same rows.
+        let items = tray.menu();
+        let sub = project_submenu_named(&items, "Work");
+        assert_eq!(sub.label, "Work");
+        assert_eq!(find_standard(sub, "This week: 30m").label, "This week: 30m");
+        // The undo row is still enabled: the undo map is intact.
+        assert_eq!(undo_row(&items, "Work"), ("Undo quick-add".into(), true));
+        // The tooltip and the icon still answer.
+        assert_eq!(tray.tool_tip().description, "Week total 0:00 · 0 projects");
+        assert_eq!(tray.status(), ksni::Status::Active);
+        // And the setters still write through a poisoned lock.
+        tray.set_summary(TooltipState {
+            total_ms: 90 * 60_000,
+            projects: 2,
+            attention: false,
+        });
+        assert_eq!(tray.tool_tip().description, "Week total 1:30 · 2 projects");
     }
 }
