@@ -18,7 +18,7 @@ timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
 gpui = { workspace = true }
 anyhow = { workspace = true }
-async-io = "2"
+async-io = { workspace = true }
 # System save dialog via the desktop portal. Same
 # backend as gpui itself: `async-std` selects zbus' async-io backend, never
 # tokio (see the workspace manifest for why tokio is load-bearing absent).

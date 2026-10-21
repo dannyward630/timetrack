@@ -16,7 +16,7 @@ timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
 ksni = { workspace = true }
 anyhow = { workspace = true }
-async-io = "2"
+async-io = { workspace = true }
 
 [dev-dependencies]
 zbus = { workspace = true }

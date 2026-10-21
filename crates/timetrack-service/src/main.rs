@@ -213,7 +213,7 @@ impl EntryIface {
 }
 
 /// zbus uses the async-io backend (see the workspace Cargo.toml), so the
-/// runtime is `async_io`, not tokio. `tokio::main` would leave no reactor for
+/// runtime is `async_io`, not tokio. A tokio main would leave no reactor for
 /// zbus' internal executor.
 fn main() -> anyhow::Result<()> {
     async_io::block_on(run())
