@@ -44,7 +44,11 @@
 # existing. There is no OCR -- the pixel assertions deliberately do not claim
 # to read the number, only that the region changed when the total did.
 #
-# Run it after `cargo build --release`.
+# Run it after
+#   cargo build --release --features timetrack-gui/portal-stub
+# The feature compiles in the save-dialog stub this check drives: there is no
+# live portal on a headless X server, and a released binary has no stub to
+# arm at all.
 #
 # Needs: Xvfb, dbus-daemon, ImageMagick (convert, compare, import), xdpyinfo,
 # setxkbmap, gcc and libXtst. xwininfo is optional: when it is installed, a
@@ -101,7 +105,10 @@ cleanup() {
 trap cleanup EXIT
 
 for f in "$GUI" "$SVC" "$CLI"; do
-  [ -x "$f" ] || { echo "missing $f -- run 'cargo build --release' first"; exit 2; }
+  [ -x "$f" ] || {
+    echo "missing $f -- run 'cargo build --release --features timetrack-gui/portal-stub' first"
+    exit 2
+  }
 done
 for t in Xvfb dbus-daemon convert compare import xdpyinfo setxkbmap gcc; do
   command -v "$t" >/dev/null || { echo "missing $t"; exit 2; }
