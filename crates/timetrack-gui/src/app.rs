@@ -32,7 +32,7 @@ use gpui::{
     MouseButton, Render, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
     rgb, rgba,
 };
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
 use timetrack_proto::{ClientError, ProjectView, Snapshot, no_service_hint, version_mismatch_hint};
@@ -40,9 +40,12 @@ use timetrack_proto::{ClientError, ProjectView, Snapshot, no_service_hint, versi
 /// How often the service is polled for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(1000);
 
-/// A snapshot handed from the service thread to the UI thread.
+/// A message handed from the service thread to the UI thread.
+///
+/// Snapshots do not travel here: they have their own bounded channel (see
+/// `spawn_service_thread`), because they are the one kind of message that
+/// can be dropped without losing anything.
 enum Msg {
-    Snapshot(Box<Snapshot>),
     Error(StatusMsg),
     /// A success worth showing (e.g. where an export was written). Snapshots
     /// never clear feedback, so this survives until the next action.
@@ -157,8 +160,50 @@ enum Action {
     StartService,
 }
 
-/// Spawn the service thread. Returns `(messages_rx, actions_tx)`.
-fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
+/// What happened to a snapshot offered to the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offered {
+    /// It is queued.
+    Queued,
+    /// The view is behind, so the snapshot was dropped.
+    Dropped,
+    /// The window is gone.
+    Gone,
+}
+
+/// Offer a snapshot to the view.
+///
+/// The queue holds one snapshot. A view that stops draining -- a hidden
+/// window, a long paint -- must not make the queue grow without bound, and
+/// the snapshot waiting there is already stale, so a new one is dropped
+/// rather than queued behind it. The next tick's arrives and the view
+/// catches up.
+fn offer_snapshot(tx: &SyncSender<Snapshot>, s: Snapshot) -> Offered {
+    match tx.try_send(s) {
+        Ok(()) => Offered::Queued,
+        Err(std::sync::mpsc::TrySendError::Full(_)) => Offered::Dropped,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Offered::Gone,
+    }
+}
+
+/// Spawn the service thread.
+///
+/// Returns `(snapshots_rx, messages_rx, actions_tx)`.
+///
+/// The two channels back to the view are different on purpose.
+///
+/// **Snapshots** are bounded. They arrive about once a second and the view
+/// drains them every 300 ms, so a view that stops draining -- a hidden
+/// window, a long paint -- must not make the queue grow without bound. A
+/// snapshot a second old is worth nothing, so the queue holds one and a
+/// newer one is dropped rather than queued behind it; the next tick's
+/// arrives and the view catches up.
+///
+/// **Messages** -- errors, statuses, the result of an action -- are
+/// unbounded and never dropped. Those are the service's refusals and the
+/// user's intentions, and losing one would be a lie.
+fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Sender<Action>) {
+    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
     let (tx, rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -322,8 +367,10 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                 }
                 match client.snapshot().await {
                     Ok(s) => {
-                        if tx.send(Msg::Snapshot(Box::new(s))).is_err() {
-                            return;
+                        match offer_snapshot(&snapshot_tx, s) {
+                            Offered::Queued | Offered::Dropped => {}
+                            // The window is gone: nothing left to do.
+                            Offered::Gone => return,
                         }
                     }
                     Err(e) => {
@@ -336,7 +383,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
             }
         });
     });
-    (rx, action_tx)
+    (snapshot_rx, rx, action_tx)
 }
 
 /// What kind of problem a status line reports.
@@ -1146,6 +1193,10 @@ fn bar_width(ms: i64, max_ms: i64) -> f32 {
 }
 
 pub struct TimetrackView {
+    /// Snapshots, on their own bounded channel: a stale one is worth
+    /// nothing, so the queue never grows (see `spawn_service_thread`).
+    snapshots: Receiver<Snapshot>,
+    /// Errors, statuses and action results: never dropped.
     rx: Receiver<Msg>,
     actions: Sender<Action>,
     snapshot: Snapshot,
@@ -1437,8 +1488,9 @@ fn export_preview_entries<'a>(
 
 impl TimetrackView {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let (rx, actions) = spawn_service_thread();
+        let (snapshots, rx, actions) = spawn_service_thread();
         let view = TimetrackView {
+            snapshots,
             rx,
             actions,
             snapshot: Snapshot::default(),
@@ -1498,6 +1550,62 @@ impl TimetrackView {
     // not. Everything bus-related is confined to the dedicated std::thread in
     // `spawn_service_thread`, which owns an async-io runtime of its own.
 
+    /// Take a fresh snapshot. Returns whether anything visible changed.
+    fn apply_snapshot(&mut self, s: Snapshot) -> bool {
+        let mut changed = false;
+        if s != self.snapshot {
+            self.snapshot = s;
+            changed = true;
+        }
+        // The typed day mirrors the anchor's local day: re-mirror
+        // it from the snapshot zone now that a real zone exists.
+        // User edits stay intact — only the just-opened value is
+        // fixed (see `refresh_from_snapshot`).
+        let tz = snapshot_tz(&self.snapshot);
+        let before = self.export_picker.anchor_text.clone();
+        self.export_picker.refresh_from_snapshot(&tz);
+        if self.export_picker.anchor_text != before {
+            changed = true;
+        }
+        // A routine snapshot must not wipe feedback from the last
+        // action: snapshots arrive every second, so clearing here
+        // made error reports from the service thread unreadable.
+        //
+        // Two notices are the exception, because a snapshot is
+        // what proves them over: the service is there again
+        // ("service is not running"), and it is speaking the
+        // interface this client speaks ("different versions" --
+        // the user reinstalled whichever side was older). An
+        // ordinary action error survives until the next one.
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|s| is_connection_notice(s.kind))
+        {
+            self.status = None;
+            changed = true;
+        }
+        // The lists can shrink under the cursor when something is
+        // removed, which would otherwise index out of bounds.
+        let entries = self.snapshot.entries.len();
+        if self.selected >= entries {
+            let clamped = entries.saturating_sub(1);
+            if clamped != self.selected {
+                self.selected = clamped;
+                changed = true;
+            }
+        }
+        let projects = self.active_projects().len();
+        if self.project_cursor >= projects {
+            let clamped = projects.saturating_sub(1);
+            if clamped != self.project_cursor {
+                self.project_cursor = clamped;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Fold every queued message into one refresh. Several may be pending and
     /// only the newest snapshot matters.
     ///
@@ -1515,60 +1623,19 @@ impl TimetrackView {
                 *changed = true;
             }
         };
+        // The snapshot channel is bounded, so it holds at most one. Take the
+        // newest one waiting and leave the rest: a snapshot a second old is
+        // worth nothing, and the next tick's arrives.
+        let mut newest: Option<Snapshot> = None;
+        while let Ok(s) = self.snapshots.try_recv() {
+            newest = Some(s);
+        }
+        if let Some(s) = newest {
+            changed |= self.apply_snapshot(s);
+        }
+
         loop {
             match self.rx.try_recv() {
-                Ok(Msg::Snapshot(s)) => {
-                    if *s != self.snapshot {
-                        self.snapshot = *s;
-                        changed = true;
-                    }
-                    // The typed day mirrors the anchor's local day: re-mirror
-                    // it from the snapshot zone now that a real zone exists.
-                    // User edits stay intact — only the just-opened value is
-                    // fixed (see `refresh_from_snapshot`).
-                    let tz = snapshot_tz(&self.snapshot);
-                    let before = self.export_picker.anchor_text.clone();
-                    self.export_picker.refresh_from_snapshot(&tz);
-                    if self.export_picker.anchor_text != before {
-                        changed = true;
-                    }
-                    // A routine snapshot must not wipe feedback from the last
-                    // action: snapshots arrive every second, so clearing here
-                    // made error reports from the service thread unreadable.
-                    //
-                    // Two notices are the exception, because a snapshot is
-                    // what proves them over: the service is there again
-                    // ("service is not running"), and it is speaking the
-                    // interface this client speaks ("different versions" --
-                    // the user reinstalled whichever side was older). An
-                    // ordinary action error survives until the next one.
-                    if self
-                        .status
-                        .as_ref()
-                        .is_some_and(|s| is_connection_notice(s.kind))
-                    {
-                        self.status = None;
-                        changed = true;
-                    }
-                    // The lists can shrink under the cursor when something is
-                    // removed, which would otherwise index out of bounds.
-                    let entries = self.snapshot.entries.len();
-                    if self.selected >= entries {
-                        let clamped = entries.saturating_sub(1);
-                        if clamped != self.selected {
-                            self.selected = clamped;
-                            changed = true;
-                        }
-                    }
-                    let projects = self.active_projects().len();
-                    if self.project_cursor >= projects {
-                        let clamped = projects.saturating_sub(1);
-                        if clamped != self.project_cursor {
-                            self.project_cursor = clamped;
-                            changed = true;
-                        }
-                    }
-                }
                 Ok(Msg::Error(note)) => set_status(&mut self.status, note, &mut changed),
                 Ok(Msg::Status(note)) => {
                     set_status(&mut self.status, StatusMsg::local(note), &mut changed)
@@ -4028,6 +4095,30 @@ mod tests {
         assert!(is_connection_notice(StatusKind::VersionMismatch));
         assert!(!is_connection_notice(StatusKind::Service));
         assert!(!is_connection_notice(StatusKind::Local));
+    }
+
+    // --- the snapshot queue ---
+
+    #[test]
+    fn a_snapshot_is_dropped_rather_than_queued_behind_a_stale_one() {
+        // The queue holds one. A view that stops draining must not make it
+        // grow, so a newer snapshot is dropped rather than queued behind the
+        // stale one -- and the next tick's takes its place.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        assert_eq!(offer_snapshot(&tx, Snapshot::default()), Offered::Queued);
+        assert_eq!(offer_snapshot(&tx, Snapshot::default()), Offered::Dropped);
+        assert!(
+            rx.try_recv().is_ok(),
+            "the one that got there is still there"
+        );
+        assert!(rx.try_recv().is_err(), "and it is the only one");
+    }
+
+    #[test]
+    fn a_closed_view_is_told_the_window_is_gone() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx);
+        assert_eq!(offer_snapshot(&tx, Snapshot::default()), Offered::Gone);
     }
 
     // --- which prompt is open ---
