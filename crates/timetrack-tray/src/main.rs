@@ -61,6 +61,28 @@ const POLL: Duration = Duration::from_secs(5);
 /// here it is the menu, not the data, that is capped).
 const MAX_PROJECTS: usize = 8;
 
+/// The tray's one bus connection, shared by the poll loop and the menu
+/// workers (#50).
+///
+/// The poll loop publishes the live client here; a menu click clones it
+/// and makes its call on the clone, so a burst of clicks multiplies
+/// threads but never bus connections.
+type SharedClient = Arc<Mutex<Option<Client>>>;
+
+/// The tray's live connection, cloned for one call.
+///
+/// `None` means the tray holds no connection -- the service is not
+/// running -- so a caller must not open one of its own.
+fn shared_client(slot: &SharedClient) -> Option<Client> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Publish the tray's live connection, or clear it once that connection
+/// dies, so the menu workers always find the current one.
+fn set_shared_client(slot: &SharedClient, client: Option<Client>) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = client;
+}
+
 /// One unarchived project as the menu sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectItem {
@@ -228,6 +250,10 @@ struct TimetrackTray {
     /// quitting never blocks, never calls the service, and leaves through
     /// `main`, unregistering the item cleanly.
     shutdown: Arc<AtomicBool>,
+    /// The tray's one bus connection, shared with the poll loop (#50). The
+    /// menu workers take the client out of it instead of opening a
+    /// connection of their own.
+    client: SharedClient,
 }
 
 /// Label for a quick-add bucket row, in minutes like the GUI and CLI buckets
@@ -274,13 +300,18 @@ fn undo_record_stale(result: &Result<(), ClientError>) -> bool {
 }
 
 impl TimetrackTray {
-    fn new(last_quick_add: Arc<Mutex<HashMap<String, String>>>, shutdown: Arc<AtomicBool>) -> Self {
+    fn new(
+        last_quick_add: Arc<Mutex<HashMap<String, String>>>,
+        shutdown: Arc<AtomicBool>,
+        client: SharedClient,
+    ) -> Self {
         Self {
             menu: Mutex::new(MenuModel::default()),
             summary: Mutex::new(TooltipState::default()),
             unwell: Mutex::new(None),
             last_quick_add,
             shutdown,
+            client,
         }
     }
 
@@ -337,10 +368,13 @@ impl TimetrackTray {
                     // records the created id for undo below when it lands.
                     let project_id = project_id.clone();
                     let undo = tray.last_quick_add.clone();
+                    let slot = tray.client.clone();
                     std::thread::spawn(move || {
                         let result: Result<timetrack_proto::EntryView, ClientError> =
                             async_io::block_on(async {
-                                let client = Client::connect().await?;
+                                // The tray's own connection (#50): the click
+                                // reuses it instead of opening a new one.
+                                let client = shared_client(&slot).ok_or(ClientError::NoService)?;
                                 client.quick_add(&project_id, ms).await
                             });
                         match result {
@@ -376,9 +410,12 @@ impl TimetrackTray {
                 };
                 let project_id = undo_project.clone();
                 let undo = tray.last_quick_add.clone();
+                let slot = tray.client.clone();
                 std::thread::spawn(move || {
                     let result: Result<(), ClientError> = async_io::block_on(async {
-                        let client = Client::connect().await?;
+                        // The tray's own connection (#50): the click reuses
+                        // it instead of opening a new one.
+                        let client = shared_client(&slot).ok_or(ClientError::NoService)?;
                         client.undo_quick_add(&entry_id).await
                     });
                     match &result {
@@ -421,15 +458,20 @@ impl TimetrackTray {
                     submenu: vec![
                         ksni::MenuItem::Standard(ksni::menu::StandardItem {
                             label: confirm_label.clone(),
-                            activate: Box::new(move |_: &mut Self| {
+                            activate: Box::new(move |tray: &mut Self| {
                                 // Clone for the worker: `activate` must stay
                                 // callable, so nothing moves out of it.
                                 let entry_id = entry_id.clone();
                                 let confirm_label = confirm_label.clone();
+                                let slot = tray.client.clone();
                                 std::thread::spawn(move || {
                                     let result: Result<(), ClientError> =
                                         async_io::block_on(async {
-                                            let client = Client::connect().await?;
+                                            // The tray's own connection
+                                            // (#50): the click reuses it
+                                            // instead of opening a new one.
+                                            let client = shared_client(&slot)
+                                                .ok_or(ClientError::NoService)?;
                                             client.delete_entry(&entry_id).await
                                         });
                                     match result {
@@ -620,14 +662,21 @@ async fn run() -> anyhow::Result<()> {
     // the process leaves through `main` below, unregistering the SNI item
     // cleanly instead of dying mid-D-Bus-call.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let handle = TimetrackTray::new(last_quick_add.clone(), shutdown.clone())
-        .assume_sni_available(true)
-        .spawn()
-        .await
-        .map_err(|e| anyhow::anyhow!("could not register tray item: {e}"))?;
+    // The tray's one bus connection (#50): the poll loop publishes the
+    // live client here and the menu workers reuse it, so a click never
+    // opens a second connection.
+    let client_slot: SharedClient = Arc::new(Mutex::new(None));
+    let handle = TimetrackTray::new(
+        last_quick_add.clone(),
+        shutdown.clone(),
+        client_slot.clone(),
+    )
+    .assume_sni_available(true)
+    .spawn()
+    .await
+    .map_err(|e| anyhow::anyhow!("could not register tray item: {e}"))?;
     println!("timetrack-tray: registered org.sequ.timetrack.tray");
 
-    let mut client: Option<Client> = None;
     let mut last_state: Option<ConnState> = None;
     let mut last_total_ms: Option<i64> = None;
     // The last menu pushed to the item, plus the last undo map and tooltip
@@ -652,9 +701,16 @@ async fn run() -> anyhow::Result<()> {
         // (Re)connect anonymously: `Client::connect` never requests BUS_NAME,
         // so a healthy service is never disturbed and an absent one just
         // fails here, before any method call.
-        if client.is_none() {
-            match Client::connect().await {
-                Ok(c) => client = Some(c),
+        //
+        // The connection is published in the shared slot, so the menu
+        // workers reuse it instead of opening one of their own (#50).
+        let client = match shared_client(&client_slot) {
+            Some(c) => c,
+            None => match Client::connect().await {
+                Ok(c) => {
+                    set_shared_client(&client_slot, Some(c.clone()));
+                    c
+                }
                 Err(e) => {
                     // Connecting reaches no method, so any failure here is
                     // the bus itself, presented as the service being
@@ -674,14 +730,10 @@ async fn run() -> anyhow::Result<()> {
                     async_io::Timer::after(POLL).await;
                     continue;
                 }
-            }
-        }
+            },
+        };
 
-        let result = client
-            .as_ref()
-            .expect("client is connected above")
-            .snapshot()
-            .await;
+        let result = client.snapshot().await;
         let state = conn_state(&result);
         if last_state != Some(state) {
             last_state = Some(state);
@@ -739,7 +791,7 @@ async fn run() -> anyhow::Result<()> {
             Err(ClientError::NoService) | Err(ClientError::Transport(_)) => {
                 // The bus or the service went away: drop the connection so
                 // the next tick reconnects from scratch.
-                client = None;
+                set_shared_client(&client_slot, None);
             }
             Err(ClientError::VersionMismatch { .. }) | Err(ClientError::Service(_)) => {
                 // Keep the connection: the bus is fine. A mismatch means a
@@ -778,6 +830,7 @@ mod tests {
         TimetrackTray::new(
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
         )
     }
 
@@ -985,6 +1038,27 @@ mod tests {
         assert!(!undo.enabled);
         let delete = find_standard(sub, "Nothing to delete");
         assert!(!delete.enabled);
+    }
+
+    #[test]
+    fn the_tray_keeps_one_shared_connection() {
+        // #50: the poll loop publishes the live client in a slot, and the
+        // menu workers take it from there -- a click must never open a
+        // connection of its own. The slot is the tray's connection, so the
+        // tray keeps it.
+        let slot: super::SharedClient = Arc::new(Mutex::new(None));
+        let tray = TimetrackTray::new(
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+            slot.clone(),
+        );
+        assert!(
+            Arc::ptr_eq(&tray.client, &slot),
+            "the tray must keep the very slot the poll loop publishes to"
+        );
+        // Nothing published yet: there is no connection to reuse, and a
+        // worker must refuse the call rather than open one in its place.
+        assert!(super::shared_client(&slot).is_none());
     }
 
     #[test]
