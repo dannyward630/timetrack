@@ -13,6 +13,17 @@ description = "TimeTrack desktop client (gpui)"
 name = "timetrack-gui"
 path = "src/main.rs"
 
+[features]
+default = []
+# The headless GUI smoke check needs a save dialog it can drive, and there
+# is no live portal on a headless X server. The stub that stands in for one
+# is compiled in only when this feature is on, so a released binary cannot
+# be talked into bypassing the system save dialog.
+#
+# The smoke check's build turns it on explicitly:
+#   cargo build --release -p timetrack-gui --features timetrack-gui/portal-stub
+portal-stub = []
+
 [dependencies]
 timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }

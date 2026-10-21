@@ -74,10 +74,16 @@ cargo build --release
 # The tray's round-trip test spawns the debug service binary, which `cargo test`
 # does not build (it compiles test harnesses, not binaries):
 cargo build --package timetrack-service
-cargo test --workspace        # 320+ unit tests (GUI tests need the system libs below)
-bash scripts/e2e.sh           # 139 end-to-end checks against a real service
-bash scripts/gui-smoke.sh     # 61 headless GUI checks: paint, quick-add click, keyboard, confirm dialogs, tabs, export picker/preview/save
+cargo test --workspace --features timetrack-gui/portal-stub   # unit tests (GUI tests need the system libs below)
+bash scripts/e2e.sh           # end-to-end checks against a real service
+bash scripts/gui-smoke.sh     # headless GUI checks: paint, quick-add click, keyboard, confirm dialogs, tabs, export picker/preview/save
 ```
+
+The `portal-stub` feature compiles in the save-dialog stub the GUI smoke
+check drives: there is no live portal on a headless X server. A released
+binary is built **without** it, so there is no stub in it to arm — the
+system save dialog cannot be talked out of the way by an environment
+variable.
 
 CI runs those same commands on every pull request and on `main`
 (`.github/workflows/ci.yml`: rustfmt, clippy, `cargo test --workspace`, then the
