@@ -12,12 +12,17 @@
 //! the same call a desktop host makes), asserts a 15-minute `QuickAdd` entry
 //! lands for the seeded project, undoes it, quick-adds `+30m`, cancels its
 //! delete (the entry stays), then confirms and asserts it is gone.
+//!
+//! The fake service also remembers which bus connection each call arrived
+//! on: a menu click must travel over the connection the tray already holds
+//! (#50), not over a fresh one.
 
 mod common;
 
 use common::ChildGuard;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use timetrack_proto::{BUS_NAME, Client, EntrySource, OBJECT_PATH};
 use zbus::interface;
@@ -29,6 +34,9 @@ struct FakeInner {
     store: timetrack_core::JsonStore,
     data: timetrack_core::Store,
     ids: timetrack_core::Counter,
+    /// The bus connections each method was called over: the unique name of
+    /// the caller, per method (#50).
+    callers: HashMap<String, HashSet<String>>,
 }
 
 struct FakeService {
@@ -51,13 +59,37 @@ impl FakeService {
         }
         let ids = timetrack_core::Counter::continuing(&data);
         let svc = Self {
-            inner: Mutex::new(FakeInner { store, data, ids }),
+            inner: Mutex::new(FakeInner {
+                store,
+                data,
+                ids,
+                callers: HashMap::new(),
+            }),
         };
         {
             let g = svc.inner.lock().unwrap();
             g.store.save(&g.data).expect("the seed must persist");
         }
         svc
+    }
+
+    /// Remember which bus connection a call arrived on, so the test can
+    /// tell a reused connection from a fresh one (#50).
+    fn record_caller(&self, method: &str, header: &zbus::message::Header<'_>) {
+        let Some(sender) = header.sender() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        g.callers
+            .entry(method.to_string())
+            .or_default()
+            .insert(sender.as_str().to_string());
+    }
+
+    /// The bus connections a method was called over.
+    fn callers(&self, method: &str) -> HashSet<String> {
+        let g = self.inner.lock().unwrap();
+        g.callers.get(method).cloned().unwrap_or_default()
     }
 
     /// Everything the tray's poll loop reads: projects plus this week's
@@ -100,7 +132,9 @@ impl FakeService {
     fn quick_add_json(&self, project_id: &str, duration_ms: i64) -> zbus::fdo::Result<String> {
         let mut g = self.inner.lock().unwrap();
         let now = now_ms();
-        let FakeInner { data, ids, store } = &mut *g;
+        let FakeInner {
+            data, ids, store, ..
+        } = &mut *g;
         match timetrack_core::quick_add(data, ids, project_id, duration_ms, now) {
             Ok(entry) => {
                 if let Err(e) = store.save(data) {
@@ -185,27 +219,44 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-struct FakeIface(FakeService);
+struct FakeIface(Arc<FakeService>);
 
 #[interface(name = "org.sequ.timetrack.Entries")]
 impl FakeIface {
     #[zbus(name = "Snapshot")]
-    fn snapshot(&self) -> String {
+    fn snapshot(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> String {
+        self.0.record_caller("Snapshot", &header);
         self.0.snapshot_json()
     }
 
     #[zbus(name = "QuickAdd")]
-    fn quick_add(&self, project_id: &str, duration_ms: i64) -> zbus::fdo::Result<String> {
+    fn quick_add(
+        &self,
+        project_id: &str,
+        duration_ms: i64,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<String> {
+        self.0.record_caller("QuickAdd", &header);
         self.0.quick_add_json(project_id, duration_ms)
     }
 
     #[zbus(name = "UndoQuickAdd")]
-    fn undo_quick_add(&self, entry_id: &str) -> zbus::fdo::Result<()> {
+    fn undo_quick_add(
+        &self,
+        entry_id: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.0.record_caller("UndoQuickAdd", &header);
         self.0.undo_quick_add_unit(entry_id)
     }
 
     #[zbus(name = "DeleteEntry")]
-    fn delete_entry(&self, entry_id: &str) -> zbus::fdo::Result<()> {
+    fn delete_entry(
+        &self,
+        entry_id: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.0.record_caller("DeleteEntry", &header);
         self.0.delete_entry_unit(entry_id)
     }
 }
@@ -221,11 +272,12 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         let (conn, items) = common::serve_watcher(&address).await;
 
         let store_path = dir.join("store.json");
+        let fake = Arc::new(FakeService::new(store_path.clone()));
         let _service_conn = zbus::connection::Builder::address(address.as_str())
             .expect("private bus address must parse")
             .name(BUS_NAME)
             .expect("service name must be valid")
-            .serve_at(OBJECT_PATH, FakeIface(FakeService::new(store_path.clone())))
+            .serve_at(OBJECT_PATH, FakeIface(fake.clone()))
             .expect("service path must be valid")
             .build()
             .await
@@ -251,8 +303,9 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         let plus_15m = common::wait_for_row(&menu, "+15m", false, Duration::from_secs(20)).await;
         common::click_row(&menu, plus_15m).await;
 
-        // The tray's worker thread connects and quick-adds; the entry must
-        // land in the store with the 15-minute bucket, tagged quick-add.
+        // The tray's worker thread quick-adds over the connection the tray
+        // already holds; the entry must land in the store with the
+        // 15-minute bucket, tagged quick-add.
         let client = Client::connect()
             .await
             .expect("must connect to the fake service");
@@ -288,6 +341,25 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
             async_io::Timer::after(Duration::from_millis(200)).await;
         }
         assert!(store_path.exists(), "the store file must have been written");
+
+        // #50: the click reached the service over the connection the tray
+        // already had -- the same bus connection its poll loop uses, not a
+        // fresh one per click. The test's own client also polls the
+        // service, so the quick-add caller must be one of the callers the
+        // snapshots came from.
+        let quick_add_callers = fake.callers("QuickAdd");
+        assert_eq!(
+            quick_add_callers.len(),
+            1,
+            "one click must travel over one connection, not a new one each time: \
+             {quick_add_callers:?}"
+        );
+        let snapshot_callers = fake.callers("Snapshot");
+        assert!(
+            quick_add_callers.is_subset(&snapshot_callers),
+            "the click must reuse the tray's connection \
+             (quick-add from {quick_add_callers:?}, snapshots from {snapshot_callers:?})"
+        );
 
         // Tray-6 (#10): the submenu now offers an enabled undo row (the
         // poll loop rebuilds once the worker records the created id); click
