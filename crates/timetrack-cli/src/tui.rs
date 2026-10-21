@@ -54,9 +54,25 @@ struct App {
     /// ordered by start time and two quick-adds can share a timestamp; the
     /// id we were handed is the only unambiguous answer (REQUIREMENTS §6).
     last_quick_add_id: Option<String>,
+    /// The entry a pending delete would remove, if `d` is waiting for its
+    /// second key.
+    delete_confirm: Option<DeleteConfirm>,
     /// A transient message shown in the footer.
     status: Option<String>,
     should_quit: bool,
+}
+
+/// A pending delete confirmation: the entry that would go, and the one-line
+/// summary the footer shows while it waits.
+///
+/// The summary names the project and the duration, so `d` can never remove
+/// time as a side effect of reaching for another key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteConfirm {
+    /// The entry that would be removed.
+    id: String,
+    /// What the footer says while the confirmation is pending.
+    summary: String,
 }
 
 impl App {
@@ -87,13 +103,6 @@ impl App {
             }
             Err(e) => self.status = Some(format!("service unavailable: {e}")),
         }
-    }
-
-    fn selected_id(&self) -> Option<String> {
-        self.snapshot
-            .entries
-            .get(self.selected)
-            .map(|e| e.id.clone())
     }
 
     /// The project quick-add and the new-entry dialogs attribute time to.
@@ -134,6 +143,26 @@ impl App {
 
     async fn on_key(&mut self, key: event::KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // A pending confirmation listens only to its own answers: `d`
+        // confirms, `Esc` -- or any other key -- disarms. Nothing else can
+        // happen between the two `d`s.
+        if self.delete_confirm.is_some() {
+            match pending_answer(key.code, ctrl) {
+                // `d` falls through to the delete arm below.
+                PendingAnswer::Confirm => {}
+                PendingAnswer::Quit => {
+                    self.delete_confirm = None;
+                    self.should_quit = true;
+                    return;
+                }
+                PendingAnswer::Disarm => {
+                    self.delete_confirm = None;
+                    return;
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('q') => self.should_quit = true,
@@ -190,18 +219,35 @@ impl App {
                 }
             }
 
-            // --- explicit delete ---
+            // --- explicit delete: two keys, like the GUI and the tray ---
             KeyCode::Char('d') => {
-                if let Some(id) = self.selected_id() {
-                    let for_call = id.clone();
-                    let ok = self
-                        .act(move |c| {
-                            let id = for_call.clone();
-                            async move { c.delete_entry(&id).await }
-                        })
-                        .await;
-                    if ok {
-                        self.status = Some(format!("deleted {id}"));
+                let effect =
+                    delete_effect(self.delete_confirm.as_ref(), &self.snapshot, self.selected);
+                match effect {
+                    DeleteEffect::Arm(confirm) => {
+                        // The first `d` only names the entry; the footer
+                        // asks for the second one.
+                        self.status = None;
+                        self.delete_confirm = Some(confirm);
+                    }
+                    DeleteEffect::Delete(id) => {
+                        // The confirmation has been answered: drop it before
+                        // the call, so a failed delete does not leave the UI
+                        // waiting for a third `d`.
+                        self.delete_confirm = None;
+                        let for_call = id.clone();
+                        let ok = self
+                            .act(move |c| {
+                                let id = for_call.clone();
+                                async move { c.delete_entry(&id).await }
+                            })
+                            .await;
+                        if ok {
+                            self.status = Some(format!("deleted {id}"));
+                        }
+                    }
+                    DeleteEffect::Nothing => {
+                        self.status = Some("nothing to delete".into());
                     }
                 }
             }
@@ -278,6 +324,85 @@ fn last_quick_add(snap: &Snapshot) -> Option<String> {
         .iter()
         .find(|e| e.source == timetrack_proto::EntrySource::QuickAdd)
         .map(|e| e.id.clone())
+}
+
+/// The delete confirmation for the entry at `selected`, if there is one.
+///
+/// A free function over the snapshot, like the other rules above, so the
+/// wording is testable without a live service connection. The summary names
+/// the project and the duration in the tray's words (`Delete 30m from
+/// Work`), so the three clients cannot drift apart on what a delete would
+/// take.
+fn delete_offer(snap: &Snapshot, selected: usize) -> Option<DeleteConfirm> {
+    let picked = snap.entries.get(selected)?;
+    let project = snap
+        .projects
+        .iter()
+        .find(|p| p.id == picked.project_id)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| picked.project_id.clone());
+    Some(DeleteConfirm {
+        id: picked.id.clone(),
+        summary: format!(
+            "Delete {} from {}? d to confirm, esc to cancel",
+            timetrack_core::format_compact(picked.duration_ms()),
+            project,
+        ),
+    })
+}
+
+/// What the `d` key does.
+#[derive(Debug, PartialEq, Eq)]
+enum DeleteEffect {
+    /// There is no entry to delete.
+    Nothing,
+    /// Show this confirmation and wait for a second `d`.
+    Arm(DeleteConfirm),
+    /// Delete this entry.
+    Delete(String),
+}
+
+/// The effect of the `d` key, given what is already pending.
+///
+/// Pure, so the two-key rule is testable without a service connection: the
+/// first `d` only names the entry, and only an armed confirmation can turn
+/// into a delete.
+fn delete_effect(
+    pending: Option<&DeleteConfirm>,
+    snap: &Snapshot,
+    selected: usize,
+) -> DeleteEffect {
+    match pending {
+        Some(confirm) => DeleteEffect::Delete(confirm.id.clone()),
+        None => match delete_offer(snap, selected) {
+            Some(confirm) => DeleteEffect::Arm(confirm),
+            None => DeleteEffect::Nothing,
+        },
+    }
+}
+
+/// What a key press means while a delete confirmation is pending.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingAnswer {
+    /// `d`: delete the armed entry.
+    Confirm,
+    /// `Esc`, or any other key: disarm, change nothing.
+    Disarm,
+    /// `q` (or Ctrl-C): leave.
+    Quit,
+}
+
+/// The answer a key press gives to a pending delete confirmation.
+///
+/// Free of `App`, so the rule is testable without a service connection: only
+/// `d` confirms, and everything else but `q` disarms without deleting.
+fn pending_answer(code: KeyCode, ctrl: bool) -> PendingAnswer {
+    match code {
+        KeyCode::Char('d') => PendingAnswer::Confirm,
+        KeyCode::Char('c') if ctrl => PendingAnswer::Quit,
+        KeyCode::Char('q') => PendingAnswer::Quit,
+        _ => PendingAnswer::Disarm,
+    }
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -433,6 +558,10 @@ fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
             .unwrap_or_else(|| id.to_string())
     };
 
+    // The entry a pending delete would take, so the row that is about to go
+    // is the one the eye is on.
+    let armed = app.delete_confirm.as_ref().map(|c| c.id.as_str());
+
     let items: Vec<ListItem> = if app.snapshot.entries.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  nothing tracked yet — press 1 to add 5 minutes",
@@ -444,7 +573,12 @@ fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let style = if i == app.selected {
+                let style = if armed == Some(e.id.as_str()) {
+                    Style::default()
+                        .bg(Color::Red)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else if i == app.selected {
                     Style::default()
                         .bg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD)
@@ -485,15 +619,25 @@ fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
+/// The footer: the last action's message, or the key hints.
+///
+/// A pending delete confirmation outranks the message: it is the question
+/// the user has to answer before anything else happens.
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let footer: String = match &app.status {
-        Some(s) => s.clone(),
-        None => "1-4 quick add  a 30m  u undo  d delete  j/k move  h/l project  q quit".to_string(),
+    let (footer, style) = match &app.delete_confirm {
+        Some(confirm) => (
+            confirm.summary.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        None => match &app.status {
+            Some(s) => (s.clone(), Style::default().fg(Color::DarkGray)),
+            None => (
+                "1-4 quick add  a 30m  u undo  d delete  j/k move  h/l project  q quit".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        },
     };
-    f.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    f.render_widget(Paragraph::new(footer).style(style), area);
 }
 
 /// Shorten to `max` characters, so a long project name cannot push the rest
@@ -537,6 +681,7 @@ async fn event_loop(
         selected: 0,
         project_cursor: 0,
         last_quick_add_id: None,
+        delete_confirm: None,
         status: None,
         should_quit: false,
     };
@@ -589,6 +734,14 @@ mod tests {
             name: name.into(),
             colour: None,
             archived,
+        }
+    }
+
+    /// An entry that ran for `minutes` minutes.
+    fn entry_minutes(id: &str, source: EntrySource, start: i64, minutes: i64) -> EntryView {
+        EntryView {
+            ended_at: start + minutes * 60_000,
+            ..entry(id, source, start)
         }
     }
 
@@ -655,6 +808,96 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(last_quick_add(&snap), None);
+    }
+
+    #[test]
+    fn the_delete_confirmation_names_the_project_and_the_duration() {
+        // The confirmation has to say what would go, in the tray's words:
+        // the project and the duration, never a bare id.
+        let snap = Snapshot {
+            projects: vec![project("p1", "Work", false)],
+            entries: vec![entry_minutes("e1", EntrySource::Manual, 0, 30)],
+            ..Default::default()
+        };
+        let offer = delete_offer(&snap, 0).expect("e1 is selected");
+        assert_eq!(offer.id, "e1");
+        assert_eq!(
+            offer.summary,
+            "Delete 30m from Work? d to confirm, esc to cancel"
+        );
+    }
+
+    #[test]
+    fn there_is_no_confirmation_without_an_entry() {
+        let snap = Snapshot {
+            projects: vec![project("p1", "Work", false)],
+            entries: vec![entry("e1", EntrySource::Manual, 0)],
+            ..Default::default()
+        };
+        assert!(delete_offer(&snap, 99).is_none());
+        assert!(delete_offer(&Snapshot::default(), 0).is_none());
+    }
+
+    #[test]
+    fn the_first_d_only_arms_the_confirmation() {
+        // The two-key rule the GUI and the tray already have: the first `d`
+        // names the entry, the second removes it. An unarmed delete changes
+        // nothing in the store.
+        let snap = Snapshot {
+            projects: vec![project("p1", "Work", false)],
+            entries: vec![entry_minutes("e1", EntrySource::Manual, 0, 30)],
+            ..Default::default()
+        };
+        match delete_effect(None, &snap, 0) {
+            DeleteEffect::Arm(confirm) => assert_eq!(confirm.id, "e1"),
+            other => panic!("the first d must only arm the confirmation: {other:?}"),
+        }
+        // Nothing to delete: no confirmation, no delete.
+        assert_eq!(
+            delete_effect(None, &Snapshot::default(), 0),
+            DeleteEffect::Nothing
+        );
+    }
+
+    #[test]
+    fn the_second_d_deletes_the_armed_entry() {
+        let snap = Snapshot {
+            projects: vec![project("p1", "Work", false)],
+            entries: vec![entry_minutes("e1", EntrySource::Manual, 0, 30)],
+            ..Default::default()
+        };
+        let armed = delete_offer(&snap, 0).expect("e1 is selected");
+        assert_eq!(
+            delete_effect(Some(&armed), &snap, 0),
+            DeleteEffect::Delete("e1".to_string())
+        );
+    }
+
+    #[test]
+    fn only_a_second_d_deletes_and_any_other_key_disarms() {
+        // While the confirmation is pending, only `d` answers it; `Esc` and
+        // every other key disarm it without deleting, and `q` still leaves.
+        assert_eq!(
+            pending_answer(KeyCode::Char('d'), false),
+            PendingAnswer::Confirm
+        );
+        assert_eq!(pending_answer(KeyCode::Esc, false), PendingAnswer::Disarm);
+        assert_eq!(
+            pending_answer(KeyCode::Char('j'), false),
+            PendingAnswer::Disarm
+        );
+        assert_eq!(
+            pending_answer(KeyCode::Char('1'), false),
+            PendingAnswer::Disarm
+        );
+        assert_eq!(
+            pending_answer(KeyCode::Char('q'), false),
+            PendingAnswer::Quit
+        );
+        assert_eq!(
+            pending_answer(KeyCode::Char('c'), true),
+            PendingAnswer::Quit
+        );
     }
 
     #[test]
