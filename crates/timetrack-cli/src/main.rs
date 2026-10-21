@@ -36,7 +36,8 @@
 //!   can shrink -- the confirmation says by how much)
 //!
 //! And the small edits: `set-text` rewrites a description, `set-project`
-//! moves an entry between projects, `unarchive` reverses `archive`.
+//! moves an entry between projects, `unarchive` reverses `archive`,
+//! `delete-project` removes a project that has no entries left.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -203,6 +204,10 @@ enum Command {
 
     /// Unarchive a project, making it selectable again.
     Unarchive { id: String },
+
+    /// Delete a project. Refused when it still has entries, and when it is
+    /// the last one.
+    DeleteProject { id: String },
 
     /// Export entries as CSV (REQUIREMENTS §10).
     Export {
@@ -523,6 +528,18 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         Command::Unarchive { id } => {
             let p = client.set_archived(&id, false).await?;
             println!("unarchived {} ({})", p.name, p.id);
+        }
+
+        Command::DeleteProject { id } => {
+            // Resolved by id or by name, like rename and recolour, so
+            // `timetrack delete-project Work` works as well as the id.
+            let snap = client.snapshot().await?;
+            let existing = find_project(&snap, &id)?;
+            // The service owns the rules: a project that still has entries
+            // cannot be deleted, and neither can the last project. Its
+            // refusals reach the CLI in the core's own words.
+            client.delete_project(&existing.id).await?;
+            println!("deleted project {} ({})", existing.name, existing.id);
         }
 
         Command::Status => print_status(&client.snapshot().await?),
@@ -941,6 +958,29 @@ mod tests {
         // someone's alias should fail here, not at runtime.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn delete_project_takes_one_positional_project() {
+        // `timetrack delete-project p2`: one positional argument, the project
+        // id or its name.
+        use clap::CommandFactory;
+        let cli = Cli::try_parse_from(["timetrack", "delete-project", "p2"])
+            .expect("delete-project args must parse");
+        match cli.command {
+            Some(Command::DeleteProject { id }) => assert_eq!(id, "p2"),
+            other => panic!("expected delete-project, got {other:?}"),
+        }
+        // Spelled with a dash, like every other multi-word subcommand.
+        assert!(
+            Cli::command()
+                .get_subcommands()
+                .any(|c| c.get_name() == "delete-project"),
+            "the subcommand must be called delete-project"
+        );
+        // And it needs a project: clap refuses the missing argument, not the
+        // service.
+        assert!(Cli::try_parse_from(["timetrack", "delete-project"]).is_err());
     }
 
     #[test]
