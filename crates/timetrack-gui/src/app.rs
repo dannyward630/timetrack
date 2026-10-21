@@ -281,27 +281,23 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                             };
                             match fetched {
                                 Ok(csv) => {
-                                    // The dialog opens after the fetch, so a
-                                    // service refusal never prompts for a
-                                    // location. Cancel is a quiet status that
-                                    // writes nothing; no portal falls back to
-                                    // the direct home-directory write.
-                                    let outcome = portal_save_file(&req.suggested_name).await;
-                                    let via_portal = matches!(outcome, PortalOutcome::Granted(_));
-                                    match resolve_export_destination(outcome, &req.path) {
-                                        Some(dest) => {
-                                            let _ = tx.send(export_write_msg(
-                                                &csv,
-                                                &dest,
-                                                req.scope,
-                                                &req.period_id,
-                                                via_portal,
-                                            ));
-                                        }
-                                        None => {
-                                            let _ = tx.send(export_cancel_msg());
-                                        }
-                                    }
+                                    // The save dialog is the user's, and it
+                                    // can stay open for as long as they
+                                    // like. Awaiting it here would stop this
+                                    // thread from serving anything else --
+                                    // no snapshot, no quick-add -- until they
+                                    // answered, and the window would look
+                                    // frozen over a frozen data set.
+                                    //
+                                    // So the dialog and the write happen on
+                                    // their own thread, and the result comes
+                                    // back over the same channel.
+                                    let tx = tx.clone();
+                                    std::thread::spawn(move || {
+                                        async_io::block_on(async move {
+                                            save_export(tx, csv, req).await;
+                                        });
+                                    });
                                 }
                                 Err(e) => {
                                     let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
@@ -928,6 +924,33 @@ fn which_prompt(
     }
 }
 
+/// Ask where to put an export and write it there.
+///
+/// Runs off the service thread, so the save dialog never stops that thread
+/// from serving: the window keeps painting and refreshing, and a quick-add
+/// made while the dialog is open still lands in the store.
+async fn save_export(tx: Sender<Msg>, csv: String, req: ExportRequest) {
+    // The dialog opens after the fetch, so a service refusal never prompts
+    // for a location. Cancel is a quiet status that writes nothing; no
+    // portal falls back to the direct home-directory write.
+    let outcome = portal_save_file(&req.suggested_name).await;
+    let via_portal = matches!(outcome, PortalOutcome::Granted(_));
+    match resolve_export_destination(outcome, &req.path) {
+        Some(dest) => {
+            let _ = tx.send(export_write_msg(
+                &csv,
+                &dest,
+                req.scope,
+                &req.period_id,
+                via_portal,
+            ));
+        }
+        None => {
+            let _ = tx.send(export_cancel_msg());
+        }
+    }
+}
+
 /// The element id of one of a project's row buttons.
 ///
 /// Built from the project id itself rather than from a number parsed out of
@@ -1254,6 +1277,11 @@ fn resolve_export_destination(outcome: PortalOutcome, fallback: &str) -> Option<
 /// parent does not exist (local error naming path plus reason). Both still
 /// log the requested name first, so the dialog wiring stays pinned. Only
 /// when the stub is active, so production never sees this.
+///
+/// `<file>.hold` makes the next stubbed save *wait* before answering, the
+/// way a real dialog waits for a person: the outcome is decided first, so
+/// removing the flag while the stub sleeps does not change it. That is what
+/// pins that the window keeps serving while the dialog is open.
 fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> {
     let log = stub.strip_prefix("record:")?;
     let mut file = std::fs::OpenOptions::new()
@@ -1263,15 +1291,17 @@ fn portal_stub_outcome(stub: &str, current_name: &str) -> Option<PortalOutcome> 
         .ok()?;
     use std::io::Write;
     writeln!(file, "{current_name}").ok()?;
-    if std::path::Path::new(&format!("{log}.cancel")).exists() {
-        return Some(PortalOutcome::Cancelled);
+    let outcome = if std::path::Path::new(&format!("{log}.cancel")).exists() {
+        PortalOutcome::Cancelled
+    } else if std::path::Path::new(&format!("{log}.fail")).exists() {
+        PortalOutcome::Granted(format!("/nonexistent-timetrack-gui/{current_name}"))
+    } else {
+        PortalOutcome::Unavailable
+    };
+    if std::path::Path::new(&format!("{log}.hold")).exists() {
+        std::thread::sleep(std::time::Duration::from_secs(6));
     }
-    if std::path::Path::new(&format!("{log}.fail")).exists() {
-        return Some(PortalOutcome::Granted(format!(
-            "/nonexistent-timetrack-gui/{current_name}"
-        )));
-    }
-    Some(PortalOutcome::Unavailable)
+    Some(outcome)
 }
 
 /// Ask the system save dialog where to write an export (ticket 27).
