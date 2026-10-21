@@ -38,6 +38,26 @@ pub const OBJECT_PATH: &str = "/org/sequ/timetrack";
 /// Interface name.
 pub const INTERFACE: &str = "org.sequ.timetrack.Entries";
 
+/// How long a method call may take before the client gives up on it.
+///
+/// zbus has no default method timeout, so without this a service that
+/// accepts the connection and then never answers hangs the caller forever:
+/// the TUI freezes inside its refresh and even `q` stops working (issue #43).
+///
+/// Ten seconds is the trade-off. A healthy service answers a snapshot in
+/// milliseconds, so ten seconds is three orders of magnitude more than it
+/// needs -- a slow machine, a store with years of entries or a busy service
+/// still answers well inside it -- while a wedged one surfaces as an error
+/// the user can see within ten seconds instead of never.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a call that ran out of time says.
+///
+/// The service did not refuse: it stopped answering. The wording says so,
+/// because "the service is not running" would send the user looking in the
+/// wrong place.
+const TIMEOUT_WORDING: &str = "the service did not answer in time";
+
 /// How an entry was recorded, mirroring `timetrack_core::EntrySource`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntrySource {
@@ -273,6 +293,12 @@ impl ClientError {
             zbus::Error::MethodError(name, detail, _) => {
                 Self::from_error_name(name.as_str(), detail.as_deref())
             }
+            // A call that ran out of time: the service took the connection
+            // and then stopped answering. That is a transport failure, not a
+            // refusal, and it must not look like a missing service.
+            zbus::Error::InputOutput(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                ClientError::Transport(TIMEOUT_WORDING.to_string())
+            }
             other => ClientError::Transport(other.to_string()),
         }
     }
@@ -317,8 +343,12 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to the service, with a short timeout so a missing service
-    /// produces a clear message rather than a hang.
+    /// Connect to the service.
+    ///
+    /// The connection carries a default method timeout ([`CALL_TIMEOUT`]), so
+    /// every call this client makes is abandoned if the service stops
+    /// answering: a wedged service becomes an error, never a hang
+    /// (issue #43).
     pub async fn connect() -> Result<Self, ClientError> {
         // NOTE: do *not* call `.name(BUS_NAME)` here. On a client connection
         // that asks the bus to hand us the well-known name, which only ever
@@ -331,6 +361,9 @@ impl Client {
         // service surfaces at the first method call, as `NoService`.
         let conn = zbus::connection::Builder::session()
             .map_err(ClientError::from_bus)?
+            // The timeout lives on the connection, so every method inherits
+            // it -- there is no per-call timeout to forget.
+            .method_timeout(CALL_TIMEOUT)
             .build()
             .await
             .map_err(ClientError::from_bus)?;
@@ -942,5 +975,48 @@ mod tests {
             .to_string(),
             "an entry must not end before it starts"
         );
+    }
+
+    // --- the call timeout ---
+
+    #[test]
+    fn the_call_timeout_is_ten_seconds() {
+        // Pinned: the value is a deliberate trade-off, not an accident. It
+        // has to be long enough that a slow but healthy service never trips
+        // it (a snapshot takes milliseconds), and short enough that a wedged
+        // service is reported rather than waited on forever.
+        assert_eq!(CALL_TIMEOUT, Duration::from_secs(10));
+        assert!(CALL_TIMEOUT >= Duration::from_secs(5));
+        assert!(CALL_TIMEOUT <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_timed_out_call_is_a_transport_failure_not_a_hang() {
+        // zbus reports a call that ran out of time as an I/O error with
+        // `ErrorKind::TimedOut`. It must sort as a transport failure, so no
+        // client mistakes it for a missing service or a refusal, and it must
+        // say what happened (issue #43).
+        let err = ClientError::from_bus(zbus::Error::InputOutput(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into(),
+        ));
+        assert!(
+            matches!(err, ClientError::Transport(_)),
+            "a timeout is a transport failure, got {err:?}"
+        );
+        assert_eq!(err.to_string(), TIMEOUT_WORDING);
+        assert!(
+            !err.to_string().contains("not running"),
+            "a wedged service is not a missing one: {err}"
+        );
+    }
+
+    #[test]
+    fn other_io_failures_keep_their_own_wording() {
+        // Only a timeout gets the timeout wording: a broken socket is a
+        // different problem and keeps the bus's own words.
+        let err = ClientError::from_bus(zbus::Error::InputOutput(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "socket closed").into(),
+        ));
+        assert_eq!(err.to_string(), "I/O error: socket closed");
     }
 }
