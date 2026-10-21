@@ -18,6 +18,14 @@
 //! (REQUIREMENTS §7), then the quick-add row, then this week's projects,
 //! then the recent entries. The GUI and the CLI showing the same hierarchy in
 //! the same order is deliberate.
+//!
+//! # The calls happen on their own thread
+//!
+//! The UI thread never waits for the bus: every call happens on a service
+//! thread and the outcome comes back as a message. A service that accepts
+//! the connection and then goes quiet therefore costs a line in the footer
+//! instead of a frozen screen -- and `q` keeps quitting while a call is
+//! outstanding (issue #43).
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -32,9 +40,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use std::io::{Stdout, stdout};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use timetrack_core::QUICK_ADD_MS;
-use timetrack_proto::{Client, ClientError, ProjectView, Snapshot};
+use timetrack_proto::{Client, ClientError, EntryView, ProjectView, Snapshot};
 
 /// How often to refresh from the service.
 const TICK: Duration = Duration::from_millis(1000);
@@ -43,17 +52,17 @@ const TICK: Duration = Duration::from_millis(1000);
 const POLL: Duration = Duration::from_millis(100);
 
 struct App {
-    client: Client,
+    /// Where the UI's commands go.
+    ///
+    /// The calls themselves happen on the service thread, so the UI never
+    /// waits for the bus: a service that accepts the connection and then
+    /// goes quiet cannot freeze the TUI, and `q` keeps working while a call
+    /// is outstanding (issue #43).
+    requests: Sender<Request>,
     snapshot: Snapshot,
     selected: usize,
     /// Index into the *active* projects for the project quick-adds go to.
     project_cursor: usize,
-    /// The entry the last quick-add created, so `u` undoes exactly that one.
-    ///
-    /// Tracked here rather than re-derived from the list, because the list is
-    /// ordered by start time and two quick-adds can share a timestamp; the
-    /// id we were handed is the only unambiguous answer (REQUIREMENTS §6).
-    last_quick_add_id: Option<String>,
     /// The entry a pending delete would remove, if `d` is waiting for its
     /// second key.
     delete_confirm: Option<DeleteConfirm>,
@@ -76,10 +85,27 @@ struct DeleteConfirm {
 }
 
 impl App {
-    async fn refresh(&mut self) {
-        match self.client.snapshot().await {
-            Ok(s) => {
-                self.snapshot = s;
+    /// A fresh UI, with its commands going to the service thread.
+    fn new(requests: Sender<Request>) -> Self {
+        App {
+            requests,
+            snapshot: Snapshot::default(),
+            selected: 0,
+            project_cursor: 0,
+            delete_confirm: None,
+            status: None,
+            should_quit: false,
+        }
+    }
+
+    /// Put what the service thread reported on screen.
+    ///
+    /// A failure never takes the UI down: it lands in the footer as a
+    /// message, and the TUI keeps running (issue #43).
+    fn apply(&mut self, reply: Reply) {
+        match reply {
+            Reply::Snapshot(s) => {
+                self.snapshot = *s;
                 // The lists may have shrunk under the cursor.
                 if self.selected >= self.snapshot.entries.len() {
                     self.selected = self.snapshot.entries.len().saturating_sub(1);
@@ -101,8 +127,31 @@ impl App {
                     self.status = None;
                 }
             }
-            Err(e) => self.status = Some(format!("service unavailable: {e}")),
+            Reply::QuickAdded(entry) => {
+                self.status = Some(format!(
+                    "added {} to {} (u to undo)",
+                    timetrack_core::format_compact(entry.duration_ms()),
+                    self.project_name(&entry.project_id)
+                ));
+            }
+            Reply::DurationAdded(entry) => {
+                self.status = Some(format!(
+                    "added {} to {}",
+                    timetrack_core::format_compact(entry.duration_ms()),
+                    self.project_name(&entry.project_id)
+                ));
+            }
+            Reply::Undone { id } => self.status = Some(format!("undid quick add {id}")),
+            Reply::Deleted { id } => self.status = Some(format!("deleted {id}")),
+            Reply::NothingToUndo => self.status = Some("nothing to undo".into()),
+            Reply::RefreshFailed(e) => self.status = Some(format!("service unavailable: {e}")),
+            Reply::ActionFailed(e) => self.status = Some(e.to_string()),
         }
+    }
+
+    /// The name of a project, or its id when the snapshot does not have it.
+    fn project_name(&self, id: &str) -> String {
+        project_name(&self.snapshot, id)
     }
 
     /// The project quick-add and the new-entry dialogs attribute time to.
@@ -114,34 +163,53 @@ impl App {
         current_project(&self.snapshot, self.project_cursor)
     }
 
-    /// Run one action, recording any failure in the footer rather than
-    /// exiting: a transient bus error should not kill the UI.
+    /// Ask the service thread to add one of the quick-add buckets.
     ///
-    /// Takes a closure rather than a future so the call is not evaluated (and
-    /// not sent to the bus) until it is actually awaited here. Returns whether
-    /// the call succeeded, so the caller prints "undid ..." only when
-    /// something was actually undone.
-    async fn act<F, Fut>(&mut self, f: F) -> bool
-    where
-        F: FnOnce(Client) -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<(), ClientError>>,
-    {
-        // Client is a cheap handle over the same connection, so clone it out
-        // rather than borrow `self` across the call: the call needs `&mut self`
-        // again afterwards to refresh and to record any error.
-        let client = self.client.clone();
-        let ok = match f(client).await {
-            Ok(()) => true,
-            Err(e) => {
-                self.status = Some(e.to_string());
-                false
-            }
+    /// The call is not waited for: the UI keeps drawing and keeps reading
+    /// keys while the service thinks about it, so a wedged service costs a
+    /// status message, not a frozen TUI (issue #43).
+    fn quick_add(&mut self, duration_ms: i64) {
+        let Some(project) = self.current_project().map(|p| p.id.clone()) else {
+            self.status =
+                Some("no project yet -- create one with: timetrack project \"Work\"".into());
+            return;
         };
-        self.refresh().await;
-        ok
+        let _ = self.requests.send(Request::QuickAdd {
+            project,
+            ms: duration_ms,
+        });
     }
 
-    async fn on_key(&mut self, key: event::KeyEvent) {
+    /// Ask the service thread to record a duration ending now.
+    fn add_duration(&mut self) {
+        let Some(project) = self.current_project().map(|p| p.id.clone()) else {
+            self.status =
+                Some("no project yet -- create one with: timetrack project \"Work\"".into());
+            return;
+        };
+        // Thirty minutes is the middle default and the least destructive
+        // thing to add by accident.
+        let _ = self.requests.send(Request::AddDuration {
+            project,
+            ms: 30 * 60_000,
+        });
+    }
+
+    /// Ask the service thread to undo the last quick add.
+    ///
+    /// The target is resolved by the thread, not here: a quick add that has
+    /// not landed yet is still the one the user means to undo, and the UI
+    /// cannot know its id.
+    fn undo_quick_add(&mut self) {
+        let _ = self.requests.send(Request::UndoQuickAdd);
+    }
+
+    /// Ask the service thread to delete an entry.
+    fn delete_entry(&mut self, id: String) {
+        let _ = self.requests.send(Request::DeleteEntry { id });
+    }
+
+    fn on_key(&mut self, key: event::KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         // A pending confirmation listens only to its own answers: `d`
@@ -168,56 +236,16 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
 
             // --- quick add: 5/15/30/60 on the number row (REQUIREMENTS §6) ---
-            KeyCode::Char('1') => self.quick_add(QUICK_ADD_MS[0]).await,
-            KeyCode::Char('2') => self.quick_add(QUICK_ADD_MS[1]).await,
-            KeyCode::Char('3') => self.quick_add(QUICK_ADD_MS[2]).await,
-            KeyCode::Char('4') => self.quick_add(QUICK_ADD_MS[3]).await,
+            KeyCode::Char('1') => self.quick_add(QUICK_ADD_MS[0]),
+            KeyCode::Char('2') => self.quick_add(QUICK_ADD_MS[1]),
+            KeyCode::Char('3') => self.quick_add(QUICK_ADD_MS[2]),
+            KeyCode::Char('4') => self.quick_add(QUICK_ADD_MS[3]),
 
             // --- method 2: a duration ending now ---
-            KeyCode::Char('a') => {
-                let Some(project) = self.current_project().map(|p| p.id.clone()) else {
-                    self.status = Some(
-                        "no project yet -- create one with: timetrack project \"Work\"".into(),
-                    );
-                    return;
-                };
-                // Thirty minutes is the middle default and the least
-                // destructive thing to add by accident.
-                let id = project;
-                let client = self.client.clone();
-                let label = self
-                    .current_project()
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
-                let res = client.add_duration(&id, "", 30 * 60_000).await;
-                match res {
-                    Ok(_) => self.status = Some(format!("added 30m to {label}")),
-                    Err(e) => self.status = Some(e.to_string()),
-                }
-                self.refresh().await;
-            }
+            KeyCode::Char('a') => self.add_duration(),
 
             // --- undo: only ever the last quick add ---
-            KeyCode::Char('u') => {
-                let undo_id = self
-                    .last_quick_add_id
-                    .clone()
-                    .or_else(|| last_quick_add(&self.snapshot));
-                if let Some(id) = undo_id {
-                    let for_call = id.clone();
-                    let ok = self
-                        .act(move |c| {
-                            let id = for_call.clone();
-                            async move { c.undo_quick_add(&id).await }
-                        })
-                        .await;
-                    if ok {
-                        self.status = Some(format!("undid quick add {id}"));
-                    }
-                } else {
-                    self.status = Some("nothing to undo".into());
-                }
-            }
+            KeyCode::Char('u') => self.undo_quick_add(),
 
             // --- explicit delete: two keys, like the GUI and the tray ---
             KeyCode::Char('d') => {
@@ -235,16 +263,7 @@ impl App {
                         // the call, so a failed delete does not leave the UI
                         // waiting for a third `d`.
                         self.delete_confirm = None;
-                        let for_call = id.clone();
-                        let ok = self
-                            .act(move |c| {
-                                let id = for_call.clone();
-                                async move { c.delete_entry(&id).await }
-                            })
-                            .await;
-                        if ok {
-                            self.status = Some(format!("deleted {id}"));
-                        }
+                        self.delete_entry(id);
                     }
                     DeleteEffect::Nothing => {
                         self.status = Some("nothing to delete".into());
@@ -272,31 +291,175 @@ impl App {
             _ => {}
         }
     }
+}
 
-    /// Add one of the quick-add buckets to the selected project.
-    async fn quick_add(&mut self, duration_ms: i64) {
-        let Some(project) = self.current_project().map(|p| p.id.clone()) else {
-            self.status =
-                Some("no project yet -- create one with: timetrack project \"Work\"".into());
-            return;
+// --- the service thread ---
+
+/// What the TUI asks the service thread to do.
+///
+/// Every bus call goes through the thread. The UI must never wait for the
+/// service: a service that accepts the connection and then goes quiet would
+/// freeze the TUI inside its refresh, and the user could not even quit
+/// (issue #43).
+#[derive(Debug)]
+enum Request {
+    /// Record one of the quick-add buckets, ending now.
+    QuickAdd { project: String, ms: i64 },
+    /// Record a duration ending now.
+    AddDuration { project: String, ms: i64 },
+    /// Undo the last quick add.
+    UndoQuickAdd,
+    /// Delete an entry.
+    DeleteEntry { id: String },
+}
+
+/// What the service thread reports back.
+#[derive(Debug)]
+enum Reply {
+    /// A fresh snapshot of the service's state.
+    Snapshot(Box<Snapshot>),
+    /// A quick add worked: here is the entry it made.
+    QuickAdded(Box<EntryView>),
+    /// A duration was recorded: here is the entry it made.
+    DurationAdded(Box<EntryView>),
+    /// A quick add was undone.
+    Undone { id: String },
+    /// An entry was deleted.
+    Deleted { id: String },
+    /// There is no quick add to undo.
+    NothingToUndo,
+    /// A refresh failed: the service is not answering.
+    RefreshFailed(ClientError),
+    /// An action failed.
+    ActionFailed(ClientError),
+}
+
+/// Spawn the thread that talks to the service.
+///
+/// The UI thread never waits for the bus, so a wedged service costs a
+/// message in the footer instead of a frozen screen: the TUI keeps drawing
+/// and `q` keeps quitting while a call is outstanding (issue #43). The
+/// thread ends when the UI drops its end of the channel.
+fn spawn_service_thread(client: Client) -> (Receiver<Reply>, Sender<Request>) {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // zbus uses the async-io backend (see the workspace Cargo.toml), so
+        // the bus is driven with `async_io::block_on` on this thread, exactly
+        // as the one-shot commands drive it.
+        async_io::block_on(service_loop(client, request_rx, reply_tx));
+    });
+    (reply_rx, request_tx)
+}
+
+/// The service thread's loop: answer the UI's requests, and refresh on a
+/// tick.
+///
+/// The requests are answered one at a time, in the order they were asked
+/// for, so two quick adds in a row are two entries and an undo that follows
+/// a quick add undoes that one.
+async fn service_loop(client: Client, requests: Receiver<Request>, replies: Sender<Reply>) {
+    // The entry the last quick add made, so `u` undoes exactly that one --
+    // including one that has not been drawn yet (REQUIREMENTS §6).
+    let mut last_quick_add_id: Option<String> = None;
+    // The last snapshot, for the undo fallback when this thread never made
+    // a quick add itself.
+    let mut last_snapshot = Snapshot::default();
+    // When the last refresh happened. `None` means "not yet", so the first
+    // one is due at once and the screen is never blank for a whole tick.
+    let mut last_refresh: Option<Instant> = None;
+    loop {
+        // Wait for a request, but never longer than until the next refresh
+        // is due. zbus reads the socket on its own executor thread, so
+        // waiting here does not stall the bus.
+        let wait = match last_refresh {
+            Some(at) => TICK.saturating_sub(at.elapsed()),
+            None => Duration::ZERO,
         };
-        let name = self
-            .current_project()
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-        let client = self.client.clone();
-        match client.quick_add(&project, duration_ms).await {
-            Ok(e) => {
-                self.last_quick_add_id = Some(e.id.clone());
-                self.status = Some(format!(
-                    "added {} to {name} (u to undo)",
-                    timetrack_core::format_compact(e.duration_ms())
-                ));
+        let request = match requests.recv_timeout(wait) {
+            Ok(request) => Some(request),
+            // Nothing waiting: it is time to refresh.
+            Err(RecvTimeoutError::Timeout) => None,
+            // The UI is gone; nothing left to do.
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let acted = request.is_some();
+        match request {
+            Some(Request::QuickAdd { project, ms }) => match client.quick_add(&project, ms).await {
+                Ok(entry) => {
+                    last_quick_add_id = Some(entry.id.clone());
+                    let _ = replies.send(Reply::QuickAdded(Box::new(entry)));
+                }
+                Err(e) => {
+                    let _ = replies.send(Reply::ActionFailed(e));
+                }
+            },
+            Some(Request::AddDuration { project, ms }) => {
+                match client.add_duration(&project, "", ms).await {
+                    Ok(entry) => {
+                        let _ = replies.send(Reply::DurationAdded(Box::new(entry)));
+                    }
+                    Err(e) => {
+                        let _ = replies.send(Reply::ActionFailed(e));
+                    }
+                }
             }
-            Err(err) => self.status = Some(err.to_string()),
+            Some(Request::UndoQuickAdd) => {
+                // The target is resolved here, not by the UI: a quick add
+                // that has not landed yet is still the one the user means to
+                // undo, and the UI cannot know its id.
+                match undo_target(last_quick_add_id.as_deref(), &last_snapshot) {
+                    Some(id) => match client.undo_quick_add(&id).await {
+                        Ok(()) => {
+                            let _ = replies.send(Reply::Undone { id });
+                        }
+                        Err(e) => {
+                            let _ = replies.send(Reply::ActionFailed(e));
+                        }
+                    },
+                    None => {
+                        let _ = replies.send(Reply::NothingToUndo);
+                    }
+                }
+            }
+            Some(Request::DeleteEntry { id }) => match client.delete_entry(&id).await {
+                Ok(()) => {
+                    let _ = replies.send(Reply::Deleted { id });
+                }
+                Err(e) => {
+                    let _ = replies.send(Reply::ActionFailed(e));
+                }
+            },
+            None => {}
         }
-        self.refresh().await;
+        // An action changes the data, so refresh straight away: the screen
+        // must show what the action did, not the state before it. Otherwise
+        // refresh on the tick, so a service that has gone quiet shows up as
+        // a failure instead of a frozen screen.
+        if acted || last_refresh.is_none_or(|at| at.elapsed() >= TICK) {
+            match client.snapshot().await {
+                Ok(s) => {
+                    last_snapshot = s.clone();
+                    let _ = replies.send(Reply::Snapshot(Box::new(s)));
+                }
+                Err(e) => {
+                    let _ = replies.send(Reply::RefreshFailed(e));
+                }
+            }
+            last_refresh = Some(Instant::now());
+        }
     }
+}
+
+/// The entry an undo should remove.
+///
+/// The quick add this session made wins over the newest one in the
+/// snapshot: a quick add that has not landed yet is still the one the user
+/// means to undo, and the snapshot cannot know its id.
+fn undo_target(last_quick_add_id: Option<&str>, snap: &Snapshot) -> Option<String> {
+    last_quick_add_id
+        .map(|id| id.to_string())
+        .or_else(|| last_quick_add(snap))
 }
 
 /// Projects offered for new entries: archived ones are hidden, because
@@ -314,11 +477,19 @@ fn current_project(snap: &Snapshot, cursor: usize) -> Option<&ProjectView> {
     active_projects(snap).get(cursor).copied()
 }
 
-/// The entry `u` would undo.
+/// The name of a project, or its id when the snapshot does not have it.
+fn project_name(snap: &Snapshot, id: &str) -> String {
+    snap.projects
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// The newest quick-add in the list.
 ///
-/// Prefers the id handed back by the most recent quick-add call, and falls
-/// back to the newest quick-add in the list for a client that has just
-/// started. Entries arrive newest first, so the first match is the newest.
+/// The fallback for an undo when this session has not made a quick add
+/// itself. Entries arrive newest first, so the first match is the newest.
 fn last_quick_add(snap: &Snapshot) -> Option<String> {
     snap.entries
         .iter()
@@ -549,14 +720,7 @@ fn draw_projects(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
 /// Recent entries. Everything is closed, so there is no running marker.
 fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let project_name = |id: &str| -> String {
-        app.snapshot
-            .projects
-            .iter()
-            .find(|p| p.id == id)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| id.to_string())
-    };
+    let project_name = |id: &str| -> String { project_name(&app.snapshot, id) };
 
     // The entry a pending delete would take, so the row that is about to go
     // is the one the eye is on.
@@ -660,7 +824,7 @@ pub async fn run() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = event_loop(&mut terminal, client).await;
+    let res = event_loop(&mut terminal, client);
 
     // Always restore the terminal, even if the loop failed, or the user is
     // left with a broken shell.
@@ -671,39 +835,32 @@ pub async fn run() -> Result<()> {
     res
 }
 
-async fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    client: Client,
-) -> Result<()> {
-    let mut app = App {
-        client,
-        snapshot: Snapshot::default(),
-        selected: 0,
-        project_cursor: 0,
-        last_quick_add_id: None,
-        delete_confirm: None,
-        status: None,
-        should_quit: false,
-    };
-    app.refresh().await;
+/// The TUI's event loop: draw, take what the service thread reported, read
+/// a key.
+///
+/// Nothing here waits for the bus. The calls happen on the service thread,
+/// so a wedged service cannot stop the loop: the screen keeps being drawn
+/// and `q` keeps quitting while a call is outstanding (issue #43).
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, client: Client) -> Result<()> {
+    let (replies, requests) = spawn_service_thread(client);
+    let mut app = App::new(requests);
 
-    let mut last_poll = Instant::now();
     while !app.should_quit {
         terminal.draw(|f| draw(f, &app))?;
+
+        // Take whatever the service thread has reported since last time.
+        while let Ok(reply) = replies.try_recv() {
+            app.apply(reply);
+        }
 
         if event::poll(POLL)? {
             if let Event::Key(key) = event::read()? {
                 // Windows/GTK emit both press and release; acting on both would
                 // double every command.
                 if key.kind == KeyEventKind::Press {
-                    app.on_key(key).await;
+                    app.on_key(key);
                 }
             }
-        }
-
-        if last_poll.elapsed() >= TICK {
-            app.refresh().await;
-            last_poll = Instant::now();
         }
     }
     Ok(())
@@ -900,9 +1057,116 @@ mod tests {
         );
     }
 
+    // --- the wedged service (issue #43) ---
+
+    /// A key press, as the event loop would hand it over.
+    fn key(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// An app whose commands go nowhere, and the channel they would go to.
+    fn app() -> (App, Receiver<Request>) {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        (App::new(requests), receiver)
+    }
+
+    #[test]
+    fn a_wedged_service_is_reported_in_the_footer_and_the_ui_keeps_running() {
+        // A service that accepts the connection and then never answers must
+        // not take the TUI down: the failure lands in the footer as a
+        // notice, and the UI carries on (issue #43).
+        let (mut app, _requests) = app();
+        app.apply(Reply::RefreshFailed(ClientError::Transport(
+            "the service did not answer in time".into(),
+        )));
+        let status = app.status.as_deref().expect("a status message");
+        assert!(
+            status.starts_with("service unavailable"),
+            "the footer must say the service is unavailable: {status}"
+        );
+        assert!(!app.should_quit, "a wedged service must not quit the TUI");
+    }
+
+    #[test]
+    fn the_unavailable_notice_clears_when_the_service_answers_again() {
+        // Recovery is the other half of the notice: once a snapshot lands,
+        // the "service unavailable" line goes away, and nothing else does.
+        let (mut app, _requests) = app();
+        app.apply(Reply::RefreshFailed(ClientError::Transport(
+            "the service did not answer in time".into(),
+        )));
+        app.apply(Reply::Snapshot(Box::default()));
+        assert!(
+            app.status.is_none(),
+            "the notice clears on recovery, got {:?}",
+            app.status
+        );
+
+        // An action's own message survives the next poll.
+        app.apply(Reply::Undone { id: "e1".into() });
+        app.apply(Reply::Snapshot(Box::default()));
+        assert_eq!(app.status.as_deref(), Some("undid quick add e1"));
+    }
+
+    #[test]
+    fn a_failed_action_says_what_went_wrong_and_keeps_the_ui_alive() {
+        let (mut app, _requests) = app();
+        app.apply(Reply::ActionFailed(ClientError::Transport(
+            "the service did not answer in time".into(),
+        )));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("the service did not answer in time")
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_key_press_asks_the_service_thread_rather_than_calling_the_bus() {
+        // The UI never calls the service itself: it hands the request over
+        // and carries on. That is what keeps the event loop alive while a
+        // call is outstanding (issue #43).
+        let (mut app, requests) = app();
+        app.snapshot = Snapshot {
+            projects: vec![project("p1", "Work", false)],
+            ..Default::default()
+        };
+        app.on_key(key(KeyCode::Char('1')));
+        match requests.try_recv().expect("a request") {
+            Request::QuickAdd { project, ms } => {
+                assert_eq!(project, "p1");
+                assert_eq!(ms, QUICK_ADD_MS[0]);
+            }
+            other => panic!("expected a quick add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn q_quits_even_while_a_call_is_outstanding() {
+        // The whole point of the service thread: the UI thread never waits
+        // for the bus, so the quit key always works.
+        let (mut app, _requests) = app();
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn undo_targets_the_quick_add_this_session_made() {
+        // The target is resolved by the service thread, so an undo typed
+        // right after a quick add undoes *that* one -- the snapshot cannot
+        // know the id of a quick add that has not landed yet.
+        let snap = Snapshot {
+            entries: vec![entry("e2", EntrySource::QuickAdd, 0)],
+            ..Default::default()
+        };
+        assert_eq!(undo_target(Some("e9"), &snap).as_deref(), Some("e9"));
+        assert_eq!(undo_target(None, &snap).as_deref(), Some("e2"));
+        assert_eq!(undo_target(None, &Snapshot::default()), None);
+    }
+
     #[test]
     fn selection_clamps_to_a_shrunk_list() {
-        // Simulates the guard in App::refresh: deleting the last entry while
+        // Simulates the guard in App::apply: deleting the last entry while
         // the cursor sits on it must not leave the index out of bounds.
         let mut selected: usize = 5;
         let len: usize = 2;
