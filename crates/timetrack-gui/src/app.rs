@@ -77,6 +77,29 @@ struct ExportRequest {
     suggested_name: String,
 }
 
+/// Build the request for one export button, from one anchor and one zone.
+///
+/// Everything the request names -- the period, the file name, the fallback
+/// path -- is derived together, so the file cannot be called `...-W41.csv`
+/// while holding a different week. The destination used to be computed at
+/// render time and captured in the click closure, so a zone that changed
+/// between the last paint and the click put the file in a directory named
+/// for a different week.
+fn export_request(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    now: i64,
+    tz: &timetrack_core::Tz,
+) -> ExportRequest {
+    ExportRequest {
+        scope,
+        path: default_export_path(scope, anchor_ms, tz),
+        anchor_ms: export_anchor_for_save(scope, anchor_ms, now, tz),
+        period_id: export_period_label(scope, anchor_ms, tz),
+        suggested_name: export_suggested_name(scope, anchor_ms, tz),
+    }
+}
+
 /// A command the UI wants performed. The service thread owns the bus
 /// connection, so the UI cannot issue D-Bus calls itself.
 #[derive(Debug, Clone)]
@@ -327,6 +350,18 @@ enum StatusKind {
     Service,
     /// Local UI notes and bus-level failures, not service refusals.
     Local,
+}
+
+/// Whether a status is a connection notice: one that a snapshot proves over.
+///
+/// The "service is not running" and "different versions" notices describe the
+/// connection rather than one action, so the first snapshot that arrives
+/// clears them -- the service is back, or it is speaking this client's
+/// interface now. An ordinary error is about one action and survives until
+/// the next one, because snapshots arrive every second and would otherwise
+/// make it unreadable.
+fn is_connection_notice(kind: StatusKind) -> bool {
+    matches!(kind, StatusKind::NoService | StatusKind::VersionMismatch)
 }
 
 /// The footer status line: what to show, and what kind of problem it is.
@@ -914,6 +949,17 @@ async fn save_export(tx: Sender<Msg>, csv: String, req: ExportRequest) {
             let _ = tx.send(export_cancel_msg());
         }
     }
+}
+
+/// The element id of one of a project's row buttons.
+///
+/// Built from the project id itself rather than from a number parsed out of
+/// it. The core mints ids as `p1`, `p2`, ..., so parsing the numeric suffix
+/// was unique in practice -- but any id that was not `p<digits>` fell back to
+/// `0`, which would have given two such projects the same element id, and
+/// gpui would have treated the second button as the first.
+fn project_button_id(kind: &'static str, project_id: &str) -> ElementId {
+    ElementId::from((ElementId::from(kind), project_id.to_string()))
 }
 
 /// The Export tab's scope-plus-anchor picker (spec #19).
@@ -1545,9 +1591,18 @@ impl TimetrackView {
                     // A routine snapshot must not wipe feedback from the last
                     // action: snapshots arrive every second, so clearing here
                     // made error reports from the service thread unreadable.
-                    // Only the "service is not running" notice clears on
-                    // recovery; action errors survive until the next one.
-                    if self.service_missing() {
+                    //
+                    // Two notices are the exception, because a snapshot is
+                    // what proves them over: the service is there again
+                    // ("service is not running"), and it is speaking the
+                    // interface this client speaks ("different versions" --
+                    // the user reinstalled whichever side was older). An
+                    // ordinary action error survives until the next one.
+                    if self
+                        .status
+                        .as_ref()
+                        .is_some_and(|s| is_connection_notice(s.kind))
+                    {
                         self.status = None;
                         changed = true;
                     }
@@ -3061,12 +3116,7 @@ impl TimetrackView {
                     move |el| {
                         el.child(
                             div()
-                                // Project ids are `p1`, `p2`, ... so the numeric
-                                // suffix is unique within the store and a valid id.
-                                .id(ElementId::from((
-                                    "archive",
-                                    p.id.trim_start_matches('p').parse::<u64>().unwrap_or(0),
-                                )))
+                                .id(project_button_id("archive", &p.id))
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
@@ -3091,10 +3141,7 @@ impl TimetrackView {
                     move |el| {
                         el.child(
                             div()
-                                .id(ElementId::from((
-                                    "unarchive",
-                                    p.id.trim_start_matches('p').parse::<u64>().unwrap_or(0),
-                                )))
+                                .id(project_button_id("unarchive", &p.id))
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
@@ -3379,9 +3426,6 @@ impl TimetrackView {
             {
                 let entity = self.entity.clone();
                 let button_scope = *button_scope;
-                let path = default_export_path(button_scope, self.export_picker.anchor_ms, &tz);
-                let suggested_name =
-                    export_suggested_name(button_scope, self.export_picker.anchor_ms, &tz);
                 let label = format!("Export {}", button_scope.as_str());
                 row = row.child(
                     div()
@@ -3395,28 +3439,22 @@ impl TimetrackView {
                         .child(label)
                         .when_some(entity, move |el, entity| {
                             el.on_click(move |_ev, _window, cx| {
-                                let path = path.clone();
-                                let suggested_name = suggested_name.clone();
                                 entity.update(cx, |view, cx| {
+                                    // Everything about the request is computed
+                                    // here, from one snapshot and one zone:
+                                    // the destination used to be computed at
+                                    // render time and captured, so a zone
+                                    // that changed between the last paint and
+                                    // the click would have put the file in a
+                                    // directory named for a different week.
                                     let tz = snapshot_tz(&view.snapshot);
-                                    let anchor_ms = export_anchor_for_save(
+                                    let request = export_request(
                                         button_scope,
                                         view.export_picker.anchor_ms,
                                         now_ms(),
                                         &tz,
                                     );
-                                    let period_id = export_period_label(
-                                        button_scope,
-                                        view.export_picker.anchor_ms,
-                                        &tz,
-                                    );
-                                    view.send(Action::ExportCsv(ExportRequest {
-                                        scope: button_scope,
-                                        path,
-                                        anchor_ms,
-                                        period_id,
-                                        suggested_name,
-                                    }));
+                                    view.send(Action::ExportCsv(request));
                                     cx.notify();
                                 });
                             })
@@ -4029,6 +4067,17 @@ mod tests {
         assert!(delete_offer(&snap, 99).is_none());
     }
 
+    #[test]
+    fn only_connection_notices_are_cleared_by_a_snapshot() {
+        // A snapshot proves the service is back, and that it is speaking this
+        // client's interface -- so those two notices go. An action error
+        // survives, because snapshots arrive every second.
+        assert!(is_connection_notice(StatusKind::NoService));
+        assert!(is_connection_notice(StatusKind::VersionMismatch));
+        assert!(!is_connection_notice(StatusKind::Service));
+        assert!(!is_connection_notice(StatusKind::Local));
+    }
+
     // --- which prompt is open ---
 
     #[test]
@@ -4079,6 +4128,36 @@ mod tests {
         assert_eq!(
             which_prompt(false, false, false, true, true),
             Some(OpenPrompt::Merge)
+        );
+    }
+
+    // --- the project row buttons ---
+
+    #[test]
+    fn two_projects_never_share_a_button_element_id() {
+        // The old id parsed the numeric suffix out of the project id and
+        // fell back to 0 for anything else, so two ids that were not
+        // `p<digits>` would have collided.
+        assert_ne!(
+            project_button_id("archive", "p1"),
+            project_button_id("archive", "p2")
+        );
+        assert_ne!(
+            project_button_id("archive", "imported"),
+            project_button_id("archive", "other")
+        );
+        assert_ne!(
+            project_button_id("archive", "imported"),
+            project_button_id("unarchive", "imported"),
+            "the two buttons of one project must differ too"
+        );
+    }
+
+    #[test]
+    fn one_project_always_gets_the_same_button_element_id() {
+        assert_eq!(
+            project_button_id("archive", "p7"),
+            project_button_id("archive", "p7")
         );
     }
 
@@ -4508,6 +4587,40 @@ mod tests {
                 "all time ignores the anchor: {all}"
             );
         }
+    }
+
+    #[test]
+    fn an_export_request_names_one_period_everywhere() {
+        // The destination used to be computed at render time and captured in
+        // the click closure, so it could come from a different snapshot than
+        // the period the request names. Everything is derived together now.
+        let scope = timetrack_core::ExportScope::Week;
+        let anchor = day_anchor("2026-10-08");
+        // `now` in a different week, so the request names a *chosen* period
+        // and takes the anchored call rather than the current-period one.
+        let now = day_anchor("2026-11-05");
+        let request = export_request(scope, anchor, now, &utc_tz());
+        assert_eq!(request.period_id, "2026-W41");
+        assert_eq!(request.suggested_name, "timetrack-export-week-2026-W41.csv");
+        assert!(
+            request.path.ends_with("timetrack-export-week-2026-W41.csv"),
+            "the fallback path names the same week: {}",
+            request.path
+        );
+        assert_eq!(
+            request.anchor_ms,
+            Some(anchor),
+            "a chosen period uses the anchored call"
+        );
+    }
+
+    #[test]
+    fn an_export_request_for_all_time_ignores_the_anchor() {
+        let anchor = day_anchor("2026-10-08");
+        let request = export_request(timetrack_core::ExportScope::All, anchor, anchor, &utc_tz());
+        assert_eq!(request.period_id, "all time");
+        assert_eq!(request.suggested_name, "timetrack-export-all.csv");
+        assert_eq!(request.anchor_ms, None, "all time uses the old call");
     }
 
     #[test]
