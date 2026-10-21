@@ -711,6 +711,37 @@ elif "$WORK/xtest" "$DISP" key 1; then
   rm -f "$WORK/portal-names.log.fail"
 
   echo
+  echo "== the window keeps serving while the save dialog is open =="
+  # The save dialog used to be awaited on the service thread, so while it
+  # was open the thread served nothing at all: no snapshot, no quick-add.
+  # The window looked frozen over a frozen data set.
+  #
+  # The stub holds the dialog open for six seconds, which is long enough to
+  # make a quick-add made during it either land or not. It fails the write
+  # (the `.fail` flag), so nothing is written and the week files stay as
+  # they are.
+  touch "$WORK/portal-names.log.fail" "$WORK/portal-names.log.hold"
+  TOTAL_BEFORE=$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')
+  shot export-before-hold.png
+  CLICK=$(blobs export-before-hold.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '1p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK) and holding the dialog"
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  sleep 1
+  # The dialog is open (the stub is still holding it). A quick-add now must
+  # still reach the service.
+  "$WORK/xtest" "$DISP" key 1
+  sleep 1
+  TOTAL_DURING=$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')
+  if [ "$TOTAL_DURING" != "$TOTAL_BEFORE" ]; then
+    ok "the service kept serving while the save dialog was open"
+  else
+    bad "the service kept serving while the save dialog was open" \
+      "the total did not change ($TOTAL_BEFORE -> $TOTAL_DURING)"
+  fi
+  rm -f "$WORK/portal-names.log.fail" "$WORK/portal-names.log.hold"
+  sleep 1
+
+  echo
   echo "== a prompt opened on the Export tab is drawn there =="
   # The prompts used to be rendered inside the Home tab only, while the key
   # handler opened them on every tab. On the Export tab that produced a modal
