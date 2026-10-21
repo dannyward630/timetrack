@@ -88,10 +88,6 @@ jobs:
           tar -czf dist/timetrack-${{ matrix.arch }}.tar.gz -C dist timetrack-${{ matrix.arch }}
           rm dist/timetrack-${{ matrix.arch }}
 
-      - name: Checksum
-        working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
-
       # Unpacked first, because the tarball is what a downloader gets: a
       # passing check on a loose copy in the workspace would not be evidence
       # about the file on the release page.
@@ -111,18 +107,9 @@ jobs:
           rm -rf verify
 
       - uses: actions/upload-artifact@v4
-        if: ${{ inputs.dry_run }}
         with:
           name: timetrack-${{ matrix.arch }}
-          path: dist/
-
-      - uses: softprops/action-gh-release@v2
-        if: ${{ !inputs.dry_run }}
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/SHA256SUMS
-          generate_release_notes: true
+          path: dist/timetrack-${{ matrix.arch }}.tar.gz
 
   appimage:
     name: TimeTrack-x86_64.AppImage
@@ -138,11 +125,6 @@ jobs:
           apt-packages: ${{ env.GUI_LIBS }} file
       - name: Build the AppImage
         run: ./build-appimage.sh
-      - name: Checksum
-        run: |
-          mkdir -p dist
-          cp TimeTrack-x86_64.AppImage dist/
-          (cd dist && sha256sum TimeTrack-x86_64.AppImage > TimeTrack-x86_64.AppImage.sha256)
       - name: Verify the AppImage bundles both binaries
         run: |
           ./TimeTrack-x86_64.AppImage --appimage-extract >/dev/null
@@ -151,14 +133,42 @@ jobs:
           test -x squashfs-root/AppRun
           rm -rf squashfs-root
       - uses: actions/upload-artifact@v4
-        if: ${{ inputs.dry_run }}
         with:
           name: TimeTrack-x86_64.AppImage
+          path: TimeTrack-x86_64.AppImage
+
+  # One job publishes, and it runs only once both builds have finished. Two
+  # publishing jobs each generate the release notes and each write their own
+  # SHA256SUMS, which is how v0.1.0 came out with its notes printed twice and a
+  # checksum file listing one of the two tarballs. A dry run stops before the
+  # last step and keeps exactly the files a release would carry.
+  publish:
+    name: publish
+    needs: [build, appimage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write one checksum file for everything published
+        working-directory: dist
+        run: sha256sum *.tar.gz *.AppImage > SHA256SUMS
+      - name: Show what would be published
+        working-directory: dist
+        run: ls -l
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run }}
+        with:
+          name: release-assets
           path: dist/
       - uses: softprops/action-gh-release@v2
         if: ${{ !inputs.dry_run }}
         with:
           files: |
-            dist/TimeTrack-x86_64.AppImage
-            dist/TimeTrack-x86_64.AppImage.sha256
+            dist/*.tar.gz
+            dist/*.AppImage
+            dist/SHA256SUMS
+          generate_release_notes: true
 
