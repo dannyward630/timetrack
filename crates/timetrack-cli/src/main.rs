@@ -43,7 +43,7 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::time::Duration;
 use timetrack_cli::tui;
-use timetrack_proto::{Client, ProjectView, Snapshot};
+use timetrack_proto::{Client, ClientError, ProjectView, Snapshot, no_service_hint};
 
 /// How long to wait for the service to appear before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -247,21 +247,29 @@ async fn run() -> Result<()> {
         return tui::run().await;
     }
 
-    let client = Client::wait_for_service(CONNECT_TIMEOUT)
+    // `wait_for_service` waits for the service to answer, not merely for a
+    // bus to exist, and gives up with the shared guidance -- so a missing
+    // service says what to do about it rather than naming a D-Bus error the
+    // user cannot act on.
+    let client = Client::wait_for_service(CONNECT_TIMEOUT).await?;
+    dispatch(client, cli.command.expect("non-TUI command above"))
         .await
-        .map_err(|e| {
-            // A bare "ServiceUnknown" is accurate but unhelpful; say what to do.
-            if e.to_string().contains("ServiceUnknown") {
-                e.context(
-                    "the TimeTrack service is not running.\n\
-                 Start it with:  timetrack-service\n\
-                 or enable the systemd user unit for your session.",
-                )
-            } else {
-                e
-            }
-        })?;
-    dispatch(client, cli.command.expect("non-TUI command above")).await
+        .map_err(explain)
+}
+
+/// A failure the user can act on, in the words the other clients use.
+///
+/// The three clients say the same thing about a missing service, so the
+/// wording comes from the protocol crate rather than from here. A refusal
+/// from the service keeps its own wording.
+fn explain(err: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        err.downcast_ref::<ClientError>(),
+        Some(ClientError::NoService)
+    ) {
+        return anyhow::anyhow!(no_service_hint());
+    }
+    err
 }
 
 async fn dispatch(client: Client, command: Command) -> Result<()> {
@@ -770,6 +778,31 @@ fn parse_duration(text: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_service_is_explained_with_the_shared_hint() {
+        // The guidance used to live in a block that matched on the substring
+        // "ServiceUnknown" -- a string no error here ever contained -- so it
+        // never reached the user.
+        let err = anyhow::Error::new(ClientError::NoService);
+        let text = explain(err).to_string();
+        assert_eq!(text, no_service_hint());
+        assert!(
+            text.contains("Start it with"),
+            "the hint says how to start the service: {text}"
+        );
+    }
+
+    #[test]
+    fn a_service_refusal_keeps_its_own_wording() {
+        let err = anyhow::Error::new(ClientError::Service(
+            timetrack_proto::ServiceError::UnknownExportScope("bogus".into()),
+        ));
+        assert_eq!(
+            explain(err).to_string(),
+            "unknown export scope 'bogus' (use week, month or all)"
+        );
+    }
 
     #[test]
     fn durations_parse_with_units() {
