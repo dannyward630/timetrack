@@ -574,18 +574,31 @@ impl Client {
     }
 
     /// Poll until the service appears on the bus, or give up.
+    ///
+    /// Connecting proves a *bus* is there, not that the service owns the
+    /// name: `Client::connect` is anonymous, so it succeeds with no service
+    /// around. The first method call is what proves the service, so that is
+    /// what this waits for -- otherwise the name and the timeout promised a
+    /// wait the function never did, and a missing service surfaced as a bare
+    /// error from whatever command was being run.
+    ///
+    /// Gives up with the shared "not running" guidance, so every client says
+    /// the same thing about a missing service.
     pub async fn wait_for_service(timeout: Duration) -> anyhow::Result<Self> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Ok(c) = Client::connect().await {
-                return Ok(c);
+            if let Ok(client) = Client::connect().await {
+                match client.snapshot().await {
+                    Ok(_) => return Ok(client),
+                    // The bus is there and the service is not: wait for it.
+                    Err(ClientError::NoService) => {}
+                    // Any other failure is about this call, not about the
+                    // service being absent: report it as it is.
+                    Err(e) => return Err(anyhow::Error::new(e)),
+                }
             }
             if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "the timetrack service ({BUS_NAME}) did not appear on the bus.\n\
-                     Start it with:  timetrack-service\n\
-                     It is normally started on demand by the systemd user unit."
-                );
+                anyhow::bail!("{}", no_service_hint());
             }
             // `async_io::Timer`, not a tokio sleep: this function runs
             // inside a program driven by `async_io::block_on` (the CLI and the
