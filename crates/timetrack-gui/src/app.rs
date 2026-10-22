@@ -26,13 +26,13 @@
 //! There is no timer state here, because there is none in the model. The Home
 //! tab's primary control is the 5/15/30/60 quick-add row.
 
+use self::chrome::{maximize_glyph, titlebar_drag, window_button};
 use self::status::{StatusKind, StatusMsg, is_connection_notice};
 use self::tabs::{Tab, cycle_tab};
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement,
-    MouseButton, Render, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
-    rgb, rgba,
+    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement, Render,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px, rgb, rgba,
 };
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::time::Duration;
@@ -2303,68 +2303,6 @@ impl Render for TimetrackView {
     }
 }
 
-/// A region of the integrated titlebar that drags the undecorated window.
-///
-/// Left-drag moves the window, right-click opens the window menu, and a
-/// double-click toggles maximize, like a system title bar. The platform
-/// ignores `window_control_area` on Linux, so the move starts here
-/// explicitly; where the marker is honoured it does the same job.
-fn titlebar_drag(id: &'static str, stretch: bool, label: &str) -> impl IntoElement {
-    let mut region = div()
-        .id(ElementId::from(id))
-        .px_2()
-        .py_1()
-        .text_sm()
-        .text_color(rgb(0x7a7a90))
-        .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(MouseButton::Left, |_, window, _| {
-            window.start_window_move();
-        })
-        .on_mouse_down(MouseButton::Right, |ev, window, _| {
-            window.show_window_menu(ev.position);
-        })
-        .on_click(|ev, window, _| {
-            if ev.click_count() == 2 {
-                window.zoom_window();
-            }
-        });
-    if stretch {
-        region = region.flex_1();
-    }
-    region.child(label.to_string())
-}
-
-/// The maximize button's glyph: a square to expand, nested squares to
-/// restore, following the window's current state.
-fn maximize_glyph(is_maximized: bool) -> &'static str {
-    if is_maximized { "▣" } else { "□" }
-}
-
-/// One of the integrated window controls: minimize, maximize or close.
-///
-/// Neutral grey, never the action green (which the smoke check counts), with
-/// the close glyph in red. The `window_control_area` marker is honoured on
-/// platforms with native hit-testing; the click handler below is what acts on
-/// Linux, where the marker is ignored.
-fn window_button(
-    id: &'static str,
-    label: &str,
-    area: WindowControlArea,
-    danger: bool,
-    on_click: impl Fn(&mut Window) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(ElementId::from(id))
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(if danger { rgb(0xe06c75) } else { rgb(0x9a9ab0) })
-        .child(label.to_string())
-        .window_control_area(area)
-        .on_click(move |_, window, _| on_click(window))
-}
-
 impl TimetrackView {
     /// The integrated titlebar: the window has no system title bar (see
     /// `main.rs`), so this row is the drag handle, the tab strip and the
@@ -4025,14 +3963,6 @@ mod tests {
     // --- tabs and bars (§11) ---
 
     #[test]
-    fn maximize_button_names_the_action_it_will_take() {
-        // A square to expand, nested squares to restore: the button always
-        // states what pressing it does, following the window's state.
-        assert_eq!(maximize_glyph(false), "□");
-        assert_eq!(maximize_glyph(true), "▣");
-    }
-
-    #[test]
     fn bars_fill_the_track_proportionally() {
         assert_eq!(bar_width(3_600_000, 3_600_000), PROJECT_BAR_TRACK_PX);
         assert_eq!(bar_width(1_800_000, 3_600_000), PROJECT_BAR_TRACK_PX / 2.0);
@@ -4800,3 +4730,5 @@ mod testsupport;
 mod status;
 
 mod tabs;
+
+mod chrome;
