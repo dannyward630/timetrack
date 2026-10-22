@@ -8,5 +8,6 @@
 //! The view layer: titlebar, tabs, prompt panels and footer, drawn from the
 //! latest snapshot the service produced.
 
+pub mod export;
 pub mod home;
 pub mod projects;
