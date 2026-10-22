@@ -12,8 +12,9 @@
 //! the tab strip and the minimize/maximize/close buttons live in one row
 //! that this module builds.
 
+use super::theme;
 use gpui::prelude::*;
-use gpui::{ElementId, MouseButton, Window, WindowControlArea, div, rgb};
+use gpui::{ElementId, MouseButton, Window, WindowControlArea, div, rgba};
 
 /// A region of the integrated titlebar that drags the undecorated window.
 ///
@@ -27,7 +28,7 @@ pub(super) fn titlebar_drag(id: &'static str, stretch: bool, label: &str) -> imp
         .px_2()
         .py_1()
         .text_sm()
-        .text_color(rgb(0x7a7a90))
+        .text_color(rgba(theme::MUTED_TEXT))
         .window_control_area(WindowControlArea::Drag)
         .on_mouse_down(MouseButton::Left, |_, window, _| {
             window.start_window_move();
@@ -71,7 +72,11 @@ pub(super) fn window_button(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(if danger { rgb(0xe06c75) } else { rgb(0x9a9ab0) })
+        .text_color(if danger {
+            rgba(theme::DANGER)
+        } else {
+            rgba(theme::ROW_TEXT)
+        })
         .child(label.to_string())
         .window_control_area(area)
         .on_click(move |_, window, _| on_click(window))

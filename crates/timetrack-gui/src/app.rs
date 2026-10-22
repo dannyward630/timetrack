@@ -1898,7 +1898,7 @@ impl Render for TimetrackView {
             .flex()
             .flex_col()
             .size_full()
-            .text_color(rgb(0xe6e6f0))
+            .text_color(rgba(theme::BODY_TEXT))
             .on_key_down(move |ev, _window, cx| {
                 // `update` alone never repaints: it only runs the closure,
                 // and a frame is scheduled solely by `notify`. Without it a
@@ -1917,7 +1917,7 @@ impl Render for TimetrackView {
                     .flex_col()
                     .flex_1()
                     .w_full()
-                    .bg(rgb(0x11111b))
+                    .bg(rgba(theme::WINDOW_BG))
                     .when(!maximized, |el| el.rounded_xl().overflow_hidden())
                     .child(self.render_titlebar(window))
                     // The prompt panels sit above the tab content, so a prompt
@@ -1950,7 +1950,7 @@ impl TimetrackView {
             .gap_1()
             .px_3()
             .py_2()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             // The panel clip does not round children, so the titlebar
             // rounds its own top to meet the panel's corners. Square when
             // maximized, like the panel itself.
@@ -1966,14 +1966,14 @@ impl TimetrackView {
                     .rounded_md()
                     .cursor_pointer()
                     .bg(if is_selected {
-                        rgba(0x2a2a3aff)
+                        rgba(theme::RAISED_BG)
                     } else {
                         rgba(0x00000000)
                     })
                     .text_color(if is_selected {
                         rgb(0xffffff)
                     } else {
-                        rgb(0x7a7a90)
+                        rgba(theme::MUTED_TEXT)
                     })
                     .child(tab.label())
                     .when(!is_selected, move |el| {
@@ -2038,15 +2038,20 @@ impl TimetrackView {
                     .text_color(rgb(0xffffff))
                     .child(timetrack_core::format_duration(week.total_ms)),
             )
-            .child(div().text_sm().text_color(rgb(0x7a7a90)).child(format!(
-                "this week · {} {}",
-                week.entry_count,
-                if week.entry_count == 1 {
-                    "entry"
-                } else {
-                    "entries"
-                }
-            )));
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgba(theme::MUTED_TEXT))
+                    .child(format!(
+                        "this week · {} {}",
+                        week.entry_count,
+                        if week.entry_count == 1 {
+                            "entry"
+                        } else {
+                            "entries"
+                        }
+                    )),
+            );
 
         // A day over 24h is legal data, but it usually means a mistyped
         // interval, so it is worth saying (REQUIREMENTS §4). Built as a div
@@ -2055,7 +2060,7 @@ impl TimetrackView {
             .px_6()
             .pb_1()
             .text_sm()
-            .text_color(rgb(0xd29922))
+            .text_color(rgba(theme::WARNING))
             .child(if self.snapshot.over_24h_days.is_empty() {
                 String::new()
             } else {
@@ -2131,7 +2136,7 @@ impl TimetrackView {
                         .text_color(if focused {
                             rgb(0xffffff)
                         } else {
-                            rgb(0x7a7a90)
+                            rgba(theme::MUTED_TEXT)
                         })
                         .child(format!("{} {label}", if focused { ">" } else { " " })),
                 )
@@ -2142,17 +2147,17 @@ impl TimetrackView {
                         .py_1()
                         .rounded_md()
                         .bg(if focused {
-                            rgba(0x2a2a3aff)
+                            rgba(theme::RAISED_BG)
                         } else {
                             rgba(0x00000000)
                         })
-                        .text_color(rgb(0xe6e6f0))
+                        .text_color(rgba(theme::BODY_TEXT))
                         .child(format!("{value}{}", if focused { "_" } else { "" })),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0x6a6a80))
+                        .text_color(rgba(theme::HINT_TEXT))
                         .child(hint.to_string()),
                 )
         };
@@ -2166,8 +2171,8 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
-            .child(div().text_color(rgb(0x7fd3ff)).child(title))
+            .bg(rgba(theme::PANEL_BG))
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
             .child(field_row(
                 "what",
                 &dlg.description,
@@ -2190,11 +2195,16 @@ impl TimetrackView {
                 div()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("type to edit · tab next field · enter save · esc cancel"),
             );
         if let Some(err) = &dlg.error {
-            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
         panel
     }
@@ -2211,10 +2221,10 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             .child(
                 div()
-                    .text_color(rgb(0x7fd3ff))
+                    .text_color(rgba(theme::ACCENT))
                     .child(format!("SPLIT ENTRY {}", prompt.entry_id)),
             )
             .child(
@@ -2230,14 +2240,14 @@ impl TimetrackView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgba(0x2a2a3aff))
-                            .text_color(rgb(0xe6e6f0))
+                            .bg(rgba(theme::RAISED_BG))
+                            .text_color(rgba(theme::BODY_TEXT))
                             .child(format!("{}_", prompt.at)),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x6a6a80))
+                            .text_color(rgba(theme::HINT_TEXT))
                             .child("(-90, 90, now, HH:MM)"),
                     ),
             )
@@ -2245,11 +2255,16 @@ impl TimetrackView {
                 div()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("type a moment · enter split · esc cancel"),
             );
         if let Some(err) = &prompt.error {
-            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
         panel
     }
@@ -2268,10 +2283,10 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             .child(
                 div()
-                    .text_color(rgb(0x7fd3ff))
+                    .text_color(rgba(theme::ACCENT))
                     .child(confirm.summary.clone()),
             )
     }
@@ -2288,10 +2303,10 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             .child(
                 div()
-                    .text_color(rgb(0x7fd3ff))
+                    .text_color(rgba(theme::ACCENT))
                     .child(confirm.summary.clone()),
             )
     }
@@ -2312,8 +2327,8 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
-            .child(div().text_color(rgb(0x7fd3ff)).child(title))
+            .bg(rgba(theme::PANEL_BG))
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
             .child(
                 div()
                     .flex()
@@ -2327,14 +2342,14 @@ impl TimetrackView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgba(0x2a2a3aff))
-                            .text_color(rgb(0xe6e6f0))
+                            .bg(rgba(theme::RAISED_BG))
+                            .text_color(rgba(theme::BODY_TEXT))
                             .child(format!("{}_", prompt.name)),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x6a6a80))
+                            .text_color(rgba(theme::HINT_TEXT))
                             .child("a short name, e.g. Work"),
                     ),
             )
@@ -2342,11 +2357,16 @@ impl TimetrackView {
                 div()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("type a name · enter save · esc cancel"),
             );
         if let Some(err) = &prompt.error {
-            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
         panel
     }
@@ -2360,7 +2380,12 @@ impl TimetrackView {
             .unwrap_or_else(|| "no project".into());
 
         let mut row = div().flex().items_center().gap_2().px_6().py_3();
-        row = row.child(div().text_sm().text_color(rgb(0x7a7a90)).child("add time"));
+        row = row.child(
+            div()
+                .text_sm()
+                .text_color(rgba(theme::MUTED_TEXT))
+                .child("add time"),
+        );
         for ms in QUICK_ADD_MS {
             let target = project_id.clone();
             row = row.child(
@@ -2369,7 +2394,7 @@ impl TimetrackView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x2ea043))
+                    .bg(rgba(theme::ACTION))
                     .text_color(rgb(0xffffff))
                     // With no project there is nothing to attribute the time
                     // to, so the button is present but inert rather than
@@ -2394,7 +2419,7 @@ impl TimetrackView {
         row.child(
             div()
                 .text_sm()
-                .text_color(rgb(0x9a9ab0))
+                .text_color(rgba(theme::ROW_TEXT))
                 .child(format!("→ {project_name}")),
         )
     }
@@ -2426,7 +2451,7 @@ impl TimetrackView {
             list = list.child(
                 div()
                     .py_2()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("No projects yet — add one on the Projects tab."),
             );
         }
@@ -2440,7 +2465,7 @@ impl TimetrackView {
                     .child(
                         div()
                             .flex_1()
-                            .text_color(rgb(0xc8c8d8))
+                            .text_color(rgba(theme::STRONG_TEXT))
                             .child(name.to_string()),
                     )
                     // A bar proportional to the longest row (§11), so the
@@ -2450,19 +2475,19 @@ impl TimetrackView {
                             .w(px(PROJECT_BAR_TRACK_PX))
                             .h(px(8.))
                             .rounded_md()
-                            .bg(rgb(0x2a2a3a))
+                            .bg(rgba(theme::RAISED_BG))
                             .child(
                                 div()
                                     .w(px(bar_width(ms, max_ms)))
                                     .h_full()
                                     .rounded_md()
-                                    .bg(rgb(0x7fd3ff)),
+                                    .bg(rgba(theme::ACCENT)),
                             ),
                     )
                     .child(
                         div()
                             .w(px(110.))
-                            .text_color(rgb(0x7fd3ff))
+                            .text_color(rgba(theme::ACCENT))
                             .child(timetrack_core::format_duration(ms)),
                     ),
             );
@@ -2474,7 +2499,7 @@ impl TimetrackView {
                     .px_6()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x7a7a90))
+                    .text_color(rgba(theme::MUTED_TEXT))
                     .child("THIS WEEK BY PROJECT"),
             )
             .child(div().px_6().child(list))
@@ -2486,7 +2511,7 @@ impl TimetrackView {
             return div()
                 .px_6()
                 .py_3()
-                .text_color(rgb(0x6a6a80))
+                .text_color(rgba(theme::HINT_TEXT))
                 .child("Nothing tracked yet — press 1 to add 5 minutes.")
                 .into_any_element();
         }
@@ -2509,13 +2534,13 @@ impl TimetrackView {
                 .px_6()
                 .py_1()
                 .bg(if selected {
-                    rgba(0x2a2a3aff)
+                    rgba(theme::RAISED_BG)
                 } else {
                     rgba(0x00000000)
                 })
                 // A quick-add is marked so it is visibly distinct from
                 // hand-entered time, and so `u` reads as "undo that".
-                .child(div().w_4().text_color(rgb(0x2ea043)).child(
+                .child(div().w_4().text_color(rgba(theme::ACTION)).child(
                     if e.source == timetrack_proto::EntrySource::QuickAdd {
                         "+"
                     } else {
@@ -2525,19 +2550,19 @@ impl TimetrackView {
                 .child(
                     div()
                         .w(px(110.))
-                        .text_color(rgb(0x7fd3ff))
+                        .text_color(rgba(theme::ACCENT))
                         .child(timetrack_core::format_duration(e.duration_ms())),
                 )
                 .child(
                     div()
                         .w(px(160.))
-                        .text_color(rgb(0x9a9ab0))
+                        .text_color(rgba(theme::ROW_TEXT))
                         .child(project_name(&e.project_id)),
                 )
                 .child(
                     div()
                         .flex_1()
-                        .text_color(rgb(0xe6e6f0))
+                        .text_color(rgba(theme::BODY_TEXT))
                         .child(e.label().to_string()),
                 )
         });
@@ -2547,7 +2572,7 @@ impl TimetrackView {
             .pt_2()
             .pb_1()
             .text_sm()
-            .text_color(rgb(0x7a7a90))
+            .text_color(rgba(theme::MUTED_TEXT))
             .child("RECENT ENTRIES  (+ = QUICK ADD)")
             .child(div().flex().flex_col().children(rows))
             .into_any_element()
@@ -2569,7 +2594,7 @@ impl TimetrackView {
                 .py_2()
                 .rounded_md()
                 .cursor_pointer()
-                .bg(rgba(0x2ea043ff))
+                .bg(rgba(theme::ACTION))
                 .text_color(rgb(0xffffff))
                 .child("New project")
                 .when_some(entity, |this, entity| {
@@ -2590,7 +2615,7 @@ impl TimetrackView {
                 .py_4()
                 .child(
                     div()
-                        .text_color(rgb(0x6a6a80))
+                        .text_color(rgba(theme::HINT_TEXT))
                         .child("No projects yet — create one to start tracking time."),
                 )
                 .child(new_project)
@@ -2607,7 +2632,7 @@ impl TimetrackView {
             let name = p.name.clone();
             // The project's colour, if it has one, else the neutral row grey:
             // recolours set from the CLI show up here without another action.
-            let dot = rgb(p.colour.unwrap_or(0x7a7a90));
+            let dot = theme::project_colour(p.colour);
             div()
                 .flex()
                 .items_center()
@@ -2619,9 +2644,9 @@ impl TimetrackView {
                     div()
                         .flex_1()
                         .text_color(if p.archived {
-                            rgb(0x6a6a80)
+                            rgba(theme::HINT_TEXT)
                         } else {
-                            rgb(0xe6e6f0)
+                            rgba(theme::BODY_TEXT)
                         })
                         .child(if p.archived {
                             format!("{name}  (archived)")
@@ -2632,13 +2657,13 @@ impl TimetrackView {
                 .child(
                     div()
                         .w(px(110.))
-                        .text_color(rgb(0x7fd3ff))
+                        .text_color(rgba(theme::ACCENT))
                         .child(timetrack_core::format_duration(week)),
                 )
                 .child(
                     div()
                         .w(px(110.))
-                        .text_color(rgb(0x7a7a90))
+                        .text_color(rgba(theme::MUTED_TEXT))
                         .child(timetrack_core::format_duration(all)),
                 )
                 // Archiving is offered only for live projects; an archived one
@@ -2656,7 +2681,7 @@ impl TimetrackView {
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(rgba(0x3a3a4aff))
-                                .text_color(rgb(0xc8c8d8))
+                                .text_color(rgba(theme::STRONG_TEXT))
                                 .child("Archive")
                                 .on_click(move |_ev, _window, cx| {
                                     if let Some(entity) = entity.clone() {
@@ -2680,8 +2705,8 @@ impl TimetrackView {
                                 .py_1()
                                 .rounded_md()
                                 .cursor_pointer()
-                                .bg(rgba(0x2ea04366))
-                                .text_color(rgb(0xc8c8d8))
+                                .bg(rgba(theme::ACTION_FADED))
+                                .text_color(rgba(theme::STRONG_TEXT))
                                 .child("Unarchive")
                                 .on_click(move |_ev, _window, cx| {
                                     if let Some(entity) = entity.clone() {
@@ -2707,7 +2732,7 @@ impl TimetrackView {
                     .pt_2()
                     .pb_1()
                     .text_sm()
-                    .text_color(rgb(0x7a7a90))
+                    .text_color(rgba(theme::MUTED_TEXT))
                     .child("PROJECTS   (this week · all time)"),
             )
             .child(div().flex().flex_col().children(rows))
@@ -2732,14 +2757,14 @@ impl TimetrackView {
             .rounded_md()
             .cursor_pointer()
             .bg(if selected {
-                rgba(0x2a2a3aff)
+                rgba(theme::RAISED_BG)
             } else {
                 rgba(0x00000000)
             })
             .text_color(if selected {
                 rgb(0xffffff)
             } else {
-                rgb(0x7a7a90)
+                rgba(theme::MUTED_TEXT)
             })
             .child(label)
             .when_some(entity, move |el, entity| {
@@ -2769,7 +2794,11 @@ impl TimetrackView {
             .py_1()
             .rounded_md()
             .bg(rgba(0x3a3a4aff))
-            .text_color(if active { rgb(0xc8c8d8) } else { rgb(0x6a6a80) })
+            .text_color(if active {
+                rgba(theme::STRONG_TEXT)
+            } else {
+                rgba(theme::HINT_TEXT)
+            })
             .child(label);
         if active {
             button = button
@@ -2800,13 +2829,23 @@ impl TimetrackView {
             .py_2()
             .overflow_y_scroll();
 
-        body = body.child(div().text_sm().text_color(rgb(0x7a7a90)).child("EXPORT"));
-        body = body.child(div().pt_2().text_color(rgb(0xc8c8d8)).child(format!(
-            "{} entries · {} this week · {} all time",
-            self.snapshot.entries.len(),
-            timetrack_core::format_duration(self.snapshot.week.total_ms),
-            timetrack_core::format_duration(self.snapshot.total_ms),
-        )));
+        body = body.child(
+            div()
+                .text_sm()
+                .text_color(rgba(theme::MUTED_TEXT))
+                .child("EXPORT"),
+        );
+        body = body.child(
+            div()
+                .pt_2()
+                .text_color(rgba(theme::STRONG_TEXT))
+                .child(format!(
+                    "{} entries · {} this week · {} all time",
+                    self.snapshot.entries.len(),
+                    timetrack_core::format_duration(self.snapshot.week.total_ms),
+                    timetrack_core::format_duration(self.snapshot.total_ms),
+                )),
+        );
 
         // Scope plus anchor: the stepper and the typed day edit one shared
         // anchor, and all time visibly ignores it. The preview and the
@@ -2817,7 +2856,7 @@ impl TimetrackView {
             div()
                 .pt_4()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("SCOPE"),
         );
         {
@@ -2835,7 +2874,7 @@ impl TimetrackView {
             div()
                 .pt_3()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("ANCHOR"),
         );
         {
@@ -2848,7 +2887,7 @@ impl TimetrackView {
                     .text_color(if picker_active {
                         rgb(0xffffff)
                     } else {
-                        rgb(0x6a6a80)
+                        rgba(theme::HINT_TEXT)
                     })
                     .child(self.export_picker.period_label(&tz)),
             );
@@ -2869,14 +2908,14 @@ impl TimetrackView {
                 .py_1()
                 .rounded_md()
                 .bg(if self.export_picker.editing {
-                    rgba(0x2a2a3aff)
+                    rgba(theme::RAISED_BG)
                 } else {
                     rgba(0x00000000)
                 })
                 .text_color(if picker_active {
-                    rgb(0xe6e6f0)
+                    rgba(theme::BODY_TEXT)
                 } else {
-                    rgb(0x6a6a80)
+                    rgba(theme::HINT_TEXT)
                 })
                 .child(format!("day {field_text}"));
             if picker_active {
@@ -2901,7 +2940,7 @@ impl TimetrackView {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x6a6a80))
+                            .text_color(rgba(theme::HINT_TEXT))
                             .child("(YYYY-MM-DD)"),
                     ),
             );
@@ -2911,7 +2950,7 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("t type a day · [ previous period · ] next period"),
             );
         } else {
@@ -2919,12 +2958,17 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("anchor ignored for all time"),
             );
         }
         if let Some(err) = &self.export_picker.error {
-            body = body.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
 
         // The columns a CSV export will carry, shown as a header so the shape
@@ -2933,13 +2977,13 @@ impl TimetrackView {
             div()
                 .pt_4()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("CSV COLUMNS"),
         );
         body = body.child(
             div()
                 .pt_1()
-                .text_color(rgb(0x9a9ab0))
+                .text_color(rgba(theme::ROW_TEXT))
                 .child(timetrack_core::CSV_HEADER),
         );
 
@@ -2968,7 +3012,7 @@ impl TimetrackView {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .bg(rgb(0x2ea043))
+                        .bg(rgba(theme::ACTION))
                         .text_color(rgb(0xffffff))
                         .child(label)
                         .when_some(entity, move |el, entity| {
@@ -3000,7 +3044,7 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child(self.export_location_text()),
             );
         }
@@ -3012,7 +3056,7 @@ impl TimetrackView {
             div()
                 .pt_4()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("PREVIEW"),
         );
         let preview = export_preview_entries(
@@ -3034,7 +3078,7 @@ impl TimetrackView {
                     .flex()
                     .gap_3()
                     .py_1()
-                    .text_color(rgb(0x9a9ab0))
+                    .text_color(rgba(theme::ROW_TEXT))
                     .child(e.id.clone())
                     .child(project)
                     .child(timetrack_core::format_duration(e.duration_ms()))
@@ -3046,7 +3090,7 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child(format!("… and {} more", preview.len() - 20)),
             );
         }
@@ -3065,7 +3109,7 @@ impl TimetrackView {
                 .px_6()
                 .py_3()
                 .child(
-                    div().text_sm().text_color(rgb(0xc8c8d8)).child(
+                    div().text_sm().text_color(rgba(theme::STRONG_TEXT)).child(
                         self.status
                             .as_ref()
                             .map(|s| s.text.clone())
@@ -3079,7 +3123,7 @@ impl TimetrackView {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .bg(rgb(0x2ea043))
+                        .bg(rgba(theme::ACTION))
                         .text_color(rgb(0xffffff))
                         .on_click(move |_ev, _window, cx| {
                             this.update(cx, |view, cx| {
@@ -3095,7 +3139,7 @@ impl TimetrackView {
             .px_6()
             .py_2()
             .text_sm()
-            .text_color(rgb(0x6a6a80))
+            .text_color(rgba(theme::HINT_TEXT))
             .child(self.footer())
             .into_any_element()
     }
@@ -4342,3 +4386,5 @@ mod tabs;
 mod chrome;
 
 mod service;
+
+mod theme;
