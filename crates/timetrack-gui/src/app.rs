@@ -29,6 +29,7 @@
 
 use self::chrome::{maximize_glyph, titlebar_drag, window_button};
 use self::dialogs::entry::{DialogField, EntryDialog, SaveOutcome, resolve_save};
+use self::dialogs::project::{ProjectPrompt, ProjectSave, resolve_project_prompt};
 use self::keys::printable_char;
 use self::service::{Action, ExportRequest, Msg, export_request, now_ms, spawn_service_thread};
 use self::status::{StatusKind, StatusMsg, is_connection_notice};
@@ -209,44 +210,6 @@ fn delete_offer(snapshot: &Snapshot, selected: usize) -> Option<DeleteConfirm> {
         ),
         id: picked.id,
     })
-}
-
-/// The project prompt: one name field, for creating (`edit_id` none) or
-/// renaming (`edit_id` set, prefilled with the current name).
-///
-/// Plain keystroke editing like the other prompts, and likewise pure state
-/// so resolving is unit-testable without a window.
-#[derive(Debug, Clone)]
-struct ProjectPrompt {
-    edit_id: Option<String>,
-    /// The typed name. Prefilled when renaming, so saving untouched would
-    /// be a no-op the service round-trips harmlessly.
-    name: String,
-    error: Option<String>,
-}
-
-/// What saving a project prompt means.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProjectSave {
-    Create { name: String },
-    Update { id: String, name: String },
-}
-
-/// Resolve a project prompt. Empty stays open with an error rather than
-/// storing a label no picker could show; duplicates travel to the service,
-/// which owns name uniqueness and reports them typed.
-fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String> {
-    if prompt.name.trim().is_empty() {
-        return Err("enter a project name".to_string());
-    }
-    let name = prompt.name.trim().to_string();
-    match &prompt.edit_id {
-        None => Ok(ProjectSave::Create { name }),
-        Some(id) => Ok(ProjectSave::Update {
-            id: id.clone(),
-            name,
-        }),
-    }
 }
 
 /// Which prompt, if any, currently owns the keyboard.
@@ -3166,37 +3129,6 @@ mod tests {
             project_button_id("archive", "p7"),
             project_button_id("archive", "p7")
         );
-    }
-
-    // --- project prompt ---
-
-    #[test]
-    fn project_prompt_creates_or_renames() {
-        assert_eq!(
-            resolve_project_prompt(&project_prompt(None, "Work")),
-            Ok(ProjectSave::Create {
-                name: "Work".into()
-            })
-        );
-        assert_eq!(
-            resolve_project_prompt(&project_prompt(Some("p1"), "Deep Work")),
-            Ok(ProjectSave::Update {
-                id: "p1".into(),
-                name: "Deep Work".into()
-            })
-        );
-    }
-
-    #[test]
-    fn project_prompt_trims_and_refuses_empty() {
-        assert_eq!(
-            resolve_project_prompt(&project_prompt(None, "  Work  ")),
-            Ok(ProjectSave::Create {
-                name: "Work".into()
-            })
-        );
-        assert!(resolve_project_prompt(&project_prompt(None, "")).is_err());
-        assert!(resolve_project_prompt(&project_prompt(Some("p1"), "   ")).is_err());
     }
 
     // --- tabs and bars (§11) ---

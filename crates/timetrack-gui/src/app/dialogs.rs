@@ -14,3 +14,4 @@
 //! that is on screen.
 
 pub mod entry;
+pub mod project;
