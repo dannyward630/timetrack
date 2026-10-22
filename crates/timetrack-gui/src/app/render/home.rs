@@ -8,11 +8,25 @@
 //! The Home tab: the week total first, then quick add, then projects, then
 //! recent entries. Everything below the total is deliberately quieter.
 
-use super::super::{PROJECT_BAR_TRACK_PX, TimetrackView, bar_width};
+use super::super::TimetrackView;
 use super::super::{service::Action, theme};
 use gpui::prelude::*;
 use gpui::{ElementId, IntoElement, div, px, rgb, rgba};
 use timetrack_core::QUICK_ADD_MS;
+
+/// Width of the per-project bar track on Home.
+const PROJECT_BAR_TRACK_PX: f32 = 120.0;
+
+/// Bar fill width for one per-project row: longest fills the track.
+///
+/// Pure arithmetic so the proportion is unit-testable; the renderer only
+/// turns the number into pixels.
+fn bar_width(ms: i64, max_ms: i64) -> f32 {
+    if max_ms <= 0 {
+        return 0.0;
+    }
+    (ms.max(0) as f32 / max_ms as f32) * PROJECT_BAR_TRACK_PX
+}
 
 impl TimetrackView {
     /// Home: the week total first, then quick add, then projects, then recent
@@ -287,5 +301,19 @@ impl TimetrackView {
             .child("RECENT ENTRIES  (+ = QUICK ADD)")
             .child(div().flex().flex_col().children(rows))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bars_fill_the_track_proportionally() {
+        assert_eq!(bar_width(3_600_000, 3_600_000), PROJECT_BAR_TRACK_PX);
+        assert_eq!(bar_width(1_800_000, 3_600_000), PROJECT_BAR_TRACK_PX / 2.0);
+        assert_eq!(bar_width(0, 3_600_000), 0.0);
+        // No entries (or no time) anywhere: zero width, never NaN.
+        assert_eq!(bar_width(0, 0), 0.0);
     }
 }

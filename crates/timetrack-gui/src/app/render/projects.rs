@@ -9,10 +9,21 @@
 //! an archive action. Archived projects stay listed, because their history
 //! still counts (REQUIREMENTS §14).
 
-use super::super::{TimetrackView, project_button_id};
+use super::super::TimetrackView;
 use super::super::{service::Action, theme};
 use gpui::prelude::*;
-use gpui::{IntoElement, div, px, rgb, rgba};
+use gpui::{ElementId, IntoElement, div, px, rgb, rgba};
+
+/// The element id of one of a project's row buttons.
+///
+/// Built from the project id itself rather than from a number parsed out of
+/// it. The core mints ids as `p1`, `p2`, ..., so parsing the numeric suffix
+/// was unique in practice -- but any id that was not `p<digits>` fell back to
+/// `0`, which would have given two such projects the same element id, and
+/// gpui would have treated the second button as the first.
+fn project_button_id(kind: &'static str, project_id: &str) -> ElementId {
+    ElementId::from((ElementId::from(kind), project_id.to_string()))
+}
 
 impl TimetrackView {
     /// Projects: every project with its week and all-time totals, plus an
@@ -175,5 +186,38 @@ impl TimetrackView {
             .child(div().flex().flex_col().children(rows))
             .child(new_project)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_projects_never_share_a_button_element_id() {
+        // The old id parsed the numeric suffix out of the project id and
+        // fell back to 0 for anything else, so two ids that were not
+        // `p<digits>` would have collided.
+        assert_ne!(
+            project_button_id("archive", "p1"),
+            project_button_id("archive", "p2")
+        );
+        assert_ne!(
+            project_button_id("archive", "imported"),
+            project_button_id("archive", "other")
+        );
+        assert_ne!(
+            project_button_id("archive", "imported"),
+            project_button_id("unarchive", "imported"),
+            "the two buttons of one project must differ too"
+        );
+    }
+
+    #[test]
+    fn one_project_always_gets_the_same_button_element_id() {
+        assert_eq!(
+            project_button_id("archive", "p7"),
+            project_button_id("archive", "p7")
+        );
     }
 }

@@ -39,8 +39,8 @@ use self::status::{StatusKind, StatusMsg, is_connection_notice};
 use self::tabs::{Tab, cycle_tab};
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement, Render,
-    Styled, Window, div, rgba,
+    AsyncApp, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Render, Styled,
+    Window, div, rgba,
 };
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
@@ -114,31 +114,6 @@ fn which_prompt(
     } else {
         None
     }
-}
-
-/// The element id of one of a project's row buttons.
-///
-/// Built from the project id itself rather than from a number parsed out of
-/// it. The core mints ids as `p1`, `p2`, ..., so parsing the numeric suffix
-/// was unique in practice -- but any id that was not `p<digits>` fell back to
-/// `0`, which would have given two such projects the same element id, and
-/// gpui would have treated the second button as the first.
-fn project_button_id(kind: &'static str, project_id: &str) -> ElementId {
-    ElementId::from((ElementId::from(kind), project_id.to_string()))
-}
-
-/// Width of the per-project bar track on Home.
-const PROJECT_BAR_TRACK_PX: f32 = 120.0;
-
-/// Bar fill width for one per-project row: longest fills the track.
-///
-/// Pure arithmetic so the proportion is unit-testable; the renderer only
-/// turns the number into pixels.
-fn bar_width(ms: i64, max_ms: i64) -> f32 {
-    if max_ms <= 0 {
-        return 0.0;
-    }
-    (ms.max(0) as f32 / max_ms as f32) * PROJECT_BAR_TRACK_PX
 }
 
 pub struct TimetrackView {
@@ -1158,46 +1133,7 @@ mod tests {
         );
     }
 
-    // --- the project row buttons ---
-
-    #[test]
-    fn two_projects_never_share_a_button_element_id() {
-        // The old id parsed the numeric suffix out of the project id and
-        // fell back to 0 for anything else, so two ids that were not
-        // `p<digits>` would have collided.
-        assert_ne!(
-            project_button_id("archive", "p1"),
-            project_button_id("archive", "p2")
-        );
-        assert_ne!(
-            project_button_id("archive", "imported"),
-            project_button_id("archive", "other")
-        );
-        assert_ne!(
-            project_button_id("archive", "imported"),
-            project_button_id("unarchive", "imported"),
-            "the two buttons of one project must differ too"
-        );
-    }
-
-    #[test]
-    fn one_project_always_gets_the_same_button_element_id() {
-        assert_eq!(
-            project_button_id("archive", "p7"),
-            project_button_id("archive", "p7")
-        );
-    }
-
     // --- tabs and bars (§11) ---
-
-    #[test]
-    fn bars_fill_the_track_proportionally() {
-        assert_eq!(bar_width(3_600_000, 3_600_000), PROJECT_BAR_TRACK_PX);
-        assert_eq!(bar_width(1_800_000, 3_600_000), PROJECT_BAR_TRACK_PX / 2.0);
-        assert_eq!(bar_width(0, 3_600_000), 0.0);
-        // No entries (or no time) anywhere: zero width, never NaN.
-        assert_eq!(bar_width(0, 0), 0.0);
-    }
 
     #[test]
     fn an_export_request_names_one_period_everywhere() {
