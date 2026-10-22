@@ -9,3 +9,4 @@
 //! pipeline that writes a fetched CSV where the user confirms.
 
 pub mod picker;
+pub mod save;
