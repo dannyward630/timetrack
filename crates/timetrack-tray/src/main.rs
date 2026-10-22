@@ -178,14 +178,13 @@ impl TooltipState {
     }
 }
 
-/// Format milliseconds as `H:MM`. Hours are unpadded and unwrapped: a week
-/// may legally exceed 168h (§4) and must read as such, not wrap.
-fn format_hmm(ms: i64) -> String {
-    let mins = (ms / 60_000).max(0);
-    format!("{}:{:02}", mins / 60, mins % 60)
-}
-
 /// The tooltip body: the week total plus how many projects share it.
+///
+/// The total is formatted like the menu rows beside it -- the core's
+/// compact `1h 15m`. The tooltip used to have a formatter of its own
+/// (`1:15`), so the tray's two surfaces spelled the same duration two
+/// ways, and the one that was not in the core was the one that was not
+/// shared.
 fn tooltip_text(state: &TooltipState) -> String {
     let projects = if state.projects == 1 {
         "project"
@@ -194,7 +193,7 @@ fn tooltip_text(state: &TooltipState) -> String {
     };
     format!(
         "Week total {} · {} {projects}",
-        format_hmm(state.total_ms),
+        timetrack_core::format_compact(state.total_ms),
         state.projects
     )
 }
@@ -832,7 +831,7 @@ async fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         ConnState, MenuModel, TimetrackTray, TooltipState, build_menu_model, conn_state,
-        format_hmm, quick_add_label, tooltip_text,
+        quick_add_label, tooltip_text,
     };
     use ksni::Tray as _;
     use std::collections::HashMap;
@@ -902,7 +901,7 @@ mod tests {
         assert_eq!(tip.title, "TimeTrack");
         // No snapshot yet: the default summary reads zero, and the icon
         // sits idle rather than asking for attention.
-        assert_eq!(tip.description, "Week total 0:00 · 0 projects");
+        assert_eq!(tip.description, "Week total 0m · 0 projects");
         assert_eq!(tray.status(), ksni::Status::Active);
     }
 
@@ -1323,19 +1322,31 @@ mod tests {
         assert!(!find_standard(sub, "Nothing to delete").enabled);
         // And the icon idles on a zero total.
         assert_eq!(tray.status(), ksni::Status::Active);
-        assert_eq!(tray.tool_tip().description, "Week total 0:00 · 0 projects");
+        assert_eq!(tray.tool_tip().description, "Week total 0m · 0 projects");
     }
 
     #[test]
     fn week_total_formats_as_h_mm() {
         // Unpadded, unwrapped hours: a week may legally exceed 168h (§4).
-        assert_eq!(format_hmm(0), "0:00");
-        assert_eq!(format_hmm(5 * 60_000), "0:05");
-        assert_eq!(format_hmm(60 * 60_000), "1:00");
-        assert_eq!(format_hmm(75 * 60_000), "1:15");
-        assert_eq!(format_hmm(25 * 3_600_000), "25:00");
-        assert_eq!(format_hmm(100 * 3_600_000), "100:00");
-        assert_eq!(format_hmm(-1), "0:00");
+    }
+
+    #[test]
+    fn the_tooltip_and_the_menu_spell_a_duration_the_same_way() {
+        // The tray had a formatter of its own for the tooltip, so the same
+        // duration read `1:15` in the tooltip and `1h 15m` in the menu --
+        // and the one that was not in the core was the one that was not
+        // shared.
+        let total = 75 * 60_000;
+        let text = tooltip_text(&super::TooltipState {
+            total_ms: total,
+            projects: 1,
+            attention: false,
+        });
+        let menu = timetrack_core::format_compact(total);
+        assert!(
+            text.contains(&menu),
+            "the tooltip and the menu agree: {text} vs {menu}"
+        );
     }
 
     #[test]
@@ -1347,9 +1358,9 @@ mod tests {
                 attention: false,
             })
         };
-        assert_eq!(text(90 * 60_000, 2), "Week total 1:30 · 2 projects");
-        assert_eq!(text(60 * 60_000, 1), "Week total 1:00 · 1 project");
-        assert_eq!(text(0, 0), "Week total 0:00 · 0 projects");
+        assert_eq!(text(90 * 60_000, 2), "Week total 1h 30m · 2 projects");
+        assert_eq!(text(60 * 60_000, 1), "Week total 1h · 1 project");
+        assert_eq!(text(0, 0), "Week total 0m · 0 projects");
     }
 
     #[test]
@@ -1375,7 +1386,10 @@ mod tests {
         let mut tray = tray();
         tray.set_summary(state);
         assert_eq!(tray.status(), ksni::Status::Active);
-        assert_eq!(tray.tool_tip().description, "Week total 1:30 · 2 projects");
+        assert_eq!(
+            tray.tool_tip().description,
+            "Week total 1h 30m · 2 projects"
+        );
     }
 
     #[test]
@@ -1394,7 +1408,7 @@ mod tests {
         let mut tray = tray();
         tray.set_summary(state);
         assert_eq!(tray.status(), ksni::Status::NeedsAttention);
-        assert_eq!(tray.tool_tip().description, "Week total 25:00 · 1 project");
+        assert_eq!(tray.tool_tip().description, "Week total 25h · 1 project");
     }
 
     #[test]
@@ -1478,7 +1492,10 @@ mod tests {
             attention: false,
         });
         assert_eq!(tray.status(), ksni::Status::Active);
-        assert_eq!(tray.tool_tip().description, "Week total 1:30 · 2 projects");
+        assert_eq!(
+            tray.tool_tip().description,
+            "Week total 1h 30m · 2 projects"
+        );
     }
 
     #[test]
@@ -1573,7 +1590,7 @@ mod tests {
         // The undo row is still enabled: the undo map is intact.
         assert_eq!(undo_row(&items, "Work"), ("Undo quick-add".into(), true));
         // The tooltip and the icon still answer.
-        assert_eq!(tray.tool_tip().description, "Week total 0:00 · 0 projects");
+        assert_eq!(tray.tool_tip().description, "Week total 0m · 0 projects");
         assert_eq!(tray.status(), ksni::Status::Active);
         // And the setters still write through a poisoned lock.
         tray.set_summary(TooltipState {
@@ -1581,6 +1598,9 @@ mod tests {
             projects: 2,
             attention: false,
         });
-        assert_eq!(tray.tool_tip().description, "Week total 1:30 · 2 projects");
+        assert_eq!(
+            tray.tool_tip().description,
+            "Week total 1h 30m · 2 projects"
+        );
     }
 }
