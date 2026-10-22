@@ -14,5 +14,6 @@
 //! that is on screen.
 
 pub mod entry;
+pub mod merge;
 pub mod project;
 pub mod split;
