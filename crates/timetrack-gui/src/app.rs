@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-//! The main window, and the bridge to the service.
+//! The main window. The bridge to the service -- the messages, the commands
+//! and the thread that owns the bus connection -- is in `service.rs`.
 //!
 //! GPUI is single-threaded and owns the UI, but zbus is async, so the two meet
 //! across a thread boundary: a background thread owns an async-io runtime and
@@ -26,461 +27,23 @@
 //! There is no timer state here, because there is none in the model. The Home
 //! tab's primary control is the 5/15/30/60 quick-add row.
 
+use self::chrome::{maximize_glyph, titlebar_drag, window_button};
+use self::keys::printable_char;
+use self::service::{Action, ExportRequest, Msg, export_request, now_ms, spawn_service_thread};
+use self::status::{StatusKind, StatusMsg, is_connection_notice};
+use self::tabs::{Tab, cycle_tab};
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement,
-    MouseButton, Render, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
-    rgb, rgba,
+    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement, Render,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px, rgb, rgba,
 };
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
-use timetrack_proto::{ClientError, ProjectView, Snapshot, no_service_hint, version_mismatch_hint};
+use timetrack_proto::{ProjectView, Snapshot};
 
 /// How often the service is polled for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(1000);
-
-/// A message handed from the service thread to the UI thread.
-///
-/// Snapshots do not travel here: they have their own bounded channel (see
-/// `spawn_service_thread`), because they are the one kind of message that
-/// can be dropped without losing anything.
-enum Msg {
-    Error(StatusMsg),
-    /// A success worth showing (e.g. where an export was written). Snapshots
-    /// never clear feedback, so this survives until the next action.
-    Status(String),
-    /// An export save completed: the footer status plus where the bytes went
-    /// and whether the portal granted it, so the Export tab can label a
-    /// chosen path differently from the direct fallback.
-    ExportSaved {
-        status: String,
-        dest: String,
-        via_portal: bool,
-    },
-    /// An action succeeded. Snapshots never clear feedback (they arrive
-    /// every second and would make errors unreadable), so success arrives as
-    /// its own message that dismisses the previous error.
-    ActionOk,
-}
-
-/// What an export save needs: the typed scope plus the paths and labels
-/// derived from it. Bundles the five `ExportCsv` fields so the click site,
-/// the action and the service thread pass one value instead of five loose
-/// strings (the scope stays typed end to end — nothing re-parses it).
-#[derive(Debug, Clone)]
-struct ExportRequest {
-    scope: timetrack_core::ExportScope,
-    /// Direct-save fallback path when no portal answers.
-    path: String,
-    /// `None` is the old scope-only call; `Some` the scope-plus-anchor call.
-    anchor_ms: Option<i64>,
-    period_id: String,
-    /// Period-stamped name prefilled in the save dialog.
-    suggested_name: String,
-}
-
-/// Build the request for one export button, from one anchor and one zone.
-///
-/// Everything the request names -- the period, the file name, the fallback
-/// path -- is derived together, so the file cannot be called `...-W41.csv`
-/// while holding a different week. The destination used to be computed at
-/// render time and captured in the click closure, so a zone that changed
-/// between the last paint and the click put the file in a directory named
-/// for a different week.
-fn export_request(
-    scope: timetrack_core::ExportScope,
-    anchor_ms: i64,
-    now: i64,
-    tz: &timetrack_core::Tz,
-) -> ExportRequest {
-    ExportRequest {
-        scope,
-        path: default_export_path(scope, anchor_ms, tz),
-        anchor_ms: export_anchor_for_save(scope, anchor_ms, now, tz),
-        period_id: export_period_label(scope, anchor_ms, tz),
-        suggested_name: export_suggested_name(scope, anchor_ms, tz),
-    }
-}
-
-/// A command the UI wants performed. The service thread owns the bus
-/// connection, so the UI cannot issue D-Bus calls itself.
-#[derive(Debug, Clone)]
-enum Action {
-    /// Method 4: one of the fixed buckets, ending now.
-    QuickAdd { project: String, ms: i64 },
-    /// Remove the entry a quick add created.
-    UndoQuickAdd(String),
-    /// Explicit deletion.
-    DeleteEntry(String),
-    /// Archive a project, keeping its history in totals.
-    ArchiveProject(String),
-    /// Reverse an archive, making the project selectable again.
-    UnarchiveProject(String),
-    /// Create a project.
-    AddProject(String),
-    /// Rename a project. Colour is untouched: the GUI names projects, the
-    /// CLI recolours them (§11).
-    UpdateProject { id: String, name: String },
-    /// Method 1: an explicit start and end (the manual-entry dialog).
-    AddEntry {
-        project: String,
-        description: String,
-        started_at: i64,
-        ended_at: i64,
-    },
-    /// Move an entry's endpoints (the dialog's edit mode). Never deletes.
-    SetTimes {
-        id: String,
-        started_at: i64,
-        ended_at: i64,
-    },
-    /// Edit an entry's description (the dialog's edit mode).
-    SetText { id: String, description: String },
-    /// Split one entry in two at a moment (REQUIREMENTS §8). Lossless: the
-    /// halves cover exactly the original interval.
-    SplitEntry { id: String, at_ms: i64 },
-    /// Merge entries into their union (REQUIREMENTS §8). Overlapping entries
-    /// collapse, so the total can shrink -- the view confirms with the amount
-    /// before sending this.
-    MergeEntries { ids: Vec<String> },
-    /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
-    /// the CSV over D-Bus, asks the system save dialog where to put it, and
-    /// writes it there: `anchor_ms` selects which week or month when `Some`
-    /// (the scope-plus-anchor call), while `None` keeps the old scope-only
-    /// call for all time and current scopes so old services keep serving
-    /// them. `suggested_name` is the period-stamped name prefilled in the
-    /// dialog; `path` is the direct-save fallback when no portal answers.
-    /// `period_id` feeds the saved status line.
-    ExportCsv(ExportRequest),
-    /// Launch the service. From a host build this asks the session bus to
-    /// activate it, which works when a D-Bus activation file is installed;
-    /// the AppImage starts its bundled service on launch, so the bus
-    /// already owns the name there.
-    StartService,
-}
-
-/// What happened to a snapshot offered to the view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Offered {
-    /// It is queued.
-    Queued,
-    /// The view is behind, so the snapshot was dropped.
-    Dropped,
-    /// The window is gone.
-    Gone,
-}
-
-/// Offer a snapshot to the view.
-///
-/// The queue holds one snapshot. A view that stops draining -- a hidden
-/// window, a long paint -- must not make the queue grow without bound, and
-/// the snapshot waiting there is already stale, so a new one is dropped
-/// rather than queued behind it. The next tick's arrives and the view
-/// catches up.
-fn offer_snapshot(tx: &SyncSender<Snapshot>, s: Snapshot) -> Offered {
-    match tx.try_send(s) {
-        Ok(()) => Offered::Queued,
-        Err(std::sync::mpsc::TrySendError::Full(_)) => Offered::Dropped,
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Offered::Gone,
-    }
-}
-
-/// Spawn the service thread.
-///
-/// Returns `(snapshots_rx, messages_rx, actions_tx)`.
-///
-/// The two channels back to the view are different on purpose.
-///
-/// **Snapshots** are bounded. They arrive about once a second and the view
-/// drains them every 300 ms, so a view that stops draining -- a hidden
-/// window, a long paint -- must not make the queue grow without bound. A
-/// snapshot a second old is worth nothing, so the queue holds one and a
-/// newer one is dropped rather than queued behind it; the next tick's
-/// arrives and the view catches up.
-///
-/// **Messages** -- errors, statuses, the result of an action -- are
-/// unbounded and never dropped. Those are the service's refusals and the
-/// user's intentions, and losing one would be a lie.
-fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Sender<Action>) {
-    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (action_tx, action_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // zbus uses the async-io backend (see the workspace Cargo.toml for why
-        // that is not optional), so the bus is driven with `async_io::block_on`
-        // on this dedicated thread rather than from a gpui future. gpui's
-        // executor threads have no zbus-compatible reactor, and zbus'
-        // `spawn_blocking` would panic there.
-        async_io::block_on(async move {
-            // Wait for the service, but keep retrying: the user may start it
-            // after the window opens, and the GUI should recover on its own.
-            //
-            // The reported message distinguishes "not there" from "there but
-            // speaking a different interface". Those need different fixes, and
-            // a version mismatch between the GUI and the service is otherwise
-            // indistinguishable from the service being absent. The two cases
-            // sort by error variant in `ClientError`, never by message text.
-            let mut last_error: Option<StatusMsg> = None;
-            let client = loop {
-                match timetrack_proto::Client::connect().await {
-                    Ok(c) => break c,
-                    Err(e) => {
-                        // At startup any bus failure presents as the service
-                        // being unreachable; once connected, failures triage
-                        // precisely by variant. The detail rides along in
-                        // parens, as it always has.
-                        let note = StatusMsg {
-                            text: format!("{}\n\n({e})", no_service_hint()),
-                            kind: StatusKind::NoService,
-                        };
-                        if last_error.as_ref() != Some(&note) {
-                            last_error = Some(note.clone());
-                            let _ = tx.send(Msg::Error(note));
-                        }
-                    }
-                }
-                // Poll briskly: this is a bus round trip to a local process,
-                // and a short backoff means a service started after the window
-                // is picked up almost immediately rather than seconds later.
-                async_io::Timer::after(Duration::from_millis(500)).await;
-            };
-
-            loop {
-                // Drain queued commands first, then refresh once. Batching
-                // them means one bus round trip per tick, not per click.
-                loop {
-                    match action_rx.try_recv() {
-                        Ok(Action::QuickAdd { project, ms }) => {
-                            report(&tx, client.quick_add(&project, ms).await.map(|_| ()));
-                        }
-                        Ok(Action::UndoQuickAdd(id)) => {
-                            report(&tx, client.undo_quick_add(&id).await.map(|_| ()));
-                        }
-                        Ok(Action::DeleteEntry(id)) => {
-                            report(&tx, client.delete_entry(&id).await.map(|_| ()));
-                        }
-                        Ok(Action::ArchiveProject(id)) => {
-                            report(&tx, client.set_archived(&id, true).await.map(|_| ()));
-                        }
-                        Ok(Action::UnarchiveProject(id)) => {
-                            report(&tx, client.set_archived(&id, false).await.map(|_| ()));
-                        }
-                        Ok(Action::AddProject(name)) => {
-                            report(&tx, client.add_project(&name).await.map(|_| ()));
-                        }
-                        Ok(Action::UpdateProject { id, name }) => {
-                            // Colour keeps its value: -1 is the service's
-                            // keep sentinel.
-                            report(&tx, client.update_project(&id, &name, -1).await.map(|_| ()));
-                        }
-                        Ok(Action::AddEntry {
-                            project,
-                            description,
-                            started_at,
-                            ended_at,
-                        }) => {
-                            report(
-                                &tx,
-                                client
-                                    .add(&project, &description, started_at, ended_at)
-                                    .await
-                                    .map(|_| ()),
-                            );
-                        }
-                        Ok(Action::SetTimes {
-                            id,
-                            started_at,
-                            ended_at,
-                        }) => {
-                            report(
-                                &tx,
-                                client
-                                    .set_times(&id, started_at, ended_at)
-                                    .await
-                                    .map(|_| ()),
-                            );
-                        }
-                        Ok(Action::SetText { id, description }) => {
-                            report(&tx, client.set_text(&id, &description).await.map(|_| ()));
-                        }
-                        Ok(Action::SplitEntry { id, at_ms }) => {
-                            report(&tx, client.split(&id, at_ms).await.map(|_| ()));
-                        }
-                        Ok(Action::MergeEntries { ids }) => {
-                            report(&tx, client.merge(&ids).await.map(|_| ()));
-                        }
-                        Ok(Action::ExportCsv(req)) => {
-                            // The service refusal stays typed; a local write
-                            // failure is a local note, not a service error.
-                            // All time and current scopes travel over the old
-                            // scope-only call (`None`), so old services keep
-                            // serving them; only a chosen week or month needs
-                            // the scope-plus-anchor call, which against an old
-                            // service refuses with a version message rather
-                            // than writing a wrong file.
-                            let scope_str = req.scope.as_str().to_string();
-                            let fetched = match req.anchor_ms {
-                                Some(at) => client.export_csv_at(&scope_str, at).await,
-                                None => client.export_csv(&scope_str).await,
-                            };
-                            match fetched {
-                                Ok(csv) => {
-                                    // The save dialog is the user's, and it
-                                    // can stay open for as long as they
-                                    // like. Awaiting it here would stop this
-                                    // thread from serving anything else --
-                                    // no snapshot, no quick-add -- until they
-                                    // answered, and the window would look
-                                    // frozen over a frozen data set.
-                                    //
-                                    // So the dialog and the write happen on
-                                    // their own thread, and the result comes
-                                    // back over the same channel.
-                                    let tx = tx.clone();
-                                    std::thread::spawn(move || {
-                                        async_io::block_on(async move {
-                                            save_export(tx, csv, req).await;
-                                        });
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
-                                }
-                            }
-                        }
-                        Ok(Action::StartService) => {
-                            // Calling a method is what triggers D-Bus
-                            // activation; `Client::connect` just asks for a
-                            // proxy, so make a real call to force the bus to
-                            // start the service if it can.
-                            report(&tx, client.snapshot().await.map(|_| ()));
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        // The window is gone; nothing left to do.
-                        Err(TryRecvError::Disconnected) => return,
-                    }
-                }
-                match client.snapshot().await {
-                    Ok(s) => {
-                        match offer_snapshot(&snapshot_tx, s) {
-                            Offered::Queued | Offered::Dropped => {}
-                            // The window is gone: nothing left to do.
-                            Offered::Gone => return,
-                        }
-                    }
-                    Err(e) => {
-                        if tx.send(Msg::Error(StatusMsg::from(&e))).is_err() {
-                            return;
-                        }
-                    }
-                }
-                async_io::Timer::after(REFRESH).await;
-            }
-        });
-    });
-    (snapshot_rx, rx, action_tx)
-}
-
-/// What kind of problem a status line reports.
-///
-/// The kind drives behaviour -- a missing service offers to start it, and
-/// only connection notices clear on recovery -- so it travels with the text
-/// rather than being re-parsed out of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusKind {
-    /// Nothing owns the service name.
-    NoService,
-    /// The service answered unknown-interface or unknown-method.
-    VersionMismatch,
-    /// The service refused an action; the text is its own wording.
-    Service,
-    /// Local UI notes and bus-level failures, not service refusals.
-    Local,
-}
-
-/// Whether a status is a connection notice: one that a snapshot proves over.
-///
-/// The "service is not running" and "different versions" notices describe the
-/// connection rather than one action, so the first snapshot that arrives
-/// clears them -- the service is back, or it is speaking this client's
-/// interface now. An ordinary error is about one action and survives until
-/// the next one, because snapshots arrive every second and would otherwise
-/// make it unreadable.
-fn is_connection_notice(kind: StatusKind) -> bool {
-    matches!(kind, StatusKind::NoService | StatusKind::VersionMismatch)
-}
-
-/// The footer status line: what to show, and what kind of problem it is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StatusMsg {
-    text: String,
-    kind: StatusKind,
-}
-
-impl StatusMsg {
-    /// A local UI note or bus-level failure: shown as-is, never offered the
-    /// start-service action, and dismissed by the next action's success.
-    fn local(text: impl Into<String>) -> Self {
-        StatusMsg {
-            text: text.into(),
-            kind: StatusKind::Local,
-        }
-    }
-}
-
-impl From<&ClientError> for StatusMsg {
-    /// Map a call failure to footer text without matching on message text:
-    /// the variant decides both the wording and the kind.
-    fn from(error: &ClientError) -> Self {
-        match error {
-            ClientError::NoService => StatusMsg {
-                text: no_service_hint(),
-                kind: StatusKind::NoService,
-            },
-            ClientError::VersionMismatch { .. } => StatusMsg {
-                text: version_mismatch_hint("GUI"),
-                kind: StatusKind::VersionMismatch,
-            },
-            ClientError::Service(service) => StatusMsg {
-                text: service.to_string(),
-                kind: StatusKind::Service,
-            },
-            ClientError::Transport(detail) => StatusMsg {
-                text: detail.clone(),
-                kind: StatusKind::Local,
-            },
-        }
-    }
-}
-
-/// Forward a command outcome to the UI, keeping the error typed.
-///
-/// The kind travels with the text so the view never has to recognise a
-/// failure by sniffing its wording.
-fn report(tx: &Sender<Msg>, outcome: std::result::Result<(), ClientError>) {
-    match outcome {
-        Ok(()) => {
-            let _ = tx.send(Msg::ActionOk);
-        }
-        Err(e) => {
-            let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
-        }
-    }
-}
-
-/// The current time, in milliseconds since the epoch.
-///
-/// The GUI needs its own clock reading only to parse what the user typed
-/// ("-90", "now", "09:30" are relative to here), exactly like the CLI does.
-/// The service re-validates the absolute instants, so a skew between the two
-/// clocks can mistime an entry but never store an invalid one.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 /// The snapshot's zone: prefer the name, fall back to the fixed offset for
 /// old services that send no name.
@@ -1175,43 +738,6 @@ fn shift_export_anchor(
     scope.shift(anchor_ms, delta, tz)
 }
 
-/// The three tabs (REQUIREMENTS §13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Home,
-    Projects,
-    Export,
-}
-
-impl Tab {
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Home => "Home",
-            Tab::Projects => "Projects",
-            Tab::Export => "Export",
-        }
-    }
-
-    fn all() -> [Tab; 3] {
-        [Tab::Home, Tab::Projects, Tab::Export]
-    }
-}
-
-/// The tab after Tab / Shift+Tab from `current`, wrapping around both ends.
-///
-/// Free of the view so the cycle order is unit-testable: the key handler
-/// only forwards the shift state.
-fn cycle_tab(current: Tab, backward: bool) -> Tab {
-    let tabs = Tab::all();
-    let at = tabs.iter().position(|t| *t == current).unwrap_or(0);
-    let next = if backward {
-        (at + tabs.len() - 1) % tabs.len()
-    } else {
-        (at + 1) % tabs.len()
-    };
-    tabs[next]
-}
-
 /// Width of the per-project bar track on Home.
 const PROJECT_BAR_TRACK_PX: f32 = 120.0;
 
@@ -1893,12 +1419,9 @@ impl TimetrackView {
                 // Printable text, and only that: with control, alt or the
                 // platform modifier held the keystroke is a shortcut, not
                 // input, and key_char of a special key must not leak in.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        if let Some(dlg) = self.dialog.as_mut() {
-                            dlg.type_text(ch);
-                        }
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(dlg) = self.dialog.as_mut() {
+                        dlg.type_text(ch);
                     }
                 }
             }
@@ -1995,13 +1518,10 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the other
                 // prompts, so shortcuts never leak into the name.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        if let Some(prompt) = self.project_prompt.as_mut() {
-                            prompt.name.push_str(ch);
-                            prompt.error = None;
-                        }
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(prompt) = self.project_prompt.as_mut() {
+                        prompt.name.push_str(ch);
+                        prompt.error = None;
                     }
                 }
             }
@@ -2067,13 +1587,10 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the dialog, so
                 // shortcuts and special keys never leak into the moment.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        if let Some(prompt) = self.split_prompt.as_mut() {
-                            prompt.at.push_str(ch);
-                            prompt.error = None;
-                        }
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(prompt) = self.split_prompt.as_mut() {
+                        prompt.at.push_str(ch);
+                        prompt.error = None;
                     }
                 }
             }
@@ -2232,16 +1749,6 @@ impl TimetrackView {
         self.export_picker.step(delta, &tz);
     }
 
-    /// The Export tab's location line: a portal grant names its chosen path,
-    /// anything else keeps the home-directory wording.
-    fn export_location_text(&self) -> String {
-        export_location_text(
-            self.export_last_dest
-                .as_deref()
-                .map(|dest| (dest, self.export_last_via_portal)),
-        )
-    }
-
     /// Handle a key press while the anchor day field is open. Always returns
     /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_anchor_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
@@ -2260,11 +1767,8 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the dialogs, so
                 // shortcuts and special keys never leak into the day.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        self.export_picker.type_text(ch);
-                    }
+                if let Some(ch) = printable_char(ev) {
+                    self.export_picker.type_text(ch);
                 }
             }
         }
@@ -2373,7 +1877,7 @@ impl Render for TimetrackView {
             .flex()
             .flex_col()
             .size_full()
-            .text_color(rgb(0xe6e6f0))
+            .text_color(rgba(theme::BODY_TEXT))
             .on_key_down(move |ev, _window, cx| {
                 // `update` alone never repaints: it only runs the closure,
                 // and a frame is scheduled solely by `notify`. Without it a
@@ -2392,7 +1896,7 @@ impl Render for TimetrackView {
                     .flex_col()
                     .flex_1()
                     .w_full()
-                    .bg(rgb(0x11111b))
+                    .bg(rgba(theme::WINDOW_BG))
                     .when(!maximized, |el| el.rounded_xl().overflow_hidden())
                     .child(self.render_titlebar(window))
                     // The prompt panels sit above the tab content, so a prompt
@@ -2410,68 +1914,6 @@ impl Render for TimetrackView {
     }
 }
 
-/// A region of the integrated titlebar that drags the undecorated window.
-///
-/// Left-drag moves the window, right-click opens the window menu, and a
-/// double-click toggles maximize, like a system title bar. The platform
-/// ignores `window_control_area` on Linux, so the move starts here
-/// explicitly; where the marker is honoured it does the same job.
-fn titlebar_drag(id: &'static str, stretch: bool, label: &str) -> impl IntoElement {
-    let mut region = div()
-        .id(ElementId::from(id))
-        .px_2()
-        .py_1()
-        .text_sm()
-        .text_color(rgb(0x7a7a90))
-        .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(MouseButton::Left, |_, window, _| {
-            window.start_window_move();
-        })
-        .on_mouse_down(MouseButton::Right, |ev, window, _| {
-            window.show_window_menu(ev.position);
-        })
-        .on_click(|ev, window, _| {
-            if ev.click_count() == 2 {
-                window.zoom_window();
-            }
-        });
-    if stretch {
-        region = region.flex_1();
-    }
-    region.child(label.to_string())
-}
-
-/// The maximize button's glyph: a square to expand, nested squares to
-/// restore, following the window's current state.
-fn maximize_glyph(is_maximized: bool) -> &'static str {
-    if is_maximized { "▣" } else { "□" }
-}
-
-/// One of the integrated window controls: minimize, maximize or close.
-///
-/// Neutral grey, never the action green (which the smoke check counts), with
-/// the close glyph in red. The `window_control_area` marker is honoured on
-/// platforms with native hit-testing; the click handler below is what acts on
-/// Linux, where the marker is ignored.
-fn window_button(
-    id: &'static str,
-    label: &str,
-    area: WindowControlArea,
-    danger: bool,
-    on_click: impl Fn(&mut Window) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(ElementId::from(id))
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(if danger { rgb(0xe06c75) } else { rgb(0x9a9ab0) })
-        .child(label.to_string())
-        .window_control_area(area)
-        .on_click(move |_, window, _| on_click(window))
-}
-
 impl TimetrackView {
     /// The integrated titlebar: the window has no system title bar (see
     /// `main.rs`), so this row is the drag handle, the tab strip and the
@@ -2487,7 +1929,7 @@ impl TimetrackView {
             .gap_1()
             .px_3()
             .py_2()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             // The panel clip does not round children, so the titlebar
             // rounds its own top to meet the panel's corners. Square when
             // maximized, like the panel itself.
@@ -2503,14 +1945,14 @@ impl TimetrackView {
                     .rounded_md()
                     .cursor_pointer()
                     .bg(if is_selected {
-                        rgba(0x2a2a3aff)
+                        rgba(theme::RAISED_BG)
                     } else {
                         rgba(0x00000000)
                     })
                     .text_color(if is_selected {
                         rgb(0xffffff)
                     } else {
-                        rgb(0x7a7a90)
+                        rgba(theme::MUTED_TEXT)
                     })
                     .child(tab.label())
                     .when(!is_selected, move |el| {
@@ -2575,15 +2017,20 @@ impl TimetrackView {
                     .text_color(rgb(0xffffff))
                     .child(timetrack_core::format_duration(week.total_ms)),
             )
-            .child(div().text_sm().text_color(rgb(0x7a7a90)).child(format!(
-                "this week · {} {}",
-                week.entry_count,
-                if week.entry_count == 1 {
-                    "entry"
-                } else {
-                    "entries"
-                }
-            )));
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgba(theme::MUTED_TEXT))
+                    .child(format!(
+                        "this week · {} {}",
+                        week.entry_count,
+                        if week.entry_count == 1 {
+                            "entry"
+                        } else {
+                            "entries"
+                        }
+                    )),
+            );
 
         // A day over 24h is legal data, but it usually means a mistyped
         // interval, so it is worth saying (REQUIREMENTS §4). Built as a div
@@ -2592,7 +2039,7 @@ impl TimetrackView {
             .px_6()
             .pb_1()
             .text_sm()
-            .text_color(rgb(0xd29922))
+            .text_color(rgba(theme::WARNING))
             .child(if self.snapshot.over_24h_days.is_empty() {
                 String::new()
             } else {
@@ -2668,7 +2115,7 @@ impl TimetrackView {
                         .text_color(if focused {
                             rgb(0xffffff)
                         } else {
-                            rgb(0x7a7a90)
+                            rgba(theme::MUTED_TEXT)
                         })
                         .child(format!("{} {label}", if focused { ">" } else { " " })),
                 )
@@ -2679,17 +2126,17 @@ impl TimetrackView {
                         .py_1()
                         .rounded_md()
                         .bg(if focused {
-                            rgba(0x2a2a3aff)
+                            rgba(theme::RAISED_BG)
                         } else {
                             rgba(0x00000000)
                         })
-                        .text_color(rgb(0xe6e6f0))
+                        .text_color(rgba(theme::BODY_TEXT))
                         .child(format!("{value}{}", if focused { "_" } else { "" })),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0x6a6a80))
+                        .text_color(rgba(theme::HINT_TEXT))
                         .child(hint.to_string()),
                 )
         };
@@ -2703,8 +2150,8 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
-            .child(div().text_color(rgb(0x7fd3ff)).child(title))
+            .bg(rgba(theme::PANEL_BG))
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
             .child(field_row(
                 "what",
                 &dlg.description,
@@ -2727,11 +2174,16 @@ impl TimetrackView {
                 div()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("type to edit · tab next field · enter save · esc cancel"),
             );
         if let Some(err) = &dlg.error {
-            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
         panel
     }
@@ -2748,10 +2200,10 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             .child(
                 div()
-                    .text_color(rgb(0x7fd3ff))
+                    .text_color(rgba(theme::ACCENT))
                     .child(format!("SPLIT ENTRY {}", prompt.entry_id)),
             )
             .child(
@@ -2767,14 +2219,14 @@ impl TimetrackView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgba(0x2a2a3aff))
-                            .text_color(rgb(0xe6e6f0))
+                            .bg(rgba(theme::RAISED_BG))
+                            .text_color(rgba(theme::BODY_TEXT))
                             .child(format!("{}_", prompt.at)),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x6a6a80))
+                            .text_color(rgba(theme::HINT_TEXT))
                             .child("(-90, 90, now, HH:MM)"),
                     ),
             )
@@ -2782,11 +2234,16 @@ impl TimetrackView {
                 div()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("type a moment · enter split · esc cancel"),
             );
         if let Some(err) = &prompt.error {
-            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
         panel
     }
@@ -2805,10 +2262,10 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             .child(
                 div()
-                    .text_color(rgb(0x7fd3ff))
+                    .text_color(rgba(theme::ACCENT))
                     .child(confirm.summary.clone()),
             )
     }
@@ -2825,10 +2282,10 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
+            .bg(rgba(theme::PANEL_BG))
             .child(
                 div()
-                    .text_color(rgb(0x7fd3ff))
+                    .text_color(rgba(theme::ACCENT))
                     .child(confirm.summary.clone()),
             )
     }
@@ -2849,8 +2306,8 @@ impl TimetrackView {
             .rounded_md()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a26))
-            .child(div().text_color(rgb(0x7fd3ff)).child(title))
+            .bg(rgba(theme::PANEL_BG))
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
             .child(
                 div()
                     .flex()
@@ -2864,14 +2321,14 @@ impl TimetrackView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgba(0x2a2a3aff))
-                            .text_color(rgb(0xe6e6f0))
+                            .bg(rgba(theme::RAISED_BG))
+                            .text_color(rgba(theme::BODY_TEXT))
                             .child(format!("{}_", prompt.name)),
                     )
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x6a6a80))
+                            .text_color(rgba(theme::HINT_TEXT))
                             .child("a short name, e.g. Work"),
                     ),
             )
@@ -2879,11 +2336,16 @@ impl TimetrackView {
                 div()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("type a name · enter save · esc cancel"),
             );
         if let Some(err) = &prompt.error {
-            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
         panel
     }
@@ -2897,7 +2359,12 @@ impl TimetrackView {
             .unwrap_or_else(|| "no project".into());
 
         let mut row = div().flex().items_center().gap_2().px_6().py_3();
-        row = row.child(div().text_sm().text_color(rgb(0x7a7a90)).child("add time"));
+        row = row.child(
+            div()
+                .text_sm()
+                .text_color(rgba(theme::MUTED_TEXT))
+                .child("add time"),
+        );
         for ms in QUICK_ADD_MS {
             let target = project_id.clone();
             row = row.child(
@@ -2906,7 +2373,7 @@ impl TimetrackView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x2ea043))
+                    .bg(rgba(theme::ACTION))
                     .text_color(rgb(0xffffff))
                     // With no project there is nothing to attribute the time
                     // to, so the button is present but inert rather than
@@ -2931,7 +2398,7 @@ impl TimetrackView {
         row.child(
             div()
                 .text_sm()
-                .text_color(rgb(0x9a9ab0))
+                .text_color(rgba(theme::ROW_TEXT))
                 .child(format!("→ {project_name}")),
         )
     }
@@ -2963,7 +2430,7 @@ impl TimetrackView {
             list = list.child(
                 div()
                     .py_2()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("No projects yet — add one on the Projects tab."),
             );
         }
@@ -2977,7 +2444,7 @@ impl TimetrackView {
                     .child(
                         div()
                             .flex_1()
-                            .text_color(rgb(0xc8c8d8))
+                            .text_color(rgba(theme::STRONG_TEXT))
                             .child(name.to_string()),
                     )
                     // A bar proportional to the longest row (§11), so the
@@ -2987,19 +2454,19 @@ impl TimetrackView {
                             .w(px(PROJECT_BAR_TRACK_PX))
                             .h(px(8.))
                             .rounded_md()
-                            .bg(rgb(0x2a2a3a))
+                            .bg(rgba(theme::RAISED_BG))
                             .child(
                                 div()
                                     .w(px(bar_width(ms, max_ms)))
                                     .h_full()
                                     .rounded_md()
-                                    .bg(rgb(0x7fd3ff)),
+                                    .bg(rgba(theme::ACCENT)),
                             ),
                     )
                     .child(
                         div()
                             .w(px(110.))
-                            .text_color(rgb(0x7fd3ff))
+                            .text_color(rgba(theme::ACCENT))
                             .child(timetrack_core::format_duration(ms)),
                     ),
             );
@@ -3011,7 +2478,7 @@ impl TimetrackView {
                     .px_6()
                     .pt_2()
                     .text_sm()
-                    .text_color(rgb(0x7a7a90))
+                    .text_color(rgba(theme::MUTED_TEXT))
                     .child("THIS WEEK BY PROJECT"),
             )
             .child(div().px_6().child(list))
@@ -3023,7 +2490,7 @@ impl TimetrackView {
             return div()
                 .px_6()
                 .py_3()
-                .text_color(rgb(0x6a6a80))
+                .text_color(rgba(theme::HINT_TEXT))
                 .child("Nothing tracked yet — press 1 to add 5 minutes.")
                 .into_any_element();
         }
@@ -3046,13 +2513,13 @@ impl TimetrackView {
                 .px_6()
                 .py_1()
                 .bg(if selected {
-                    rgba(0x2a2a3aff)
+                    rgba(theme::RAISED_BG)
                 } else {
                     rgba(0x00000000)
                 })
                 // A quick-add is marked so it is visibly distinct from
                 // hand-entered time, and so `u` reads as "undo that".
-                .child(div().w_4().text_color(rgb(0x2ea043)).child(
+                .child(div().w_4().text_color(rgba(theme::ACTION)).child(
                     if e.source == timetrack_proto::EntrySource::QuickAdd {
                         "+"
                     } else {
@@ -3062,19 +2529,19 @@ impl TimetrackView {
                 .child(
                     div()
                         .w(px(110.))
-                        .text_color(rgb(0x7fd3ff))
+                        .text_color(rgba(theme::ACCENT))
                         .child(timetrack_core::format_duration(e.duration_ms())),
                 )
                 .child(
                     div()
                         .w(px(160.))
-                        .text_color(rgb(0x9a9ab0))
+                        .text_color(rgba(theme::ROW_TEXT))
                         .child(project_name(&e.project_id)),
                 )
                 .child(
                     div()
                         .flex_1()
-                        .text_color(rgb(0xe6e6f0))
+                        .text_color(rgba(theme::BODY_TEXT))
                         .child(e.label().to_string()),
                 )
         });
@@ -3084,7 +2551,7 @@ impl TimetrackView {
             .pt_2()
             .pb_1()
             .text_sm()
-            .text_color(rgb(0x7a7a90))
+            .text_color(rgba(theme::MUTED_TEXT))
             .child("RECENT ENTRIES  (+ = QUICK ADD)")
             .child(div().flex().flex_col().children(rows))
             .into_any_element()
@@ -3106,7 +2573,7 @@ impl TimetrackView {
                 .py_2()
                 .rounded_md()
                 .cursor_pointer()
-                .bg(rgba(0x2ea043ff))
+                .bg(rgba(theme::ACTION))
                 .text_color(rgb(0xffffff))
                 .child("New project")
                 .when_some(entity, |this, entity| {
@@ -3127,7 +2594,7 @@ impl TimetrackView {
                 .py_4()
                 .child(
                     div()
-                        .text_color(rgb(0x6a6a80))
+                        .text_color(rgba(theme::HINT_TEXT))
                         .child("No projects yet — create one to start tracking time."),
                 )
                 .child(new_project)
@@ -3144,7 +2611,7 @@ impl TimetrackView {
             let name = p.name.clone();
             // The project's colour, if it has one, else the neutral row grey:
             // recolours set from the CLI show up here without another action.
-            let dot = rgb(p.colour.unwrap_or(0x7a7a90));
+            let dot = theme::project_colour(p.colour);
             div()
                 .flex()
                 .items_center()
@@ -3156,9 +2623,9 @@ impl TimetrackView {
                     div()
                         .flex_1()
                         .text_color(if p.archived {
-                            rgb(0x6a6a80)
+                            rgba(theme::HINT_TEXT)
                         } else {
-                            rgb(0xe6e6f0)
+                            rgba(theme::BODY_TEXT)
                         })
                         .child(if p.archived {
                             format!("{name}  (archived)")
@@ -3169,13 +2636,13 @@ impl TimetrackView {
                 .child(
                     div()
                         .w(px(110.))
-                        .text_color(rgb(0x7fd3ff))
+                        .text_color(rgba(theme::ACCENT))
                         .child(timetrack_core::format_duration(week)),
                 )
                 .child(
                     div()
                         .w(px(110.))
-                        .text_color(rgb(0x7a7a90))
+                        .text_color(rgba(theme::MUTED_TEXT))
                         .child(timetrack_core::format_duration(all)),
                 )
                 // Archiving is offered only for live projects; an archived one
@@ -3193,7 +2660,7 @@ impl TimetrackView {
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(rgba(0x3a3a4aff))
-                                .text_color(rgb(0xc8c8d8))
+                                .text_color(rgba(theme::STRONG_TEXT))
                                 .child("Archive")
                                 .on_click(move |_ev, _window, cx| {
                                     if let Some(entity) = entity.clone() {
@@ -3217,8 +2684,8 @@ impl TimetrackView {
                                 .py_1()
                                 .rounded_md()
                                 .cursor_pointer()
-                                .bg(rgba(0x2ea04366))
-                                .text_color(rgb(0xc8c8d8))
+                                .bg(rgba(theme::ACTION_FADED))
+                                .text_color(rgba(theme::STRONG_TEXT))
                                 .child("Unarchive")
                                 .on_click(move |_ev, _window, cx| {
                                     if let Some(entity) = entity.clone() {
@@ -3244,7 +2711,7 @@ impl TimetrackView {
                     .pt_2()
                     .pb_1()
                     .text_sm()
-                    .text_color(rgb(0x7a7a90))
+                    .text_color(rgba(theme::MUTED_TEXT))
                     .child("PROJECTS   (this week · all time)"),
             )
             .child(div().flex().flex_col().children(rows))
@@ -3269,14 +2736,14 @@ impl TimetrackView {
             .rounded_md()
             .cursor_pointer()
             .bg(if selected {
-                rgba(0x2a2a3aff)
+                rgba(theme::RAISED_BG)
             } else {
                 rgba(0x00000000)
             })
             .text_color(if selected {
                 rgb(0xffffff)
             } else {
-                rgb(0x7a7a90)
+                rgba(theme::MUTED_TEXT)
             })
             .child(label)
             .when_some(entity, move |el, entity| {
@@ -3306,7 +2773,11 @@ impl TimetrackView {
             .py_1()
             .rounded_md()
             .bg(rgba(0x3a3a4aff))
-            .text_color(if active { rgb(0xc8c8d8) } else { rgb(0x6a6a80) })
+            .text_color(if active {
+                rgba(theme::STRONG_TEXT)
+            } else {
+                rgba(theme::HINT_TEXT)
+            })
             .child(label);
         if active {
             button = button
@@ -3337,13 +2808,23 @@ impl TimetrackView {
             .py_2()
             .overflow_y_scroll();
 
-        body = body.child(div().text_sm().text_color(rgb(0x7a7a90)).child("EXPORT"));
-        body = body.child(div().pt_2().text_color(rgb(0xc8c8d8)).child(format!(
-            "{} entries · {} this week · {} all time",
-            self.snapshot.entries.len(),
-            timetrack_core::format_duration(self.snapshot.week.total_ms),
-            timetrack_core::format_duration(self.snapshot.total_ms),
-        )));
+        body = body.child(
+            div()
+                .text_sm()
+                .text_color(rgba(theme::MUTED_TEXT))
+                .child("EXPORT"),
+        );
+        body = body.child(
+            div()
+                .pt_2()
+                .text_color(rgba(theme::STRONG_TEXT))
+                .child(format!(
+                    "{} entries · {} this week · {} all time",
+                    self.snapshot.entries.len(),
+                    timetrack_core::format_duration(self.snapshot.week.total_ms),
+                    timetrack_core::format_duration(self.snapshot.total_ms),
+                )),
+        );
 
         // Scope plus anchor: the stepper and the typed day edit one shared
         // anchor, and all time visibly ignores it. The preview and the
@@ -3354,7 +2835,7 @@ impl TimetrackView {
             div()
                 .pt_4()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("SCOPE"),
         );
         {
@@ -3372,7 +2853,7 @@ impl TimetrackView {
             div()
                 .pt_3()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("ANCHOR"),
         );
         {
@@ -3385,7 +2866,7 @@ impl TimetrackView {
                     .text_color(if picker_active {
                         rgb(0xffffff)
                     } else {
-                        rgb(0x6a6a80)
+                        rgba(theme::HINT_TEXT)
                     })
                     .child(self.export_picker.period_label(&tz)),
             );
@@ -3406,14 +2887,14 @@ impl TimetrackView {
                 .py_1()
                 .rounded_md()
                 .bg(if self.export_picker.editing {
-                    rgba(0x2a2a3aff)
+                    rgba(theme::RAISED_BG)
                 } else {
                     rgba(0x00000000)
                 })
                 .text_color(if picker_active {
-                    rgb(0xe6e6f0)
+                    rgba(theme::BODY_TEXT)
                 } else {
-                    rgb(0x6a6a80)
+                    rgba(theme::HINT_TEXT)
                 })
                 .child(format!("day {field_text}"));
             if picker_active {
@@ -3438,7 +2919,7 @@ impl TimetrackView {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x6a6a80))
+                            .text_color(rgba(theme::HINT_TEXT))
                             .child("(YYYY-MM-DD)"),
                     ),
             );
@@ -3448,7 +2929,7 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("t type a day · [ previous period · ] next period"),
             );
         } else {
@@ -3456,12 +2937,17 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child("anchor ignored for all time"),
             );
         }
         if let Some(err) = &self.export_picker.error {
-            body = body.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
         }
 
         // The columns a CSV export will carry, shown as a header so the shape
@@ -3470,13 +2956,13 @@ impl TimetrackView {
             div()
                 .pt_4()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("CSV COLUMNS"),
         );
         body = body.child(
             div()
                 .pt_1()
-                .text_color(rgb(0x9a9ab0))
+                .text_color(rgba(theme::ROW_TEXT))
                 .child(timetrack_core::CSV_HEADER),
         );
 
@@ -3505,7 +2991,7 @@ impl TimetrackView {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .bg(rgb(0x2ea043))
+                        .bg(rgba(theme::ACTION))
                         .text_color(rgb(0xffffff))
                         .child(label)
                         .when_some(entity, move |el, entity| {
@@ -3537,8 +3023,12 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
-                    .child(self.export_location_text()),
+                    .text_color(rgba(theme::HINT_TEXT))
+                    .child(export_location_text(
+                        self.export_last_dest
+                            .as_deref()
+                            .map(|dest| (dest, self.export_last_via_portal)),
+                    )),
             );
         }
 
@@ -3549,7 +3039,7 @@ impl TimetrackView {
             div()
                 .pt_4()
                 .text_sm()
-                .text_color(rgb(0x7a7a90))
+                .text_color(rgba(theme::MUTED_TEXT))
                 .child("PREVIEW"),
         );
         let preview = export_preview_entries(
@@ -3571,7 +3061,7 @@ impl TimetrackView {
                     .flex()
                     .gap_3()
                     .py_1()
-                    .text_color(rgb(0x9a9ab0))
+                    .text_color(rgba(theme::ROW_TEXT))
                     .child(e.id.clone())
                     .child(project)
                     .child(timetrack_core::format_duration(e.duration_ms()))
@@ -3583,7 +3073,7 @@ impl TimetrackView {
                 div()
                     .pt_1()
                     .text_sm()
-                    .text_color(rgb(0x6a6a80))
+                    .text_color(rgba(theme::HINT_TEXT))
                     .child(format!("… and {} more", preview.len() - 20)),
             );
         }
@@ -3602,7 +3092,7 @@ impl TimetrackView {
                 .px_6()
                 .py_3()
                 .child(
-                    div().text_sm().text_color(rgb(0xc8c8d8)).child(
+                    div().text_sm().text_color(rgba(theme::STRONG_TEXT)).child(
                         self.status
                             .as_ref()
                             .map(|s| s.text.clone())
@@ -3616,7 +3106,7 @@ impl TimetrackView {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .bg(rgb(0x2ea043))
+                        .bg(rgba(theme::ACTION))
                         .text_color(rgb(0xffffff))
                         .on_click(move |_ev, _window, cx| {
                             this.update(cx, |view, cx| {
@@ -3632,7 +3122,7 @@ impl TimetrackView {
             .px_6()
             .py_2()
             .text_sm()
-            .text_color(rgb(0x6a6a80))
+            .text_color(rgba(theme::HINT_TEXT))
             .child(self.footer())
             .into_any_element()
     }
@@ -3640,8 +3130,9 @@ impl TimetrackView {
 
 #[cfg(test)]
 mod tests {
+    use super::testsupport::*;
     use super::*;
-    use timetrack_proto::{ClientError, EntrySource, EntryView, ServiceError};
+    use timetrack_proto::{EntrySource, EntryView};
 
     #[test]
     fn quick_add_buckets_are_5_15_30_60() {
@@ -3649,29 +3140,6 @@ mod tests {
         // to the core constant must break this test rather than the UI.
         let mins: Vec<i64> = QUICK_ADD_MS.iter().map(|m| m / 60_000).collect();
         assert_eq!(mins, [5, 15, 30, 60]);
-    }
-
-    #[test]
-    fn there_are_exactly_three_tabs() {
-        assert_eq!(Tab::all().len(), 3);
-        assert_eq!(Tab::all()[0], Tab::Home);
-    }
-
-    #[test]
-    fn tab_labels_match_the_requirements() {
-        assert_eq!(Tab::Home.label(), "Home");
-        assert_eq!(Tab::Projects.label(), "Projects");
-        assert_eq!(Tab::Export.label(), "Export");
-    }
-
-    #[test]
-    fn every_tab_has_a_distinct_label() {
-        // Two tabs sharing a label would make the strip ambiguous.
-        let labels: Vec<&str> = Tab::all().iter().map(|t| t.label()).collect();
-        let mut sorted = labels.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), labels.len());
     }
 
     #[test]
@@ -3685,39 +3153,6 @@ mod tests {
         for e in &snap.entries {
             // Every entry carries a real end, never an Option.
             let _: i64 = e.ended_at;
-        }
-    }
-
-    fn entry(id: &str, source: EntrySource, start: i64) -> EntryView {
-        EntryView {
-            id: id.into(),
-            project_id: "p1".into(),
-            description: id.into(),
-            started_at: start,
-            ended_at: start + 3_600_000,
-            source,
-            note: None,
-        }
-    }
-
-    fn project(id: &str, name: &str) -> ProjectView {
-        ProjectView {
-            id: id.into(),
-            name: name.into(),
-            colour: None,
-            archived: false,
-        }
-    }
-
-    fn entry_on(id: &str, project: &str, start: i64, end: i64) -> EntryView {
-        EntryView {
-            id: id.into(),
-            project_id: project.into(),
-            description: id.into(),
-            started_at: start,
-            ended_at: end,
-            source: EntrySource::Manual,
-            note: None,
         }
     }
 
@@ -3745,10 +3180,6 @@ mod tests {
     }
 
     // --- the manual-entry dialog ---
-
-    fn new_dialog() -> EntryDialog {
-        EntryDialog::new("p1".into(), "Work".into())
-    }
 
     #[test]
     fn a_new_dialog_prefills_end_at_now() {
@@ -3908,91 +3339,7 @@ mod tests {
 
     // --- typed status kinds (no string parsing) ---
 
-    fn status_for(error: &ClientError) -> StatusMsg {
-        StatusMsg::from(error)
-    }
-
-    #[test]
-    fn no_service_offers_to_start_it() {
-        let note = status_for(&ClientError::NoService);
-        assert_eq!(note.kind, StatusKind::NoService);
-        assert!(
-            note.text.contains("not running"),
-            "must keep the start-service wording: {}",
-            note.text
-        );
-    }
-
-    #[test]
-    fn version_mismatch_names_the_fix() {
-        let note = status_for(&ClientError::VersionMismatch {
-            name: "org.freedesktop.DBus.Error.UnknownInterface".into(),
-        });
-        assert_eq!(note.kind, StatusKind::VersionMismatch);
-        assert!(
-            note.text.contains("different versions"),
-            "must keep the reinstall wording: {}",
-            note.text
-        );
-    }
-
-    #[test]
-    fn refusals_show_the_services_own_wording() {
-        // Backward-compatible strings, dispatched by variant.
-        let note = status_for(&ClientError::Service(ServiceError::Rule(
-            timetrack_core::RuleError::NotQuickAdd("e1".into()),
-        )));
-        assert_eq!(note.kind, StatusKind::Service);
-        assert_eq!(
-            note.text,
-            "entry 'e1' was not created by a quick add, so it cannot be undone"
-        );
-    }
-
-    #[test]
-    fn hostile_names_never_steer_dispatch() {
-        // A project literally named after an error state must still land in
-        // the Service bucket: dispatch keys on the variant, never on the
-        // text it happens to contain.
-        for name in [
-            "org.freedesktop.DBus.Error.UnknownInterface",
-            "the service is not running, honestly",
-            "ServiceUnknown",
-        ] {
-            let note = status_for(&ClientError::Service(ServiceError::Rule(
-                timetrack_core::RuleError::DuplicateProject(name.into()),
-            )));
-            assert_eq!(
-                note.kind,
-                StatusKind::Service,
-                "project name {name:?} must not steer dispatch"
-            );
-            assert!(
-                note.text.contains(name),
-                "wording must survive: {}",
-                note.text
-            );
-        }
-    }
-
-    #[test]
-    fn transport_failures_are_local_notes() {
-        let note = status_for(&ClientError::Transport("d-bus wobble".into()));
-        assert_eq!(note.kind, StatusKind::Local);
-        assert_eq!(note.text, "d-bus wobble");
-    }
-
     // --- split prompt ---
-
-    fn split_prompt(at: &str) -> SplitPrompt {
-        SplitPrompt {
-            entry_id: "e1".into(),
-            started_at: 0,
-            ended_at: 3_600_000,
-            at: at.into(),
-            error: None,
-        }
-    }
 
     #[test]
     fn split_resolves_an_interior_moment() {
@@ -4021,21 +3368,6 @@ mod tests {
     }
 
     // --- merge confirmation ---
-
-    fn merge_snapshot() -> Snapshot {
-        // e1 [0h,1h] and e2 [0.5h,1.5h] overlap on p1; e3 is disjoint on p1;
-        // e4 overlaps e1 but lives on p2 and must never join.
-        Snapshot {
-            entries: vec![
-                entry_on("e1", "p1", 0, 3_600_000),
-                entry_on("e2", "p1", 1_800_000, 5_400_000),
-                entry_on("e3", "p1", 10 * 3_600_000, 11 * 3_600_000),
-                entry_on("e4", "p2", 0, 3_600_000),
-            ],
-            projects: vec![project("p1", "Work"), project("p2", "Home")],
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn merge_targets_are_the_overlapping_same_project_entries() {
@@ -4149,30 +3481,6 @@ mod tests {
         assert!(!is_connection_notice(StatusKind::Local));
     }
 
-    // --- the snapshot queue ---
-
-    #[test]
-    fn a_snapshot_is_dropped_rather_than_queued_behind_a_stale_one() {
-        // The queue holds one. A view that stops draining must not make it
-        // grow, so a newer snapshot is dropped rather than queued behind the
-        // stale one -- and the next tick's takes its place.
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        assert_eq!(offer_snapshot(&tx, Snapshot::default()), Offered::Queued);
-        assert_eq!(offer_snapshot(&tx, Snapshot::default()), Offered::Dropped);
-        assert!(
-            rx.try_recv().is_ok(),
-            "the one that got there is still there"
-        );
-        assert!(rx.try_recv().is_err(), "and it is the only one");
-    }
-
-    #[test]
-    fn a_closed_view_is_told_the_window_is_gone() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        drop(rx);
-        assert_eq!(offer_snapshot(&tx, Snapshot::default()), Offered::Gone);
-    }
-
     // --- which prompt is open ---
 
     #[test]
@@ -4258,14 +3566,6 @@ mod tests {
 
     // --- project prompt ---
 
-    fn project_prompt(edit_id: Option<&str>, name: &str) -> ProjectPrompt {
-        ProjectPrompt {
-            edit_id: edit_id.map(str::to_string),
-            name: name.into(),
-            error: None,
-        }
-    }
-
     #[test]
     fn project_prompt_creates_or_renames() {
         assert_eq!(
@@ -4298,28 +3598,6 @@ mod tests {
     // --- tabs and bars (§11) ---
 
     #[test]
-    fn tab_cycles_forward_through_all_three() {
-        assert_eq!(cycle_tab(Tab::Home, false), Tab::Projects);
-        assert_eq!(cycle_tab(Tab::Projects, false), Tab::Export);
-        assert_eq!(cycle_tab(Tab::Export, false), Tab::Home);
-    }
-
-    #[test]
-    fn tab_cycles_backward_through_all_three() {
-        assert_eq!(cycle_tab(Tab::Home, true), Tab::Export);
-        assert_eq!(cycle_tab(Tab::Export, true), Tab::Projects);
-        assert_eq!(cycle_tab(Tab::Projects, true), Tab::Home);
-    }
-
-    #[test]
-    fn maximize_button_names_the_action_it_will_take() {
-        // A square to expand, nested squares to restore: the button always
-        // states what pressing it does, following the window's state.
-        assert_eq!(maximize_glyph(false), "□");
-        assert_eq!(maximize_glyph(true), "▣");
-    }
-
-    #[test]
     fn bars_fill_the_track_proportionally() {
         assert_eq!(bar_width(3_600_000, 3_600_000), PROJECT_BAR_TRACK_PX);
         assert_eq!(bar_width(1_800_000, 3_600_000), PROJECT_BAR_TRACK_PX / 2.0);
@@ -4329,14 +3607,6 @@ mod tests {
     }
 
     // --- export anchor picker (ticket #25) ---
-
-    fn utc_tz() -> timetrack_core::Tz {
-        timetrack_core::Tz::utc()
-    }
-
-    fn day_anchor(text: &str) -> i64 {
-        timetrack_core::parse_anchor_day(text, "anchor", &utc_tz()).unwrap()
-    }
 
     #[test]
     fn anchor_picker_defaults_to_this_week_at_now() {
@@ -4545,45 +3815,6 @@ mod tests {
     }
 
     // --- scoped preview plus honest interim save (ticket #26) ---
-
-    /// Three entries, newest first as the service sends them: one in
-    /// 2026-W40 (30 Sep) and two in 2026-W41 (6 and 7 Oct).
-    fn preview_snapshot() -> Snapshot {
-        Snapshot {
-            entries: vec![
-                entry_on(
-                    "e3",
-                    "p1",
-                    day_anchor("2026-10-07"),
-                    day_anchor("2026-10-07") + 3_600_000,
-                ),
-                entry_on(
-                    "e2",
-                    "p1",
-                    day_anchor("2026-10-06"),
-                    day_anchor("2026-10-06") + 3_600_000,
-                ),
-                entry_on(
-                    "e1",
-                    "p1",
-                    day_anchor("2026-09-30"),
-                    day_anchor("2026-09-30") + 3_600_000,
-                ),
-            ],
-            ..Default::default()
-        }
-    }
-
-    fn preview_ids(
-        snap: &Snapshot,
-        scope: timetrack_core::ExportScope,
-        anchor_ms: i64,
-    ) -> Vec<String> {
-        export_preview_entries(snap, scope, anchor_ms, &utc_tz())
-            .iter()
-            .map(|e| e.id.clone())
-            .collect()
-    }
 
     #[test]
     fn preview_lists_the_scoped_rows_oldest_first() {
@@ -5127,3 +4358,18 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
     }
 }
+
+#[cfg(test)]
+mod testsupport;
+
+mod status;
+
+mod tabs;
+
+mod chrome;
+
+mod keys;
+
+mod service;
+
+mod theme;
