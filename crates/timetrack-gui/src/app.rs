@@ -3640,6 +3640,7 @@ impl TimetrackView {
 
 #[cfg(test)]
 mod tests {
+    use super::testsupport::*;
     use super::*;
     use timetrack_proto::{ClientError, EntrySource, EntryView, ServiceError};
 
@@ -3688,39 +3689,6 @@ mod tests {
         }
     }
 
-    fn entry(id: &str, source: EntrySource, start: i64) -> EntryView {
-        EntryView {
-            id: id.into(),
-            project_id: "p1".into(),
-            description: id.into(),
-            started_at: start,
-            ended_at: start + 3_600_000,
-            source,
-            note: None,
-        }
-    }
-
-    fn project(id: &str, name: &str) -> ProjectView {
-        ProjectView {
-            id: id.into(),
-            name: name.into(),
-            colour: None,
-            archived: false,
-        }
-    }
-
-    fn entry_on(id: &str, project: &str, start: i64, end: i64) -> EntryView {
-        EntryView {
-            id: id.into(),
-            project_id: project.into(),
-            description: id.into(),
-            started_at: start,
-            ended_at: end,
-            source: EntrySource::Manual,
-            note: None,
-        }
-    }
-
     #[test]
     fn undo_targets_the_newest_quick_add() {
         let snap = Snapshot {
@@ -3745,10 +3713,6 @@ mod tests {
     }
 
     // --- the manual-entry dialog ---
-
-    fn new_dialog() -> EntryDialog {
-        EntryDialog::new("p1".into(), "Work".into())
-    }
 
     #[test]
     fn a_new_dialog_prefills_end_at_now() {
@@ -3908,10 +3872,6 @@ mod tests {
 
     // --- typed status kinds (no string parsing) ---
 
-    fn status_for(error: &ClientError) -> StatusMsg {
-        StatusMsg::from(error)
-    }
-
     #[test]
     fn no_service_offers_to_start_it() {
         let note = status_for(&ClientError::NoService);
@@ -3984,16 +3944,6 @@ mod tests {
 
     // --- split prompt ---
 
-    fn split_prompt(at: &str) -> SplitPrompt {
-        SplitPrompt {
-            entry_id: "e1".into(),
-            started_at: 0,
-            ended_at: 3_600_000,
-            at: at.into(),
-            error: None,
-        }
-    }
-
     #[test]
     fn split_resolves_an_interior_moment() {
         let utc = timetrack_core::Tz::utc();
@@ -4021,21 +3971,6 @@ mod tests {
     }
 
     // --- merge confirmation ---
-
-    fn merge_snapshot() -> Snapshot {
-        // e1 [0h,1h] and e2 [0.5h,1.5h] overlap on p1; e3 is disjoint on p1;
-        // e4 overlaps e1 but lives on p2 and must never join.
-        Snapshot {
-            entries: vec![
-                entry_on("e1", "p1", 0, 3_600_000),
-                entry_on("e2", "p1", 1_800_000, 5_400_000),
-                entry_on("e3", "p1", 10 * 3_600_000, 11 * 3_600_000),
-                entry_on("e4", "p2", 0, 3_600_000),
-            ],
-            projects: vec![project("p1", "Work"), project("p2", "Home")],
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn merge_targets_are_the_overlapping_same_project_entries() {
@@ -4258,14 +4193,6 @@ mod tests {
 
     // --- project prompt ---
 
-    fn project_prompt(edit_id: Option<&str>, name: &str) -> ProjectPrompt {
-        ProjectPrompt {
-            edit_id: edit_id.map(str::to_string),
-            name: name.into(),
-            error: None,
-        }
-    }
-
     #[test]
     fn project_prompt_creates_or_renames() {
         assert_eq!(
@@ -4329,14 +4256,6 @@ mod tests {
     }
 
     // --- export anchor picker (ticket #25) ---
-
-    fn utc_tz() -> timetrack_core::Tz {
-        timetrack_core::Tz::utc()
-    }
-
-    fn day_anchor(text: &str) -> i64 {
-        timetrack_core::parse_anchor_day(text, "anchor", &utc_tz()).unwrap()
-    }
 
     #[test]
     fn anchor_picker_defaults_to_this_week_at_now() {
@@ -4545,45 +4464,6 @@ mod tests {
     }
 
     // --- scoped preview plus honest interim save (ticket #26) ---
-
-    /// Three entries, newest first as the service sends them: one in
-    /// 2026-W40 (30 Sep) and two in 2026-W41 (6 and 7 Oct).
-    fn preview_snapshot() -> Snapshot {
-        Snapshot {
-            entries: vec![
-                entry_on(
-                    "e3",
-                    "p1",
-                    day_anchor("2026-10-07"),
-                    day_anchor("2026-10-07") + 3_600_000,
-                ),
-                entry_on(
-                    "e2",
-                    "p1",
-                    day_anchor("2026-10-06"),
-                    day_anchor("2026-10-06") + 3_600_000,
-                ),
-                entry_on(
-                    "e1",
-                    "p1",
-                    day_anchor("2026-09-30"),
-                    day_anchor("2026-09-30") + 3_600_000,
-                ),
-            ],
-            ..Default::default()
-        }
-    }
-
-    fn preview_ids(
-        snap: &Snapshot,
-        scope: timetrack_core::ExportScope,
-        anchor_ms: i64,
-    ) -> Vec<String> {
-        export_preview_entries(snap, scope, anchor_ms, &utc_tz())
-            .iter()
-            .map(|e| e.id.clone())
-            .collect()
-    }
 
     #[test]
     fn preview_lists_the_scoped_rows_oldest_first() {
@@ -5127,3 +5007,6 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
     }
 }
+
+#[cfg(test)]
+mod testsupport;
