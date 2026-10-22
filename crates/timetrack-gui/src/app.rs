@@ -1749,16 +1749,6 @@ impl TimetrackView {
         self.export_picker.step(delta, &tz);
     }
 
-    /// The Export tab's location line: a portal grant names its chosen path,
-    /// anything else keeps the home-directory wording.
-    fn export_location_text(&self) -> String {
-        export_location_text(
-            self.export_last_dest
-                .as_deref()
-                .map(|dest| (dest, self.export_last_via_portal)),
-        )
-    }
-
     /// Handle a key press while the anchor day field is open. Always returns
     /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_anchor_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
@@ -3034,7 +3024,11 @@ impl TimetrackView {
                     .pt_1()
                     .text_sm()
                     .text_color(rgba(theme::HINT_TEXT))
-                    .child(self.export_location_text()),
+                    .child(export_location_text(
+                        self.export_last_dest
+                            .as_deref()
+                            .map(|dest| (dest, self.export_last_via_portal)),
+                    )),
             );
         }
 
