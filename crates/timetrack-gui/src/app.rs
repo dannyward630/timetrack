@@ -28,6 +28,7 @@
 //! tab's primary control is the 5/15/30/60 quick-add row.
 
 use self::chrome::{maximize_glyph, titlebar_drag, window_button};
+use self::dialogs::delete::{DeleteConfirm, delete_offer};
 use self::dialogs::entry::{DialogField, EntryDialog, SaveOutcome, resolve_save};
 use self::dialogs::merge::{MergeConfirm, merge_offer};
 use self::dialogs::project::{ProjectPrompt, ProjectSave, resolve_project_prompt};
@@ -66,45 +67,6 @@ fn newest_quick_add(snap: &Snapshot) -> Option<String> {
         .iter()
         .find(|e| e.source == timetrack_proto::EntrySource::QuickAdd)
         .map(|e| e.id.clone())
-}
-
-/// A pending delete confirmation: the id to send, and the one-line summary
-/// the banner shows (entry, project, duration) so `d` can never remove time
-/// as a side effect of reaching for another key.
-#[derive(Debug, Clone)]
-struct DeleteConfirm {
-    id: String,
-    summary: String,
-}
-
-/// Build the delete confirmation for the selection, if there is one.
-///
-/// Free over the snapshot like `merge_offer`, for the same reason. The
-/// summary names the entry, its project and its duration so the confirm
-/// banner states exactly what would be lost.
-fn delete_offer(snapshot: &Snapshot, selected: usize) -> Option<DeleteConfirm> {
-    let picked = snapshot.entries.get(selected)?.clone();
-    let project = snapshot
-        .projects
-        .iter()
-        .find(|p| p.id == picked.project_id)
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| picked.project_id.clone());
-    let what = if picked.description.is_empty() {
-        "no note".to_string()
-    } else {
-        format!("'{}'", picked.description)
-    };
-    Some(DeleteConfirm {
-        summary: format!(
-            "DELETE {} ({} · {} · {})? d to confirm, esc to cancel",
-            picked.id,
-            project,
-            timetrack_core::format_duration(picked.duration_ms()),
-            what,
-        ),
-        id: picked.id,
-    })
 }
 
 /// Which prompt, if any, currently owns the keyboard.
@@ -2752,7 +2714,7 @@ impl TimetrackView {
 mod tests {
     use super::testsupport::*;
     use super::*;
-    use timetrack_proto::{EntrySource, EntryView};
+    use timetrack_proto::EntrySource;
 
     #[test]
     fn quick_add_buckets_are_5_15_30_60() {
@@ -2800,53 +2762,6 @@ mod tests {
     }
 
     // --- typed status kinds (no string parsing) ---
-
-    // --- delete confirmation ---
-
-    #[test]
-    fn delete_offer_names_the_entry_project_and_duration() {
-        let snap = Snapshot {
-            entries: vec![EntryView {
-                description: "review".into(),
-                ..entry_on("e1", "p1", 0, 3_600_000)
-            }],
-            projects: vec![project("p1", "Work")],
-            ..Default::default()
-        };
-        let offer = delete_offer(&snap, 0).expect("e1 is selected");
-        assert_eq!(offer.id, "e1");
-        assert!(
-            offer.summary.contains("DELETE e1"),
-            "must name the entry: {}",
-            offer.summary
-        );
-        assert!(
-            offer.summary.contains("Work"),
-            "must name the project: {}",
-            offer.summary
-        );
-        assert!(
-            offer.summary.contains("01:00:00"),
-            "must state the duration: {}",
-            offer.summary
-        );
-        assert!(
-            offer.summary.contains("d to confirm"),
-            "must state the confirm key: {}",
-            offer.summary
-        );
-    }
-
-    #[test]
-    fn delete_offer_is_none_without_a_selection() {
-        assert!(delete_offer(&Snapshot::default(), 0).is_none());
-        let snap = Snapshot {
-            entries: vec![entry_on("e1", "p1", 0, 3_600_000)],
-            projects: vec![project("p1", "Work")],
-            ..Default::default()
-        };
-        assert!(delete_offer(&snap, 99).is_none());
-    }
 
     #[test]
     fn only_connection_notices_are_cleared_by_a_snapshot() {

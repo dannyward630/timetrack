@@ -13,6 +13,7 @@
 //! renderer both ask, so a prompt that takes the keyboard is always one
 //! that is on screen.
 
+pub mod delete;
 pub mod entry;
 pub mod merge;
 pub mod project;
