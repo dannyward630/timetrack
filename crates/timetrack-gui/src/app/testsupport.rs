@@ -12,8 +12,11 @@
 //! at the bottom of `app.rs`. They are here instead, so a test that moves
 //! into a module of its own can still reach them.
 
+use super::dialogs::entry::EntryDialog;
+use super::dialogs::project::ProjectPrompt;
+use super::dialogs::split::SplitPrompt;
+use super::export::save::export_preview_entries;
 use super::status::StatusMsg;
-use super::{EntryDialog, ProjectPrompt, SplitPrompt, export_preview_entries};
 use timetrack_proto::{ClientError, EntrySource, EntryView, ProjectView, Snapshot};
 
 /// One entry on `p1`, an hour long, with the given source.
