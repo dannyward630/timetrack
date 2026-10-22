@@ -28,6 +28,7 @@
 //! tab's primary control is the 5/15/30/60 quick-add row.
 
 use self::chrome::{maximize_glyph, titlebar_drag, window_button};
+use self::keys::printable_char;
 use self::service::{Action, ExportRequest, Msg, export_request, now_ms, spawn_service_thread};
 use self::status::{StatusKind, StatusMsg, is_connection_notice};
 use self::tabs::{Tab, cycle_tab};
@@ -1418,12 +1419,9 @@ impl TimetrackView {
                 // Printable text, and only that: with control, alt or the
                 // platform modifier held the keystroke is a shortcut, not
                 // input, and key_char of a special key must not leak in.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        if let Some(dlg) = self.dialog.as_mut() {
-                            dlg.type_text(ch);
-                        }
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(dlg) = self.dialog.as_mut() {
+                        dlg.type_text(ch);
                     }
                 }
             }
@@ -1520,13 +1518,10 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the other
                 // prompts, so shortcuts never leak into the name.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        if let Some(prompt) = self.project_prompt.as_mut() {
-                            prompt.name.push_str(ch);
-                            prompt.error = None;
-                        }
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(prompt) = self.project_prompt.as_mut() {
+                        prompt.name.push_str(ch);
+                        prompt.error = None;
                     }
                 }
             }
@@ -1592,13 +1587,10 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the dialog, so
                 // shortcuts and special keys never leak into the moment.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        if let Some(prompt) = self.split_prompt.as_mut() {
-                            prompt.at.push_str(ch);
-                            prompt.error = None;
-                        }
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(prompt) = self.split_prompt.as_mut() {
+                        prompt.at.push_str(ch);
+                        prompt.error = None;
                     }
                 }
             }
@@ -1785,11 +1777,8 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the dialogs, so
                 // shortcuts and special keys never leak into the day.
-                let m = &ev.keystroke.modifiers;
-                if !m.control && !m.alt && !m.platform {
-                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
-                        self.export_picker.type_text(ch);
-                    }
+                if let Some(ch) = printable_char(ev) {
+                    self.export_picker.type_text(ch);
                 }
             }
         }
@@ -4384,6 +4373,8 @@ mod status;
 mod tabs;
 
 mod chrome;
+
+mod keys;
 
 mod service;
 
