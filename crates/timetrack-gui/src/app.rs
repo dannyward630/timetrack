@@ -27,6 +27,7 @@
 //! tab's primary control is the 5/15/30/60 quick-add row.
 
 use self::status::{StatusKind, StatusMsg, is_connection_notice};
+use self::tabs::{Tab, cycle_tab};
 use gpui::prelude::*;
 use gpui::{
     AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement,
@@ -1102,43 +1103,6 @@ fn shift_export_anchor(
     tz: &timetrack_core::Tz,
 ) -> i64 {
     scope.shift(anchor_ms, delta, tz)
-}
-
-/// The three tabs (REQUIREMENTS §13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Home,
-    Projects,
-    Export,
-}
-
-impl Tab {
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Home => "Home",
-            Tab::Projects => "Projects",
-            Tab::Export => "Export",
-        }
-    }
-
-    fn all() -> [Tab; 3] {
-        [Tab::Home, Tab::Projects, Tab::Export]
-    }
-}
-
-/// The tab after Tab / Shift+Tab from `current`, wrapping around both ends.
-///
-/// Free of the view so the cycle order is unit-testable: the key handler
-/// only forwards the shift state.
-fn cycle_tab(current: Tab, backward: bool) -> Tab {
-    let tabs = Tab::all();
-    let at = tabs.iter().position(|t| *t == current).unwrap_or(0);
-    let next = if backward {
-        (at + tabs.len() - 1) % tabs.len()
-    } else {
-        (at + 1) % tabs.len()
-    };
-    tabs[next]
 }
 
 /// Width of the per-project bar track on Home.
@@ -3582,29 +3546,6 @@ mod tests {
     }
 
     #[test]
-    fn there_are_exactly_three_tabs() {
-        assert_eq!(Tab::all().len(), 3);
-        assert_eq!(Tab::all()[0], Tab::Home);
-    }
-
-    #[test]
-    fn tab_labels_match_the_requirements() {
-        assert_eq!(Tab::Home.label(), "Home");
-        assert_eq!(Tab::Projects.label(), "Projects");
-        assert_eq!(Tab::Export.label(), "Export");
-    }
-
-    #[test]
-    fn every_tab_has_a_distinct_label() {
-        // Two tabs sharing a label would make the strip ambiguous.
-        let labels: Vec<&str> = Tab::all().iter().map(|t| t.label()).collect();
-        let mut sorted = labels.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), labels.len());
-    }
-
-    #[test]
     fn no_running_state_survives_anywhere() {
         // A regression guard: the stopwatch's running entry must not creep
         // back in, because there is no such thing any more (REQUIREMENTS §7).
@@ -4082,20 +4023,6 @@ mod tests {
     }
 
     // --- tabs and bars (§11) ---
-
-    #[test]
-    fn tab_cycles_forward_through_all_three() {
-        assert_eq!(cycle_tab(Tab::Home, false), Tab::Projects);
-        assert_eq!(cycle_tab(Tab::Projects, false), Tab::Export);
-        assert_eq!(cycle_tab(Tab::Export, false), Tab::Home);
-    }
-
-    #[test]
-    fn tab_cycles_backward_through_all_three() {
-        assert_eq!(cycle_tab(Tab::Home, true), Tab::Export);
-        assert_eq!(cycle_tab(Tab::Export, true), Tab::Projects);
-        assert_eq!(cycle_tab(Tab::Projects, true), Tab::Home);
-    }
 
     #[test]
     fn maximize_button_names_the_action_it_will_take() {
@@ -4871,3 +4798,5 @@ mod tests {
 mod testsupport;
 
 mod status;
+
+mod tabs;
