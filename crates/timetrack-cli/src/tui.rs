@@ -787,6 +787,17 @@ fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
 ///
 /// A pending delete confirmation outranks the message: it is the question
 /// the user has to answer before anything else happens.
+/// The key hints, shown in the footer when there is nothing else to say.
+///
+/// `u` undoes a *quick add*, and `a` is not one: it records a plain
+/// 30-minute entry, the same one the GUI's dialog would make with its end
+/// prefilled at now. Saying so here is the difference between a rule the
+/// user has to discover by pressing `u` and being refused, and a rule they
+/// can read.
+fn footer_hint() -> &'static str {
+    "1-4 quick add  a 30m  u undo quick add  d delete  j/k move  h/l project  q quit"
+}
+
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let (footer, style) = match &app.delete_confirm {
         Some(confirm) => (
@@ -796,7 +807,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
         None => match &app.status {
             Some(s) => (s.clone(), Style::default().fg(Color::DarkGray)),
             None => (
-                "1-4 quick add  a 30m  u undo  d delete  j/k move  h/l project  q quit".to_string(),
+                footer_hint().to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
         },
@@ -870,6 +881,18 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, client: Client)
 mod tests {
     use super::*;
     use timetrack_proto::{EntrySource, EntryView};
+
+    #[test]
+    fn the_footer_says_what_undo_removes() {
+        // `u` removes a quick add, not the 30 minutes `a` records. The
+        // footer is where the rules live when there is no key to press.
+        let hint = footer_hint();
+        assert!(
+            hint.contains("u undo quick add"),
+            "the footer says what undo removes: {hint}"
+        );
+        assert!(hint.contains("a 30m"), "the footer lists `a`: {hint}");
+    }
 
     /// An entry that started `start` ms ago. The service sends entries newest
     /// first, so a test that depends on that order must vary the start time.
