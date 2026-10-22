@@ -9,3 +9,4 @@
 //! latest snapshot the service produced.
 
 pub mod home;
+pub mod projects;
