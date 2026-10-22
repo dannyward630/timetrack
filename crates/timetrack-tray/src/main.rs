@@ -253,6 +253,18 @@ struct TimetrackTray {
     /// menu workers take the client out of it instead of opening a
     /// connection of their own.
     client: SharedClient,
+    /// The last action that failed, and why.
+    ///
+    /// The menu workers write it; the icon and the tooltip read it. Without
+    /// it a failed quick-add looked exactly like a successful one: the menu
+    /// did not change and the icon stayed healthy, so the only trace was a
+    /// line in a terminal that may not be open.
+    ///
+    /// Sticky until the next action succeeds -- unlike the connection
+    /// state, which the poll loop clears on the next good snapshot, and
+    /// rightly so: a failure is about one action, and a snapshot says
+    /// nothing about whether that action worked.
+    action_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Label for a quick-add bucket row, in minutes like the GUI and CLI buckets
@@ -270,6 +282,19 @@ fn quick_add_label(duration_ms: i64) -> String {
 /// caller goes on.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record the outcome of a menu action, so the icon and the tooltip can say
+/// what happened.
+///
+/// A failure used to reach the user only as a line on stderr, in a terminal
+/// that may not be open: the menu did not change and the icon stayed
+/// healthy, so a quick-add that failed looked exactly like one that worked.
+///
+/// The message is sticky until the next action succeeds -- unlike the
+/// connection state, which the poll loop clears on the next good snapshot.
+fn report_action(error: &Arc<Mutex<Option<String>>>, outcome: Option<&ClientError>) {
+    *lock(error) = outcome.map(|e| e.to_string());
 }
 
 /// Remember the entry a quick-add created, so undo (#10) targets exactly the
@@ -320,6 +345,7 @@ impl TimetrackTray {
             last_quick_add,
             shutdown,
             client,
+            action_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -377,6 +403,7 @@ impl TimetrackTray {
                     let project_id = project_id.clone();
                     let undo = tray.last_quick_add.clone();
                     let slot = tray.client.clone();
+                    let failed = tray.action_error.clone();
                     std::thread::spawn(move || {
                         let result: Result<timetrack_proto::EntryView, ClientError> =
                             async_io::block_on(async {
@@ -388,6 +415,7 @@ impl TimetrackTray {
                         match result {
                             Ok(entry) => {
                                 record_quick_add(&undo, &project_id, &entry.id);
+                                report_action(&failed, None);
                                 println!(
                                     "timetrack-tray: quick-added {} to {project_id} ({})",
                                     entry.id,
@@ -395,6 +423,7 @@ impl TimetrackTray {
                                 );
                             }
                             Err(e) => {
+                                report_action(&failed, Some(&e));
                                 eprintln!("timetrack-tray: quick add to {project_id} failed: {e}");
                             }
                         }
@@ -419,6 +448,7 @@ impl TimetrackTray {
                 let project_id = undo_project.clone();
                 let undo = tray.last_quick_add.clone();
                 let slot = tray.client.clone();
+                let failed = tray.action_error.clone();
                 std::thread::spawn(move || {
                     let result: Result<(), ClientError> = async_io::block_on(async {
                         // The tray's own connection (#50): the click reuses
@@ -429,6 +459,7 @@ impl TimetrackTray {
                     match &result {
                         Ok(()) => {
                             forget_quick_add_if(&undo, &project_id, &entry_id);
+                            report_action(&failed, None);
                             println!("timetrack-tray: undid quick add {entry_id} in {project_id}");
                         }
                         Err(e) if undo_record_stale(&result) => {
@@ -436,6 +467,7 @@ impl TimetrackTray {
                             // (removed or edited elsewhere): drop the record
                             // so the row disables instead of failing forever.
                             forget_quick_add_if(&undo, &project_id, &entry_id);
+                            report_action(&failed, Some(e));
                             eprintln!(
                                 "timetrack-tray: undo of {entry_id} refused ({e}); forgetting"
                             );
@@ -443,6 +475,7 @@ impl TimetrackTray {
                         Err(e) => {
                             // Transient (no service, transport): keep the
                             // record so the next click retries.
+                            report_action(&failed, Some(e));
                             eprintln!("timetrack-tray: undo of {entry_id} failed: {e}");
                         }
                     }
@@ -472,6 +505,7 @@ impl TimetrackTray {
                                 let entry_id = entry_id.clone();
                                 let confirm_label = confirm_label.clone();
                                 let slot = tray.client.clone();
+                                let failed = tray.action_error.clone();
                                 std::thread::spawn(move || {
                                     let result: Result<(), ClientError> =
                                         async_io::block_on(async {
@@ -483,12 +517,18 @@ impl TimetrackTray {
                                             client.delete_entry(&entry_id).await
                                         });
                                     match result {
-                                        Ok(()) => println!(
-                                            "timetrack-tray: deleted {entry_id} ({confirm_label})"
-                                        ),
-                                        Err(e) => eprintln!(
-                                            "timetrack-tray: delete of {entry_id} failed: {e}"
-                                        ),
+                                        Ok(()) => {
+                                            report_action(&failed, None);
+                                            println!(
+                                                "timetrack-tray: deleted {entry_id} ({confirm_label})"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            report_action(&failed, Some(&e));
+                                            eprintln!(
+                                                "timetrack-tray: delete of {entry_id} failed: {e}"
+                                            );
+                                        }
                                     }
                                 });
                             }),
@@ -538,15 +578,17 @@ impl ksni::Tray for TimetrackTray {
     fn status(&self) -> ksni::Status {
         // Attention travels via status, not a second icon: only one icon
         // asset is installed, so a second icon name would render nothing.
-        // A missing service flattens the icon; a skew or an over-24h day
-        // asks for attention; otherwise the icon sits idle-active.
+        // A missing service flattens the icon; a skew, a refused snapshot,
+        // a failed action or an over-24h day asks for attention; otherwise
+        // the icon sits idle-active.
         let unwell = lock(&self.unwell).clone();
         let attention = lock(&self.summary).attention;
+        let failed = lock(&self.action_error).is_some();
         match unwell {
             Some(Unwell::Down) => ksni::Status::Passive,
             Some(Unwell::Skewed) => ksni::Status::NeedsAttention,
             Some(Unwell::Refused(_)) | None => {
-                if attention {
+                if attention || failed {
                     ksni::Status::NeedsAttention
                 } else {
                     ksni::Status::Active
@@ -567,11 +609,19 @@ impl ksni::Tray for TimetrackTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let summary = lock(&self.summary).clone();
         let unwell = lock(&self.unwell).clone();
+        // A connection problem outranks a failed action: "the service is
+        // not running" explains more than the refusal that failure caused.
+        // An action failure outranks the week summary, which is the point:
+        // the action is what the user just did.
+        let failed = lock(&self.action_error).clone();
         let description = match unwell {
-            None => tooltip_text(&summary),
             Some(Unwell::Down) => timetrack_proto::no_service_hint(),
             Some(Unwell::Skewed) => timetrack_proto::version_mismatch_hint("tray"),
             Some(Unwell::Refused(text)) => text,
+            None => match failed {
+                Some(text) => text,
+                None => tooltip_text(&summary),
+            },
         };
         ksni::ToolTip {
             icon_name: "org.sequ.timetrack-symbolic".into(),
@@ -831,7 +881,7 @@ async fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         ConnState, MenuModel, TimetrackTray, TooltipState, build_menu_model, conn_state,
-        quick_add_label, tooltip_text,
+        quick_add_label, report_action, tooltip_text,
     };
     use ksni::Tray as _;
     use std::collections::HashMap;
@@ -844,6 +894,41 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
         )
+    }
+
+    #[test]
+    fn a_failed_action_is_visible_in_the_tooltip_and_the_icon() {
+        // A failed quick-add used to reach the user only as a line on
+        // stderr, in a terminal that may not be open: the menu did not
+        // change and the icon stayed healthy, so it looked exactly like a
+        // quick-add that worked.
+        let tray = tray();
+        let error = tray.action_error.clone();
+        report_action(&error, Some(&ClientError::NoService));
+        assert_eq!(
+            tray.tool_tip().description,
+            "the timetrack service is not running",
+            "the tooltip says what failed"
+        );
+        assert_eq!(
+            tray.status(),
+            ksni::Status::NeedsAttention,
+            "the icon asks for attention"
+        );
+    }
+
+    #[test]
+    fn a_successful_action_clears_the_previous_failure() {
+        let tray = tray();
+        let error = tray.action_error.clone();
+        report_action(&error, Some(&ClientError::NoService));
+        report_action(&error, None);
+        assert!(
+            tray.tool_tip().description.starts_with("Week total"),
+            "the tooltip is back to the totals: {}",
+            tray.tool_tip().description
+        );
+        assert_eq!(tray.status(), ksni::Status::Active);
     }
 
     fn project(id: &str, name: &str, archived: bool) -> ProjectView {
