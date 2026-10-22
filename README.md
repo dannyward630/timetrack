@@ -295,6 +295,41 @@ runtime needs nothing installed.
 
 ## Known issues
 
+The things below are open, known, and not worked around. Everything else in
+this README works today.
+
+**The tray icon does not appear on GNOME.** GNOME Shell ships no
+StatusNotifierItem watcher, so the icon has nowhere to go. Install a tray
+extension (an AppIndicator one is the usual choice) or use the desktop
+client. See "Tray on GNOME" above.
+
+**The tray is not in the AppImage.** It is host-only for now: the image
+bundles the GUI and the service, and the tray is installed separately with
+its autostart file. See "The tray has to be installed once" above.
+
+**A corrupt or newer store is refused, not repaired.** The service will
+not start rather than start empty, because starting empty would look like
+your tracked time had vanished. The file is at
+`~/.local/share/timetrack/store.json`; move it aside to start fresh. A
+file written by a newer TimeTrack is refused the same way, and says so.
+
+**A store from the stopwatch era cannot be migrated.** That format has no
+projects, so there is nothing to migrate it onto. The service says so
+plainly and refuses it; move the file aside to start fresh.
+
+**A project cannot be deleted from the GUI.** The GUI can archive and
+unarchive, which keeps the history in the totals, but not delete. The
+terminal can: `timetrack delete-project <name>`. A project that still has
+entries is refused — move or delete the entries first.
+
+**The TUI cannot create a project.** It has no text field for one; create
+it from the command line (`timetrack project "Work"`) and it appears in
+the TUI at the next refresh.
+
+**The GUI's export preview shows the first rows, not the whole file.** It
+shows up to twenty rows, oldest first, in exactly the order the file
+carries them — enough to check the scope, not enough to read the file.
+
 ## Licence
 
 GPL-3.0-or-later. See `COPYING`.
