@@ -26,6 +26,16 @@ APPIMAGETOOL="appimagetool-$ARCH.AppImage"
 LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/$LINUXDEPLOY"
 APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/$APPIMAGETOOL"
 
+# Update information, embedded by appimagetool (`-u` below). It tells
+# AppImageUpdate where to look: the latest GitHub release's zsync file for
+# this architecture, published by `release.yml` next to the AppImage. When
+# zsyncmake is installed, appimagetool also writes that `.zsync` file next
+# to the image; without it the info is still embedded and only the file is
+# missing (the release job installs `zsync`, so a published image always
+# has both). The in-app updater needs neither: it reads the same releases
+# page directly.
+UPDATE_INFO="gh-releases-zsync|sequ-r|timetrack|latest|TimeTrack-*$ARCH.AppImage.zsync"
+
 for pair in "$LINUXDEPLOY $LINUXDEPLOY_URL" "$APPIMAGETOOL $APPIMAGETOOL_URL"; do
     # shellcheck disable=SC2086
     set -- $pair
@@ -79,5 +89,25 @@ exec "$HERE/AppRun.wrapped" "$@"
 EOF
 chmod +x AppDir/AppRun
 
-"./$APPIMAGETOOL" --appimage-extract-and-run AppDir "$APPIMAGE"
+# Absolute paths: `--appimage-extract-and-run` re-executes the tool from an
+# extracted copy that does not keep this script's working directory, so a
+# relative `AppDir` fails with "no such file or directory".
+"./$APPIMAGETOOL" --appimage-extract-and-run -u "$UPDATE_INFO" "$PWD/AppDir" "$PWD/$APPIMAGE"
+
+# appimagetool writes the `.zsync` next to wherever its re-executed copy
+# thinks it runs (in practice `$HOME`), not next to the image. Move it into
+# place so the release job finds it. A missing file only warns: without
+# zsyncmake nothing is generated, but the update information above is still
+# embedded (the release job installs `zsync`, so a published image always
+# has both -- and fails the release if it does not).
+for candidate in "$HOME/$APPIMAGE.zsync"; do
+    if [ -f "$candidate" ]; then
+        mv "$candidate" "$PWD/$APPIMAGE.zsync"
+    fi
+done
+if [ -f "$PWD/$APPIMAGE.zsync" ]; then
+    echo "wrote $APPIMAGE.zsync"
+else
+    echo "warning: no .zsync generated (zsyncmake missing?); update info is still embedded" >&2
+fi
 echo "built $APPIMAGE"

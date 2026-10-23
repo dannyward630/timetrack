@@ -1,0 +1,18 @@
+[package]
+name = "timetrack-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Self-update logic for the TimeTrack AppImage (GitHub releases)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Blocking HTTPS with rustls. Blocking, because the GUI drives updates from a
+# dedicated std::thread (like the export save), never from a gpui future -- and
+# rustls, never tokio: this workspace has deliberately no tokio anywhere (see
+# the workspace manifest for why it is load-bearing absent).
+ureq = "3"

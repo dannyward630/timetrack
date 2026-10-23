@@ -27,6 +27,7 @@ portal-stub = []
 [dependencies]
 timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
+timetrack-update = { workspace = true }
 gpui = { workspace = true }
 anyhow = { workspace = true }
 async-io = { workspace = true }

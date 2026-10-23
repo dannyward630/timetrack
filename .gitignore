@@ -5,6 +5,7 @@
 # AppImage
 /AppDir/
 /TimeTrack-*.AppImage
+/TimeTrack-*.zsync
 /linuxdeploy-*.AppImage
 /appimagetool-*.AppImage
 /squashfs-root/

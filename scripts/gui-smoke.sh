@@ -235,6 +235,10 @@ echo "== the window paints =="
   # Portal stub (ticket 27): no live portal exists headless, so the dialog
   # records its prefilled name here and the home-directory fallback runs on.
   export TIMETRACK_PORTAL_STUB="record:$WORK/portal-names.log"
+  # No self-update check headless: the footer hints and any "update
+  # available" status would depend on the network and on whatever release
+  # happens to be latest, and pixel assertions must not.
+  export TIMETRACK_NO_UPDATE=1
   # Empty WAYLAND_DISPLAY is deliberate: gpui picks Wayland when it is set and
   # non-empty, and there is no Wayland compositor on this display.
   # HOME points at the scratch dir so the Export buttons below write their

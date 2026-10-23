@@ -7,6 +7,7 @@ members = [
     "crates/timetrack-cli",
     "crates/timetrack-gui",
     "crates/timetrack-tray",
+    "crates/timetrack-update",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ repository = "https://github.com/sequ-r/timetrack"
 [workspace.dependencies]
 timetrack-core = { path = "crates/timetrack-core" }
 timetrack-proto = { path = "crates/timetrack-proto" }
+timetrack-update = { path = "crates/timetrack-update" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

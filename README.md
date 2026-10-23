@@ -293,6 +293,29 @@ same system libraries as above (`libxkbcommon-dev`,
 Debian/Ubuntu); linuxdeploy bundles the linked ones into the image, so the
 runtime needs nothing installed.
 
+### Updates
+
+The AppImage checks for updates itself, once per launch: it reads the
+latest GitHub release and compares the tag against its own version. When a
+newer release carries an image for your architecture, the footer says so
+and offers `U`:
+
+- first `U` arms the install (`press U again to download …`),
+- second `U` downloads the new image and replaces the running file,
+- relaunch to run it.
+
+Nothing installs without those two presses, and an offline launch stays
+silent rather than erroring. `TIMETRACK_NO_UPDATE=1` skips the check
+entirely. Host builds (`cargo run`, installed binaries) never check —
+there is no release to update to — and `U` there says so.
+
+The image also carries embedded update information
+(`gh-releases-zsync|…|TimeTrack-*.AppImage.zsync`), and releases publish
+the `.zsync` file next to it, so the external
+[AppImageUpdate](https://github.com/AppImage/AppImageUpdate) tool can
+delta-update the same file. The in-app updater downloads the whole image
+instead (~10 MB) and needs neither.
+
 ## Known issues
 
 The things below are open, known, and not worked around. Everything else in

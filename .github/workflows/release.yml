@@ -120,9 +120,12 @@ jobs:
       - uses: actions/checkout@v4
       # linuxdeploy bundles these from the build host into the image, but
       # building the GUI still needs their headers, same as the test job.
+      # `zsync` is for the delta-update file appimagetool writes next to the
+      # image (see build-appimage.sh): without it the update information is
+      # still embedded, but no `.zsync` is generated.
       - uses: ./.github/actions/setup
         with:
-          apt-packages: ${{ env.GUI_LIBS }} file
+          apt-packages: ${{ env.GUI_LIBS }} file zsync
       - name: Build the AppImage
         run: ./build-appimage.sh
       - name: Verify the AppImage bundles both binaries
@@ -132,10 +135,20 @@ jobs:
           test -x squashfs-root/usr/bin/timetrack-service
           test -x squashfs-root/AppRun
           rm -rf squashfs-root
+      # The zsync file is what AppImageUpdate downloads instead of the whole
+      # image, and the in-app updater's asset pick assumes a published image
+      # per architecture. A missing one fails the release, not silently.
+      - name: Verify the delta-update file and embedded update information
+        run: |
+          test -f TimeTrack-x86_64.AppImage.zsync
+          strings TimeTrack-x86_64.AppImage \
+            | grep -F 'gh-releases-zsync|sequ-r|timetrack|latest|TimeTrack-*x86_64.AppImage.zsync'
       - uses: actions/upload-artifact@v4
         with:
           name: TimeTrack-x86_64.AppImage
-          path: TimeTrack-x86_64.AppImage
+          path: |
+            TimeTrack-x86_64.AppImage
+            TimeTrack-x86_64.AppImage.zsync
 
   # One job publishes, and it runs only once both builds have finished. Two
   # publishing jobs each generate the release notes and each write their own
@@ -154,7 +167,7 @@ jobs:
           merge-multiple: true
       - name: Write one checksum file for everything published
         working-directory: dist
-        run: sha256sum *.tar.gz *.AppImage > SHA256SUMS
+        run: sha256sum *.tar.gz *.AppImage *.zsync > SHA256SUMS
       - name: Show what would be published
         working-directory: dist
         run: ls -l
@@ -169,6 +182,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.AppImage
+            dist/*.zsync
             dist/SHA256SUMS
           generate_release_notes: true
 

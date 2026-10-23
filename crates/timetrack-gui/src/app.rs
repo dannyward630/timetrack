@@ -37,6 +37,7 @@ use self::keys::printable_char;
 use self::service::{Action, Msg, now_ms, spawn_service_thread};
 use self::status::{StatusKind, StatusMsg, is_connection_notice};
 use self::tabs::{Tab, cycle_tab};
+use self::update::{AvailableUpdate, UpdateKey, UpdateState};
 use gpui::prelude::*;
 use gpui::{
     AsyncApp, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Render, Styled,
@@ -166,6 +167,9 @@ pub struct TimetrackView {
     /// no save yet) keeps the home-directory wording.
     export_last_dest: Option<String>,
     export_last_via_portal: bool,
+    /// The AppImage self-update state. The check runs once at startup on a
+    /// background thread; `U` arms and then sends the install.
+    update: UpdateState,
 }
 
 impl TimetrackView {
@@ -190,6 +194,11 @@ impl TimetrackView {
             export_picker: ExportPicker::new(now_ms()),
             export_last_dest: None,
             export_last_via_portal: false,
+            update: UpdateState {
+                applies: timetrack_update::app_image_path().is_some(),
+                disabled: std::env::var_os(timetrack_update::NO_UPDATE_ENV).is_some(),
+                ..Default::default()
+            },
         };
         view.schedule_poll(cx);
         view
@@ -344,6 +353,42 @@ impl TimetrackView {
                         changed = true;
                     }
                 }
+                Ok(Msg::UpdateAvailable { version, url }) => {
+                    // The check found a newer release. The footer announces
+                    // it; nothing downloads until the user presses `U` twice.
+                    self.update.available = Some(AvailableUpdate {
+                        version: version.clone(),
+                        url,
+                    });
+                    self.update.confirmed = false;
+                    set_status(
+                        &mut self.status,
+                        StatusMsg::local(format!("update available: v{version} — U installs it")),
+                        &mut changed,
+                    );
+                }
+                Ok(Msg::UpdateCurrent) => {
+                    self.update.checked = true;
+                }
+                Ok(Msg::UpdateInstalled { version }) => {
+                    self.update.installing = false;
+                    self.update.confirmed = false;
+                    self.update.available = None;
+                    self.update.installed = Some(version.clone());
+                    set_status(
+                        &mut self.status,
+                        StatusMsg::local(format!("v{version} installed — relaunch to run it")),
+                        &mut changed,
+                    );
+                }
+                Ok(Msg::UpdateFailed { reason }) => {
+                    self.update.installing = false;
+                    set_status(
+                        &mut self.status,
+                        StatusMsg::local(format!("update failed: {reason}")),
+                        &mut changed,
+                    );
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     set_status(
@@ -456,6 +501,10 @@ impl TimetrackView {
             // Split and merge (REQUIREMENTS §8).
             "s" => self.open_split_prompt(),
             "m" => self.open_merge_confirm(),
+
+            // Self-update (AppImage only): the first press arms the
+            // install, the second one downloads it.
+            "U" => self.on_update_key(),
 
             // Export anchor picker (spec #19): one press moves one period,
             // and `t` opens the typed day. Only on the Export tab; elsewhere
@@ -894,6 +943,19 @@ impl TimetrackView {
         }
     }
 
+    /// Handle a `U` press: arm the install on the first press, send it on
+    /// the second. The state machine is pure (`UpdateState::on_u`); this
+    /// only turns its answer into a status line or an action.
+    fn on_update_key(&mut self) {
+        match self.update.on_u() {
+            UpdateKey::Note(text) => self.status = Some(StatusMsg::local(text)),
+            UpdateKey::Install { url, version } => {
+                self.status = Some(StatusMsg::local(format!("downloading v{version}…")));
+                self.send(Action::InstallUpdate { url, version });
+            }
+        }
+    }
+
     /// Whether the service has not been seen yet, in which case the window
     /// offers to start it instead of just complaining. Keys on the status
     /// kind, never on its wording.
@@ -925,8 +987,16 @@ impl TimetrackView {
             } else if self.export_picker.editing {
                 "type a day YYYY-MM-DD · enter set · esc cancel".to_string()
             } else {
-                "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · tab tabs · j/k move · h/l project · q quit"
-                    .to_string()
+                let mut hints =
+                    "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · tab tabs · j/k move · h/l project · q quit"
+                        .to_string();
+                // Offer the update exactly while there is one to install:
+                // armed, installed and downloading states speak through the
+                // status line above instead.
+                if let Some(version) = self.update.offer_update() {
+                    hints.push_str(&format!(" · U update to v{version}"));
+                }
+                hints
             }
         })
     }
@@ -1176,6 +1246,8 @@ mod testsupport;
 mod status;
 
 mod tabs;
+
+mod update;
 
 mod chrome;
 

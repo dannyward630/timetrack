@@ -46,6 +46,25 @@ pub(super) enum Msg {
     /// every second and would make errors unreadable), so success arrives as
     /// its own message that dismisses the previous error.
     ActionOk,
+    /// The update check found a newer release with this machine's AppImage
+    /// asset. The view announces it; nothing downloads until the user
+    /// presses `U` twice.
+    UpdateAvailable {
+        version: String,
+        url: String,
+    },
+    /// The update check ran and found nothing newer.
+    UpdateCurrent,
+    /// The download renamed over the running AppImage. The user relaunches
+    /// to run it; nothing restarts itself.
+    UpdateInstalled {
+        version: String,
+    },
+    /// The install failed after the user confirmed it. An offline launch is
+    /// silence, never this: only a confirmed install reports failure.
+    UpdateFailed {
+        reason: String,
+    },
 }
 
 /// What an export save needs: the typed scope plus the paths and labels
@@ -142,6 +161,11 @@ pub(super) enum Action {
     /// the AppImage starts its bundled service on launch, so the bus
     /// already owns the name there.
     StartService,
+    /// Download a confirmed update asset and rename it over the running
+    /// AppImage (REQUIREMENTS: only the AppImage updates itself; host
+    /// builds never send this). Like the export save, the download runs on
+    /// its own thread and reports back over the channel.
+    InstallUpdate { url: String, version: String },
 }
 
 /// What happened to a snapshot offered to the view.
@@ -190,6 +214,34 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
     let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
     let (tx, rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
+    // The self-update check: one blocking HTTPS call on its own thread, at
+    // startup only. It never touches the bus, so it shares nothing with the
+    // service loop below except the message channel back to the view. Any
+    // failure is silence -- an offline launch is not an update failure --
+    // and host builds skip it entirely: only the AppImage updates itself.
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            if !timetrack_update::updates_enabled() {
+                return;
+            }
+            let current = timetrack_update::Version::current();
+            match timetrack_update::check_for_update(&current) {
+                Ok(Some(release)) => {
+                    if let Some(asset) = release.asset_for(timetrack_update::current_arch()) {
+                        let _ = tx.send(Msg::UpdateAvailable {
+                            version: release.version.as_str().to_string(),
+                            url: asset.url.clone(),
+                        });
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Msg::UpdateCurrent);
+                }
+                Err(_) => {}
+            }
+        });
+    }
     std::thread::spawn(move || {
         // zbus uses the async-io backend (see the workspace Cargo.toml for why
         // that is not optional), so the bus is driven with `async_io::block_on`
@@ -339,6 +391,29 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                             // proxy, so make a real call to force the bus to
                             // start the service if it can.
                             report(&tx, client.snapshot().await.map(|_| ()));
+                        }
+                        Ok(Action::InstallUpdate { url, version }) => {
+                            // The download outlives the tick: it runs on its
+                            // own thread (like the export save) and reports
+                            // back over the channel, so snapshots and clicks
+                            // keep flowing while the bytes arrive.
+                            let tx = tx.clone();
+                            std::thread::spawn(move || {
+                                let outcome = match timetrack_update::app_image_path() {
+                                    Some(path) => timetrack_update::install_with(&url, &path)
+                                        .map(|_| Msg::UpdateInstalled {
+                                            version: version.clone(),
+                                        })
+                                        .unwrap_or_else(|e| Msg::UpdateFailed {
+                                            reason: e.to_string(),
+                                        }),
+                                    None => Msg::UpdateFailed {
+                                        reason: timetrack_update::UpdateError::NotAppImage
+                                            .to_string(),
+                                    },
+                                };
+                                let _ = tx.send(outcome);
+                            });
                         }
                         Err(TryRecvError::Empty) => break,
                         // The window is gone; nothing left to do.
