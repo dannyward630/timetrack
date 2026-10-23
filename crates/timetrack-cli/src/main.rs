@@ -798,15 +798,15 @@ mod tests {
 
     #[test]
     fn a_missing_service_is_explained_with_the_shared_hint() {
-        // The guidance used to live in a block that matched on the substring
-        // "ServiceUnknown" -- a string no error here ever contained -- so it
-        // never reached the user.
+        // The guidance used to name a host `timetrack-service` binary and a
+        // systemd unit -- neither exists any more: the service ships inside
+        // the AppImage. The hint must name the image instead.
         let err = anyhow::Error::new(ClientError::NoService);
         let text = explain(err).to_string();
         assert_eq!(text, no_service_hint());
         assert!(
-            text.contains("Start it with"),
-            "the hint says how to start the service: {text}"
+            text.contains("AppImage"),
+            "the hint says how the service is started: {text}"
         );
     }
 

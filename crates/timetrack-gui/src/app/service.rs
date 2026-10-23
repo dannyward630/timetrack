@@ -156,10 +156,10 @@ pub(super) enum Action {
     /// dialog; `path` is the direct-save fallback when no portal answers.
     /// `period_id` feeds the saved status line.
     ExportCsv(ExportRequest),
-    /// Launch the service. From a host build this asks the session bus to
-    /// activate it, which works when a D-Bus activation file is installed;
-    /// the AppImage starts its bundled service on launch, so the bus
-    /// already owns the name there.
+    /// Launch the service. From a host build (development only) this asks
+    /// the session bus to activate it, which works when a D-Bus activation
+    /// file is installed by hand; the AppImage starts its bundled service
+    /// on launch, so the bus already owns the name there.
     StartService,
     /// Download a confirmed update asset and rename it over the running
     /// AppImage (REQUIREMENTS: only the AppImage updates itself; host

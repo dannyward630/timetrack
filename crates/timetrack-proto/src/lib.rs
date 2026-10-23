@@ -8,9 +8,8 @@
 //! The wire contract and a client for the TimeTrack service.
 //!
 //! Both front ends depend on this rather than on each other, so the GUI
-//! (an AppImage) and the CLI (a static binary) agree on one definition. It
-//! carries no GUI and no storage code, which keeps the CLI's static build
-//! small.
+//! (an AppImage) and the CLI (bundled in that same image) agree on one
+//! definition. It carries no GUI and no storage code.
 //!
 //! # Why payloads are JSON strings
 //!
@@ -323,8 +322,11 @@ impl ClientError {
 /// The "service is not running" guidance, shared by the GUI footer and
 /// the tray tooltip so both clients say the same thing. Shown for
 /// [`ClientError::NoService`].
+///
+/// The service ships inside the AppImage and starts with it: there is no
+/// host install to point at, so the hint names the image, not a binary.
 pub fn no_service_hint() -> String {
-    "the timetrack service is not running. Start it with:\ntimetrack-service &\n(or install it to a systemd user unit -- see the README)".to_string()
+    "the timetrack service is not running. Launch the TimeTrack AppImage (it starts its bundled service), then retry".to_string()
 }
 
 /// The version-skew guidance, shared by the GUI footer and the tray
@@ -782,7 +784,7 @@ mod tests {
         // both clients say the same thing: pin the exact strings here.
         assert_eq!(
             no_service_hint(),
-            "the timetrack service is not running. Start it with:\ntimetrack-service &\n(or install it to a systemd user unit -- see the README)"
+            "the timetrack service is not running. Launch the TimeTrack AppImage (it starts its bundled service), then retry"
         );
         assert_eq!(
             version_mismatch_hint("GUI"),

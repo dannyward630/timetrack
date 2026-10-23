@@ -25,8 +25,8 @@ leaves the current image untouched.
 The network call is blocking `ureq` with rustls on a dedicated thread --
 never from a gpui future, and never tokio (see the workspace manifest for
 why that is load-bearing absent). Only the AppImage updates itself: a host
-`cargo build` has no release channel, and the static CLI tarballs are
-replaced by hand.
+`cargo build` has no release channel, and the CLI ships in that same image,
+so updating the image updates both.
 
 Separately, `build-appimage.sh` embeds
 `gh-releases-zsync|sequ-r|timetrack|latest|TimeTrack-*<arch>.AppImage.zsync`

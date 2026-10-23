@@ -17,7 +17,7 @@ the terminal never loses anything, and both can be open at once.
 ## Architecture
 
 ```
-  timetrack-gui (AppImage)          timetrack (CLI, static binary)      timetrack-tray (host only)
+  timetrack-gui (AppImage)          timetrack (CLI, in the AppImage)        timetrack-tray (host only)
   gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands     SNI item: week-total tooltip,
                                                                             per-project quick-add/undo/delete
         |                                  |                                   |
@@ -91,7 +91,7 @@ service rig and the GUI smoke check, each job on its own so a red run names the
 one that failed). A failed smoke check uploads the screenshots and logs it took
 (`TT_SMOKE_ARTIFACTS`) as a run artifact. Every push to `main` then runs
 `release.yml`, which calls that workflow first and only afterwards mints the
-run's version, builds the CLI tarballs and the AppImage from it, tags the
+run's version, builds the AppImage from it, tags the
 commit and publishes the release. The version is the workspace manifest
 bumped past the latest tag -- ordinary runs only ever move the patch, so to
 ship a minor or major, bump `version` in the root `Cargo.toml` yourself and
@@ -123,16 +123,35 @@ toolkit.
 
 ## Running
 
-Start the service once, then any client:
+The AppImage is the install. Launch it once, then any client — the image
+starts its bundled service in the background, so there is no service to
+install and no D-Bus activation file to write:
 
 ```sh
-timetrack-service &
-timetrack                      # TUI
-timetrack-gui                  # desktop GUI (host build; or the AppImage below)
-timetrack-tray &               # system tray (host only)
-timetrack quick -m 15          # or a one-shot command
+./TimeTrack-x86_64.AppImage          # desktop GUI (starts the service too)
+./TimeTrack-x86_64.AppImage cli      # terminal client, same image
+timetrack-tray &                     # system tray (host only)
+```
+
+For a bare `timetrack` on `PATH`, symlink it to the image — AppRun notices
+the name it was called by and runs the CLI instead of the GUI:
+
+```sh
+ln -s /path/to/TimeTrack-x86_64.AppImage ~/.local/bin/timetrack
+timetrack                            # TUI
+timetrack quick -m 15                # or a one-shot command
 timetrack status
 ```
+
+Uninstall is deleting the AppImage file (and the symlink, if you made
+one): the image writes nothing to the host — no desktop copy, no D-Bus
+activation file, no systemd unit — so there is nothing left that can
+dangle. Your tracked time lives outside the image at
+`~/.local/share/timetrack/store.json` and is untouched by this.
+
+Host `cargo build` binaries are a development fallback only (see
+"Building" above): they need a service on the bus exactly like the tests
+do, and they never take part in an install.
 
 The TUI: `1`-`4` quick-add, `a` 30 minutes, `u` undo, `d` delete, `j`/`k` move,
 `h`/`l` change project, `q` quit. Projects are created from the command line
@@ -167,7 +186,7 @@ install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.config/autostart/org.sequ
 D-Bus activation is unchanged by all of this: the tray connects anonymously
 and never owns `org.sequ.timetrack`, so it can neither steal the service's
 name nor keep a stale service alive — it only reads. The AppImage ships no
-tray in v1 (it bundles only the GUI and the service); the tray is
+tray in v1 (it bundles the GUI, the service and the CLI); the tray is
 host-only until it is decided whether it belongs in the image.
 
 ### Tray on GNOME, and why the AppImage ships none
@@ -180,24 +199,14 @@ The tray is host-only in v1, deliberately: it runs on the host next to the
 service and is installed with the autostart file below. Until it is decided
 whether the tray belongs inside the AppImage, run it from a host build.
 
-### The service has to be installed once (host builds)
+### The service needs no install
 
-The AppImage needs none of this: it bundles the service and starts it in
-the background when the app launches, so the session bus always finds one.
-The steps below are only for running the GUI from a host `cargo build`,
-where no bundle exists to start the service. Install the service and a
-D-Bus activation file on the host; after that the session bus starts it on
-demand:
+The AppImage bundles the service and starts it in the background when the
+app launches, so the session bus always finds one. There is no D-Bus
+activation file and no systemd unit to install — and after deleting the
+image there is none left behind to go stale, either.
 
-```sh
-install -Dm755 target/release/timetrack-service ~/.local/bin/timetrack-service
-mkdir -p ~/.local/share/dbus-1/services
-sed 's|/usr/bin/timetrack-service|'"$HOME"'/.local/bin/timetrack-service|' \
-  data/org.sequ.timetrack.service.in \
-  > ~/.local/share/dbus-1/services/org.sequ.timetrack.service
-```
-
-**After upgrading, reinstall the service.** The interface was renamed from
+**After upgrading, relaunch the image.** The interface was renamed from
 `org.sequ.timetrack.Timer` to `org.sequ.timetrack.Entries` when the timer was
 cut. A stale service binary keeps answering to the old name and the GUI reports
 `UnknownInterface`. It now says so explicitly rather than claiming the service is
@@ -206,32 +215,17 @@ merely absent, because the two need different fixes:
 > The GUI and the service are different versions. Reinstall whichever one is
 > older so both speak `org.sequ.timetrack.Entries`.
 
-To run it at login instead:
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp data/org.sequ.timetrack.service ~/.config/systemd/user/
-systemctl --user enable --now org.sequ.timetrack.service
-```
-
-Note that `Exec=` in a D-Bus service file is **not** run through a shell, so it
-must be an absolute path to a real executable -- `sh -c ...` does not work.
+With one artifact carrying both, that means: quit the old image (and its
+leftover service, which exits with the session) and launch the new one.
 
 ## The terminal client
 
-`timetrack` is a separate download from the AppImage — it is an ordinary binary:
-
-```sh
-cargo install --git https://github.com/sequ-r/timetrack.git timetrack-cli
-```
-
-Release tags also publish statically linked musl builds for x86_64 and
-aarch64, so a single artifact runs on any Linux regardless of glibc version:
-
-```sh
-curl -LO https://github.com/sequ-r/timetrack/releases/latest/download/timetrack-x86_64.tar.gz
-tar xzf timetrack-x86_64.tar.gz && install -m755 timetrack-x86_64 ~/.local/bin/timetrack
-```
+`timetrack` ships inside the AppImage — it is the same `timetrack-cli`
+binary, at `usr/bin/timetrack` in the bundle. Run it through the image
+(`./TimeTrack-x86_64.AppImage cli …`) or through a symlink named
+`timetrack` pointing at the image (see "Running" above); either way the
+image starts its bundled service first, so the CLI never needs a service
+of its own.
 
 ### Commands
 
@@ -261,21 +255,16 @@ The asymmetry is deliberate: `shorten` can never delete anything, and `undo`
 **refuses** an entry it did not create, so it cannot lose hand-entered time by
 accident.
 
-Note for packagers: **do not set `CARGO_TARGET_*_MUSL_LINKER=musl-gcc`**. Some
-distributions' `musl-gcc` (GCC 16.x on Arch as of 2026-09) produces binaries
-that segfault at startup on anything that hashes — `std`'s `HashMap`, which
-zbus' D-Bus address parser needs. Rust's default linker for musl targets is
-correct; the override is the bug. See `.cargo/config.toml`.
-
 ## AppImage
 
-The GUI ships as a single portable file bundling `timetrack-gui` and
-`timetrack-service`, built with linuxdeploy + appimagetool (fetched on
-demand). It needs no install and no service setup: its AppRun starts the
-bundled service in the background, then the GUI. If a service is already
-running (a host install, or a second copy of the AppImage), the extra copy
-fails to own the bus name and exits, and the GUI talks to whichever holds
-it.
+TimeTrack ships as a single portable file bundling `timetrack-gui`,
+`timetrack-service` and the `timetrack` CLI, built with linuxdeploy +
+appimagetool (fetched on demand). It needs no install and no service
+setup: its AppRun starts the bundled service in the background, then the
+GUI — or the CLI, when the image is invoked as `timetrack` (a symlink) or
+with `cli` as the first argument. If a service is already running (a
+second copy of the AppImage), the extra copy fails to own the bus name
+and exits, and the client talks to whichever holds it.
 
 ```sh
 ./build-appimage.sh            # produces TimeTrack-<arch>.AppImage
@@ -286,12 +275,12 @@ chmod +x TimeTrack-x86_64.AppImage
 Or by hand:
 
 ```sh
-cargo build --release --package timetrack-gui --package timetrack-service
+cargo build --release --package timetrack-gui --package timetrack-service --package timetrack-cli
 # ... see build-appimage.sh for the AppDir layout and tool invocations
 ```
 
-Release tags publish the AppImage alongside the static CLI tarballs, so one
-download covers the desktop app on any Linux. The GUI's build needs the
+Release tags publish the AppImage, so one download covers the desktop app
+and the terminal client on any Linux. The GUI's build needs the
 same system libraries as above (`libxkbcommon-dev`,
 `libxkbcommon-x11-dev`, `libfreetype-dev`, `libfontconfig-dev` on
 Debian/Ubuntu); linuxdeploy bundles the linked ones into the image, so the
@@ -331,8 +320,9 @@ extension (an AppIndicator one is the usual choice) or use the desktop
 client. See "Tray on GNOME" above.
 
 **The tray is not in the AppImage.** It is host-only for now: the image
-bundles the GUI and the service, and the tray is installed separately with
-its autostart file. See "The tray has to be installed once" above.
+bundles the GUI, the service and the CLI, and the tray is installed
+separately with its autostart file. See "The tray has to be installed once"
+above.
 
 **A corrupt or newer store is refused, not repaired.** The service will
 not start rather than start empty, because starting empty would look like

@@ -9,7 +9,8 @@
 //!
 //! The GUI runs this on startup, but only when it is running as an AppImage
 //! (see [`app_image_path`]): a host `cargo build` has no release to update
-//! to, and the static CLI tarballs are replaced by hand.
+//! to, and the CLI ships in the same image so there is nothing to replace
+//! by hand.
 //!
 //! The flow is deliberately in two halves. The *check* reads the latest
 //! GitHub release, compares its tag against this build's version, and picks

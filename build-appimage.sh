@@ -4,8 +4,9 @@
 #   ./build-appimage.sh
 #
 # Produces TimeTrack-<arch>.AppImage: one portable file bundling
-# timetrack-gui and timetrack-service. It needs no install -- its AppRun
-# starts the bundled service in the background, then the GUI.
+# timetrack-gui, timetrack-service and the timetrack CLI. It needs no
+# install -- its AppRun starts the bundled service in the background,
+# then the GUI (or the CLI, when invoked as `timetrack` or with `cli`).
 #
 # Uses linuxdeploy (library bundling) and appimagetool (image assembly),
 # fetched on demand from their continuous releases. Both run with
@@ -46,7 +47,7 @@ for pair in "$LINUXDEPLOY $LINUXDEPLOY_URL" "$APPIMAGETOOL $APPIMAGETOOL_URL"; d
     fi
 done
 
-cargo build --release --locked --package timetrack-gui --package timetrack-service
+cargo build --release --locked --package timetrack-gui --package timetrack-service --package timetrack-cli
 
 rm -rf AppDir
 mkdir -p AppDir/usr/bin \
@@ -57,6 +58,7 @@ mkdir -p AppDir/usr/bin \
 
 install -m0755 target/release/timetrack-gui AppDir/usr/bin/timetrack-gui
 install -m0755 target/release/timetrack-service AppDir/usr/bin/timetrack-service
+install -m0755 target/release/timetrack AppDir/usr/bin/timetrack
 install -m0644 data/org.sequ.timetrack.desktop AppDir/usr/share/applications/
 install -m0644 data/org.sequ.timetrack.appdata.xml AppDir/usr/share/metainfo/
 install -m0644 data/icons/hicolor/scalable/apps/org.sequ.timetrack.svg \
@@ -69,22 +71,43 @@ install -m0644 data/icons/hicolor/symbolic/apps/org.sequ.timetrack-symbolic.svg 
 "./$LINUXDEPLOY" --appimage-extract-and-run --appdir AppDir \
     -e AppDir/usr/bin/timetrack-gui \
     -e AppDir/usr/bin/timetrack-service \
+    -e AppDir/usr/bin/timetrack \
     -d AppDir/usr/share/applications/org.sequ.timetrack.desktop \
     -i AppDir/usr/share/icons/hicolor/scalable/apps/org.sequ.timetrack.svg
 
-# Wrap the generated AppRun so the bundled service starts with the app.
-# The service owns the store and the bus name: if one is already running
-# (a host install, or a second copy of this AppImage), the extra copy
-# fails to own the name and exits, and the GUI talks to whichever holds
-# it. The GUI already retries its connection, so no wait is needed here,
-# and the service intentionally outlives the GUI, as with D-Bus activation.
+# Wrap the generated AppRun so the bundled service starts with the app, and
+# so the image also serves the terminal client. The service owns the store
+# and the bus name: if one is already running (a second copy of this
+# AppImage), the extra copy fails to own the name and exits, and the client
+# talks to whichever holds it. The GUI already retries its connection, and
+# the CLI waits for the service, so no wait is needed here, and the service
+# intentionally outlives the GUI, as with D-Bus activation.
+#
+# Uninstall is deleting the AppImage file: nothing is written to the host
+# (no desktop copy, no D-Bus activation file, no systemd unit), so there is
+# nothing that can dangle afterwards. A `timetrack` symlink pointing at the
+# image breaks instead, which the shell reports plainly.
 mv AppDir/AppRun AppDir/AppRun.wrapped
 cat > AppDir/AppRun <<'EOF'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
-if [ -x "$HERE/usr/bin/timetrack-service" ]; then
-    "$HERE/usr/bin/timetrack-service" >/dev/null 2>&1 &
+start_service() {
+    if [ -x "$HERE/usr/bin/timetrack-service" ]; then
+        "$HERE/usr/bin/timetrack-service" >/dev/null 2>&1 &
+    fi
+}
+case "$(basename "$0")" in
+    timetrack|timetrack-cli)
+        start_service
+        exec "$HERE/usr/bin/timetrack" "$@"
+        ;;
+esac
+if [ "${1:-}" = "cli" ]; then
+    shift
+    start_service
+    exec "$HERE/usr/bin/timetrack" "$@"
 fi
+start_service
 exec "$HERE/AppRun.wrapped" "$@"
 EOF
 chmod +x AppDir/AppRun
