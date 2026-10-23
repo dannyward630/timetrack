@@ -19,6 +19,7 @@
 //! `spawn_blocking` panics there.
 
 mod app;
+mod session;
 
 use app::TimetrackView;
 use gpui::{
@@ -27,6 +28,11 @@ use gpui::{
 };
 
 fn main() {
+    // Wayland session check first (see the `wayland` skill): which backend
+    // gpui is about to pick and whether the environment supports it. Logging
+    // only — the backend choice itself stays inside gpui's `guess_compositor`
+    // (non-empty WAYLAND_DISPLAY wins, then DISPLAY, else headless).
+    session::log_startup();
     Application::new().run(|cx: &mut App| {
         // Tall enough for the 72px week total plus the quick-add row, the
         // per-project list and a few recent entries, without scrolling to

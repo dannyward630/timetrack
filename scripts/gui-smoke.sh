@@ -240,7 +240,10 @@ echo "== the window paints =="
   # happens to be latest, and pixel assertions must not.
   export TIMETRACK_NO_UPDATE=1
   # Empty WAYLAND_DISPLAY is deliberate: gpui picks Wayland when it is set and
-  # non-empty, and there is no Wayland compositor on this display.
+  # non-empty (see the `wayland` skill, `references/linux-session.md`), and
+  # there is no Wayland compositor on this Xvfb display. WAYLAND_DEBUG passes
+  # through when the caller sets it, so a protocol trace can be taken without
+  # editing the script.
   # HOME points at the scratch dir so the Export buttons below write their
   # files where this script can assert on them, not into the real home.
   [ -n "$SOFTWARE_VULKAN" ] &&
