@@ -41,7 +41,7 @@ runs:
     # directory for this workspace runs to several gigabytes per job (gpui is
     # the bulk of it), and the whole repository gets 10 GB of cache, so caching
     # those would evict the registry caches that are actually cheap to reuse.
-    - uses: actions/cache@v4
+    - uses: actions/cache@v5
       if: inputs.cache == 'true'
       with:
         path: |

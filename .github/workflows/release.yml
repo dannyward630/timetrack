@@ -63,7 +63,7 @@ jobs:
       tag: ${{ steps.mint.outputs.tag }}
       sha: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -110,7 +110,7 @@ jobs:
             emulator: qemu-aarch64-static
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.version.outputs.sha }}
       # The tree at the tag still carries the previous version (the bump is
@@ -160,7 +160,7 @@ jobs:
           ${{ matrix.emulator }} "$BIN" --version
           rm -rf verify
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: timetrack-${{ matrix.arch }}
           path: dist/timetrack-${{ matrix.arch }}.tar.gz
@@ -171,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.version.outputs.sha }}
       # Same local mint as the tarball builds: the image must report the
@@ -204,7 +204,7 @@ jobs:
           test -f TimeTrack-x86_64.AppImage.zsync
           strings TimeTrack-x86_64.AppImage \
             | grep -F 'gh-releases-zsync|sequ-r|timetrack|latest|TimeTrack-*x86_64.AppImage.zsync'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: TimeTrack-x86_64.AppImage
           path: |
@@ -222,10 +222,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.version.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -235,7 +235,7 @@ jobs:
       - name: Show what would be published
         working-directory: dist
         run: ls -l
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: ${{ inputs.dry_run }}
         with:
           name: release-assets
@@ -247,8 +247,8 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           git tag '${{ needs.version.outputs.tag }}'
-          git push origin 'tag ${{ needs.version.outputs.tag }}'
-      - uses: softprops/action-gh-release@v2
+          git push origin tag '${{ needs.version.outputs.tag }}'
+      - uses: softprops/action-gh-release@v3
         if: ${{ !inputs.dry_run }}
         with:
           tag_name: ${{ needs.version.outputs.tag }}
