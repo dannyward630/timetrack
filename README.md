@@ -89,11 +89,15 @@ CI runs those same commands on every pull request and on `main`
 (`.github/workflows/ci.yml`: rustfmt, clippy, `cargo test --workspace`, then the
 service rig and the GUI smoke check, each job on its own so a red run names the
 one that failed). A failed smoke check uploads the screenshots and logs it took
-(`TT_SMOKE_ARTIFACTS`) as a run artifact. Pushing a `v*` tag runs `release.yml`,
-which calls that workflow first and builds the CLI tarballs and the AppImage
-only afterwards; dispatching `release.yml` by hand runs the same build and
-verification with `dry_run` on by default, so the packaging path can be checked
-without cutting a release.
+(`TT_SMOKE_ARTIFACTS`) as a run artifact. Every push to `main` then runs
+`release.yml`, which calls that workflow first and only afterwards mints the
+run's version, builds the CLI tarballs and the AppImage from it, tags the
+commit and publishes the release. The version is the workspace manifest
+bumped past the latest tag -- ordinary runs only ever move the patch, so to
+ship a minor or major, bump `version` in the root `Cargo.toml` yourself and
+the pipeline takes it as-is. Dispatching `release.yml` by hand runs the same
+build and verification with `dry_run` on by default, so the packaging path
+can be checked without cutting a release (or a tag).
 
 On Linux the GUI additionally needs the system libraries gpui links against:
 

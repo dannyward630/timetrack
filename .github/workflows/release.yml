@@ -4,20 +4,37 @@ name: release
 # plus the desktop GUI as a self-contained AppImage bundling
 # `timetrack-gui` and `timetrack-service` (see build-appimage.sh).
 #
-# A tag is the only thing that publishes. `workflow_dispatch` runs the same
-# build and the same verification with `dry_run` on by default: the artifacts
-# land as run artifacts and no release is created, which is how the packaging
-# path can be checked without cutting a version.
+# Every run mints its own version: `version` takes the greater of the
+# workspace manifest and the latest `v*` tag, patch-bumping when the
+# manifest is not ahead, and each build job mints that version into its own
+# checkout before compiling. Ordinary runs only ever move the patch; a
+# manually bumped minor or major in Cargo.toml ships as-is. The tag is
+# pushed only by `publish`, after the builds pass, so a failed run leaves
+# no tag behind -- and nothing is ever committed back: branch protection
+# takes the five checks on every `main` commit, and a bot-pushed bump would
+# have none.
+#
+# `workflow_dispatch` runs the same build and the same verification with
+# `dry_run` on by default: the artifacts land as run artifacts and no tag
+# or release is created, which is how the packaging path can be checked
+# without cutting a version. Real releases cut from `main` only.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
         description: Build and verify the artifacts, but publish no release
         type: boolean
         default: true
+
+# One release at a time: versions come from the latest tag, so two runs
+# computing at once would mint the same one and the loser's tag push would
+# fail after building everything. Queued runs see the earlier run's tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -27,16 +44,45 @@ env:
   GUI_LIBS: libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
 
 jobs:
-  # ci.yml is the single definition of what "green" means, so a tag cannot
-  # publish a tree that rustfmt, clippy, the tests, the e2e rig or the GUI
+  # ci.yml is the single definition of what "green" means, so nothing
+  # publishes a tree that rustfmt, clippy, the tests, the e2e rig or the GUI
   # smoke check reject.
   checks:
     name: checks
     uses: ./.github/workflows/ci.yml
 
+  # Compute this run's version. Tag history is needed, so this is the one
+  # checkout that takes the full clone.
+  version:
+    name: version
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.mint.outputs.version }}
+      tag: ${{ steps.mint.outputs.tag }}
+      sha: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Refuse real releases off main
+        if: ${{ !inputs.dry_run && github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::real releases cut from main only; dispatch with dry_run on other branches"
+          exit 1
+      - id: mint
+        name: Compute the next version
+        run: |
+          VERSION="$(./scripts/mint-version.sh --next)"
+          echo "next release: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
-    needs: checks
+    needs: [checks, version]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -65,6 +111,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      # The tree at the tag still carries the previous version (the bump is
+      # never committed back), so each build job mints locally. Minting is a
+      # pure function of the version, and `--locked` below proves the lock
+      # agrees -- a bad mint fails the build, not the release.
+      - name: Mint the release version
+        run: ./scripts/mint-version.sh ${{ needs.version.outputs.version }}
 
       # `musl-tools` is the Debian/Ubuntu package name for the musl cross
       # toolchain; the aarch64 build needs its cross gcc as well. Deliberately
@@ -113,11 +167,18 @@ jobs:
 
   appimage:
     name: TimeTrack-x86_64.AppImage
-    needs: checks
+    needs: [checks, version]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      # Same local mint as the tarball builds: the image must report the
+      # version its tag names, or the self-updater would offer it as an
+      # update to itself.
+      - name: Mint the release version
+        run: ./scripts/mint-version.sh ${{ needs.version.outputs.version }}
       # linuxdeploy bundles these from the build host into the image, but
       # building the GUI still needs their headers, same as the test job.
       # `zsync` is for the delta-update file appimagetool writes next to the
@@ -157,10 +218,13 @@ jobs:
   # last step and keeps exactly the files a release would carry.
   publish:
     name: publish
-    needs: [build, appimage]
+    needs: [build, appimage, version]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -176,13 +240,21 @@ jobs:
         with:
           name: release-assets
           path: dist/
+      # The tag goes on the tree the binaries were built from, and only now
+      # that they pass: pushing it earlier would leave a tag with no release
+      # behind on a failed run.
+      - name: Push the release tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git tag '${{ needs.version.outputs.tag }}'
+          git push origin 'tag ${{ needs.version.outputs.tag }}'
       - uses: softprops/action-gh-release@v2
         if: ${{ !inputs.dry_run }}
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/*.AppImage
             dist/*.zsync
             dist/SHA256SUMS
           generate_release_notes: true
-
