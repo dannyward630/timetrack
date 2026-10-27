@@ -24,7 +24,17 @@
 //! function here reads the system clock. That makes every entry's `ended_at`
 //! traceable to a single instant per call instead of being interpolated.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+
+/// Take the state lock, recovering from poison (same pattern as the tray,
+/// #100).
+///
+/// A poisoned lock still holds its data: the panic that poisoned it happened
+/// elsewhere, and the state behind it is intact. `expect`-ing the poison
+/// turned one panic into every later call failing, so recover and go on.
+fn lock(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use timetrack_core as core;
 use timetrack_core::{Counter, EntrySource, JsonStore, RuleError, Store};
@@ -103,13 +113,13 @@ impl EntryService {
     /// Write the current state out. Used by the mutation funnel and by
     /// startup, so both go through the same path.
     fn persist(&self) -> anyhow::Result<()> {
-        let g = self.inner.lock().expect("service state mutex poisoned");
+        let g = lock(&self.inner);
         g.store.save(&g.data).map_err(anyhow::Error::from)
     }
 
     /// A consistent view of everything a client needs for one frame.
     pub fn snapshot(&self) -> Snapshot {
-        let g = self.inner.lock().expect("service state mutex poisoned");
+        let g = lock(&self.inner);
         let now = now_ms();
         let today = g.tz.day_of(now);
         let week = core::week_totals(&g.data, today, &g.tz);
@@ -145,34 +155,40 @@ impl EntryService {
     /// guarantees the persist-before-acknowledge ordering. Failures keep
     /// their type: rule refusals stay `Rule`, persist failures become
     /// `Storage`, so the D-Bus layer can encode them without flattening.
-    /// If the write fails the error is returned and the in-memory state is
-    /// kept as is, so a failed save never discards tracked time: the mutation
-    /// stays visible and a later successful save persists it along with
-    /// everything else.
+    /// If the write fails the mutation is rolled back, so memory always
+    /// matches disk (#100): a mutation the client was told failed must not
+    /// linger in snapshots it was never acknowledged for.
     fn mutate<T>(
         &self,
         f: impl FnOnce(&mut Store, &mut Counter, i64) -> core::RuleResult<T>,
     ) -> Result<T, ServiceError> {
-        let mut g = self.inner.lock().expect("service state mutex poisoned");
+        let mut g = lock(&self.inner);
         let now = now_ms();
         // Destructure so `data` and `ids` are borrowed separately; borrowing
         // two fields of the same struct mutably in one call is rejected.
         let Inner {
             data, ids, store, ..
         } = &mut *g;
+        // Snapshot before mutating so a failed save (or a rule refusal after
+        // a partial mutation) can restore exactly what is on disk.
+        let saved_data = data.clone();
+        let saved_ids = ids.clone();
         let result = f(data, ids, now);
         match result {
             Ok(value) => {
-                // Persist before acknowledging. If the write fails, report
-                // the error but keep the in-memory state: reloading here
-                // would discard tracked time whenever the reload fails too,
-                // and the next successful save heals a transient failure.
+                // Persist before acknowledging.
                 if let Err(e) = store.save(data) {
+                    *data = saved_data;
+                    *ids = saved_ids;
                     return Err(ServiceError::Storage(e.to_string()));
                 }
                 Ok(value)
             }
-            Err(rule) => Err(ServiceError::from(rule)),
+            Err(rule) => {
+                *data = saved_data;
+                *ids = saved_ids;
+                Err(ServiceError::from(rule))
+            }
         }
     }
 
@@ -327,7 +343,7 @@ impl EntryService {
     pub fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, ServiceError> {
         let scope = core::ExportScope::parse(scope)
             .ok_or_else(|| ServiceError::UnknownExportScope(scope.to_string()))?;
-        let g = self.inner.lock().expect("service state mutex poisoned");
+        let g = lock(&self.inner);
         Ok(core::export_csv_at(&g.data, scope, anchor_ms, &g.tz))
     }
 
@@ -392,6 +408,37 @@ mod tests {
         assert_eq!(snap.entries[0].description, "writing");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_rolls_the_mutation_back() {
+        // #100: memory must match disk after a save failure, so the entry
+        // the client was told failed must not linger in snapshots.
+        use std::os::unix::fs::PermissionsExt;
+        let (svc, path) = service("save-failure-rollback");
+        let p = project(&svc);
+        let now = now_ms();
+        svc.add(&p.id, "kept", now - 3_600_000, now).unwrap();
+
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = svc.add(&p.id, "doomed", now - 1_800_000, now);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(failed, Err(ServiceError::Storage(_))),
+            "client must get a storage error, got: {failed:?}"
+        );
+        let snap = svc.snapshot();
+        assert_eq!(snap.entries.len(), 1, "rolled-back entry must not show");
+        assert_eq!(snap.entries[0].description, "kept");
+
+        // Disk agrees, and the service still works once writes recover.
+        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        assert_eq!(reopened.snapshot().entries.len(), 1);
+        svc.add(&p.id, "after", now - 1_800_000, now).unwrap();
+        assert_eq!(svc.snapshot().entries.len(), 2);
+    }
+
     #[test]
     fn ids_do_not_collide_after_restart() {
         let (svc, path) = service("ids");
@@ -449,10 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_save_keeps_in_memory_state() {
+    fn a_failed_save_rolls_back_without_losing_persisted_state() {
         // The double failure: the save fails, and a reload would fail too
-        // (the path is a directory). The service must keep serving what it
-        // holds rather than resetting to an empty store.
+        // (the path is a directory). The failed mutation is rolled back so
+        // memory matches disk (#100), but previously persisted state must
+        // survive -- no resetting to an empty store.
         let (svc, path) = service("double-failure");
         let p = project(&svc);
         let now = now_ms();
@@ -465,28 +513,27 @@ mod tests {
         let err = svc.add(&p.id, "unpersisted", now, now + 1);
         assert!(err.is_err(), "must not acknowledge an unpersisted entry");
 
-        // Nothing was wiped: the earlier entry, the seed project and the
-        // just-applied (unpersisted) entry are all still served.
+        // Nothing persisted was wiped, and the failed mutation is gone:
+        // memory holds exactly what the last good save put on disk.
         let snap = svc.snapshot();
         assert_eq!(snap.projects.len(), 1, "the seed project must survive");
-        assert_eq!(snap.entries.len(), 2, "in-memory state must be kept");
+        assert_eq!(snap.entries.len(), 1, "failed mutation must roll back");
         assert!(
             snap.entries.iter().any(|e| e.description == "kept"),
             "previously persisted data must survive: {snap:?}"
         );
         assert!(
-            snap.entries.iter().any(|e| e.description == "unpersisted"),
-            "the failed mutation stays in memory: {snap:?}"
+            !snap.entries.iter().any(|e| e.description == "unpersisted"),
+            "the failed mutation must not linger in memory: {snap:?}"
         );
 
         // And the failure heals: once the path is writable again the next
-        // mutation persists everything, including the entry from the failed
-        // call, so a transient failure loses nothing.
+        // mutation persists normally.
         std::fs::remove_dir_all(&path).unwrap();
         svc.add(&p.id, "healed", now, now + 1).unwrap();
         let reopened = EntryService::new(JsonStore::new(path)).unwrap();
         let snap = reopened.snapshot();
-        assert_eq!(snap.entries.len(), 3, "all three entries must be on disk");
+        assert_eq!(snap.entries.len(), 2, "kept + healed must be on disk");
     }
 
     // --- the four methods ---
@@ -884,7 +931,7 @@ mod tests {
         let utc_ms = 1_783_290_600_000; // 2026-07-05 22:30 UTC
         svc.add(&p.id, "late", utc_ms, utc_ms + 60_000).unwrap();
 
-        let g = svc.inner.lock().expect("service state mutex poisoned");
+        let g = lock(&svc.inner);
         let rome_day = rome.day_of(utc_ms);
         let utc_day = core::Tz::utc().day_of(utc_ms);
         assert_ne!(rome_day, utc_day, "Sunday UTC vs Monday Rome");
