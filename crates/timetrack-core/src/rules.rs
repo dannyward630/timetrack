@@ -27,8 +27,8 @@ pub enum RuleError {
     UnknownProject(String),
     #[error("a project named '{0}' already exists")]
     DuplicateProject(String),
-    /// A project name trimmed to nothing. Renaming states it plainly rather
-    /// than storing an empty label no picker could show.
+    /// A project name trimmed to nothing. Creating or renaming states it
+    /// plainly rather than storing an empty label no picker could show.
     #[error("project name cannot be blank")]
     BlankProjectName,
     #[error("an entry must not end before it starts")]
@@ -136,7 +136,7 @@ pub fn next_project_id(counter: &mut Counter) -> String {
 pub fn create_project(store: &mut Store, counter: &mut Counter, name: &str) -> RuleResult<Project> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(RuleError::DuplicateProject(String::new()));
+        return Err(RuleError::BlankProjectName);
     }
     if store.projects.iter().any(|p| p.name == name) {
         return Err(RuleError::DuplicateProject(name.to_string()));
@@ -603,9 +603,17 @@ mod tests {
 
     #[test]
     fn blank_project_name_is_refused() {
-        let mut s = store_with_project();
-        let mut c = ids();
-        assert!(create_project(&mut s, &mut c, "   ").is_err());
+        for name in ["", "   ", "\t"] {
+            let mut s = store_with_project();
+            let mut c = ids();
+            assert_eq!(
+                create_project(&mut s, &mut c, name).unwrap_err(),
+                RuleError::BlankProjectName,
+                "blank project name {name:?} should have its own rule error"
+            );
+            assert_eq!(s.projects.len(), 1, "a rejected project is not stored");
+            assert_eq!(c.next_project, 1, "a rejected project does not use an id");
+        }
     }
 
     #[test]

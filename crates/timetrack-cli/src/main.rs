@@ -277,6 +277,17 @@ fn explain(err: anyhow::Error) -> anyhow::Error {
     err
 }
 
+/// Refuse names the service would reject, preserving the core rule for both
+/// project creation and rename before sending the mutation over D-Bus.
+fn validate_project_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow::Error::new(
+            timetrack_core::RuleError::BlankProjectName,
+        ));
+    }
+    Ok(())
+}
+
 async fn dispatch(client: Client, command: Command) -> Result<()> {
     match command {
         Command::Tui => unreachable!("handled above"),
@@ -489,17 +500,15 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         }
 
         Command::Project { name } => {
+            validate_project_name(&name)?;
             let p = client.add_project(&name).await?;
             println!("created project {} ({})", p.name, p.id);
         }
 
         Command::Rename { id, name } => {
-            // Refused here, not just by the service: at the D-Bus level an
-            // empty name means "keep", so passing blank through would
-            // silently succeed as a no-op. Same wording as the core guard.
-            if name.trim().is_empty() {
-                anyhow::bail!("project name cannot be blank");
-            }
+            // At the D-Bus level an empty name means "keep", so passing blank
+            // through would silently succeed as a no-op.
+            validate_project_name(&name)?;
             let snap = client.snapshot().await?;
             let existing = find_project(&snap, &id)?;
             let old = existing.name.clone();
@@ -981,6 +990,21 @@ mod tests {
         // And it needs a project: clap refuses the missing argument, not the
         // service.
         assert!(Cli::try_parse_from(["timetrack", "delete-project"]).is_err());
+    }
+
+    #[test]
+    fn project_command_rejects_blank_names_with_the_core_rule_error() {
+        let cli = Cli::try_parse_from(["timetrack", "project", " \t "])
+            .expect("project args must parse so the rule can reject the name");
+        let Some(Command::Project { name }) = cli.command else {
+            panic!("expected project command");
+        };
+
+        let err = validate_project_name(&name).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<timetrack_core::RuleError>(),
+            Some(&timetrack_core::RuleError::BlankProjectName)
+        );
     }
 
     #[test]
