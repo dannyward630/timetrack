@@ -76,7 +76,9 @@ pub trait Ids {
 }
 
 /// Sequential ids, `e1`, `p1`, ...
-#[derive(Debug)]
+// Clone lets the service snapshot the counter before a mutation and
+// restore it if the save fails (#100).
+#[derive(Debug, Clone)]
 pub struct Counter {
     next_entry: u64,
     next_project: u64,

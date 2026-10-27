@@ -12,11 +12,13 @@
 //!
 //! # Durability
 //!
-//! Saves are atomic: the document is written to a temporary file in the same
-//! directory and renamed over the target. A rename within a directory is
-//! atomic, so a crash mid-write leaves the previous good file intact rather
-//! than a truncated one. The service persists *before* acknowledging a
-//! mutation, so an acknowledged entry is on disk.
+//! Saves are atomic: the document is written to a uniquely named temporary
+//! file in the same directory, synced, renamed over the target, and the
+//! parent directory is synced so the rename itself survives a crash. A
+//! rename within a directory is atomic, so a crash mid-write leaves the
+//! previous good file intact rather than a truncated one. The service
+//! persists *before* acknowledging a mutation, so an acknowledged entry is
+//! on disk.
 
 use crate::model::{STORE_VERSION, Store};
 use std::io::Write;
@@ -129,9 +131,16 @@ impl JsonStore {
         let shown = self.path.display().to_string();
         match std::fs::read_to_string(&self.path) {
             Ok(text) => {
-                // A zero-length file is a crash artifact, not real data.
+                // A zero-length file is a crash artifact, not "nothing
+                // tracked yet" -- that state is a *missing* file. Treating
+                // it as fresh would let the next save silently replace
+                // whatever it was meant to hold, so refuse like any other
+                // corrupt file (#100).
                 if text.trim().is_empty() {
-                    return Ok(Store::default());
+                    return Err(StorageError::Invalid {
+                        path: shown,
+                        reason: "file is empty".to_string(),
+                    });
                 }
                 let store: Store =
                     serde_json::from_str(&text).map_err(|e| StorageError::Invalid {
@@ -176,16 +185,40 @@ impl JsonStore {
         })?;
 
         // A sibling temp file, so the rename stays within one filesystem and
-        // is therefore atomic.
-        let tmp = self.path.with_extension("json.tmp");
-        {
+        // is therefore atomic. Unique per save (#100): a fixed name lets
+        // two racing writers truncate or rename each other's document.
+        static SAVE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SAVE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp-{}-{n}", std::process::id()));
+        let written = (|| -> StorageResult<()> {
             let mut f = std::fs::File::create(&tmp).map_err(write)?;
             f.write_all(text.as_bytes()).map_err(write)?;
             // Durability before the rename: without the sync, a crash can
             // leave the renamed file pointing at unwritten blocks.
             f.sync_all().map_err(write)?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        std::fs::rename(&tmp, &self.path).map_err(write)?;
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(write(e));
+        }
+        // The rename itself is only durable once the directory entry is
+        // synced; without this a crash can still lose the new name (#100).
+        #[cfg(unix)]
+        {
+            let parent = match self.path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            let dir = std::fs::File::open(parent).map_err(write)?;
+            dir.sync_all().map_err(write)?;
+        }
         Ok(())
     }
 }
@@ -260,16 +293,57 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_file_loads_as_empty() {
-        // A zero-length file is what a crash mid-write would leave behind if
-        // the rename were not atomic; treat it as "nothing tracked yet".
+    fn an_empty_file_is_refused_like_other_corruption() {
+        // A zero-length file is a crash artifact, not "nothing tracked
+        // yet": loading it as fresh would let the next save silently
+        // replace whatever the file was meant to hold (#100).
         let dir = tmpdir("empty");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.json");
         std::fs::write(&path, "").unwrap();
         let store = JsonStore::new(path);
-        assert!(store.load().unwrap().entries.is_empty());
+        let err = store.load().unwrap_err();
+        assert!(
+            matches!(err, StorageError::Invalid { .. }),
+            "empty file must be Invalid, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_clobber_each_others_temp_file() {
+        // Unique temp names (#100): two writers racing the same store must
+        // not share one temp file, or one can rename/truncate the other's
+        // half-written document.
+        let dir = tmpdir("concurrent");
+        let path = dir.join("store.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = JsonStore::new(path);
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let data = sample();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        store.save(&data).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut expected = sample();
+        expected.version = STORE_VERSION;
+        assert_eq!(store.load().unwrap(), expected);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
