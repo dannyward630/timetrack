@@ -489,6 +489,9 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         }
 
         Command::Project { name } => {
+            // Refused here, not just by the service, so a blank name fails
+            // before a bus round-trip. Same wording as the core guard.
+            check_project_name(&name)?;
             let p = client.add_project(&name).await?;
             println!("created project {} ({})", p.name, p.id);
         }
@@ -497,9 +500,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             // Refused here, not just by the service: at the D-Bus level an
             // empty name means "keep", so passing blank through would
             // silently succeed as a no-op. Same wording as the core guard.
-            if name.trim().is_empty() {
-                anyhow::bail!("project name cannot be blank");
-            }
+            check_project_name(&name)?;
             let snap = client.snapshot().await?;
             let existing = find_project(&snap, &id)?;
             let old = existing.name.clone();
@@ -777,6 +778,18 @@ fn snapshot_tz(snap: &Snapshot) -> timetrack_core::Tz {
     timetrack_core::Tz::from_snapshot(&snap.tz, snap.local_offset_ms)
 }
 
+/// Refuse a project name that trims to nothing, in the core guard's own
+/// wording, so `project` and `rename` fail identically before the bus.
+///
+/// Split out so the dispatch arms stay thin callers and the refusal is
+/// testable without a service.
+fn check_project_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("project name cannot be blank");
+    }
+    Ok(())
+}
+
 /// Whether a typed merge confirmation counts as "yes".
 ///
 /// Split out so the actual prompt stays a thin reader: `y`/`yes` in any
@@ -950,6 +963,20 @@ mod tests {
                 .to_string()
                 .contains("end")
         );
+    }
+
+    #[test]
+    fn blank_project_names_are_refused_before_the_bus() {
+        // `timetrack project "  "` used to reach the service and come back
+        // as a duplicate-project refusal; rename already refused locally.
+        for blank in ["", "   ", "\t\n"] {
+            let e = check_project_name(blank).unwrap_err().to_string();
+            assert_eq!(e, "project name cannot be blank", "{blank:?}");
+            // The CLI wording is the core guard's, so both surfaces agree.
+            assert_eq!(e, timetrack_core::RuleError::BlankProjectName.to_string());
+        }
+        assert!(check_project_name("Work").is_ok());
+        assert!(check_project_name("  Work  ").is_ok());
     }
 
     #[test]

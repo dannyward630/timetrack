@@ -136,7 +136,7 @@ pub fn next_project_id(counter: &mut Counter) -> String {
 pub fn create_project(store: &mut Store, counter: &mut Counter, name: &str) -> RuleResult<Project> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(RuleError::DuplicateProject(String::new()));
+        return Err(RuleError::BlankProjectName);
     }
     if store.projects.iter().any(|p| p.name == name) {
         return Err(RuleError::DuplicateProject(name.to_string()));
@@ -605,7 +605,13 @@ mod tests {
     fn blank_project_name_is_refused() {
         let mut s = store_with_project();
         let mut c = ids();
-        assert!(create_project(&mut s, &mut c, "   ").is_err());
+        // The exact variant matters: blank used to report DuplicateProject(""),
+        // which tells the user a project named '' already exists.
+        assert_eq!(
+            create_project(&mut s, &mut c, "   ").unwrap_err(),
+            RuleError::BlankProjectName
+        );
+        assert_eq!(s.projects.len(), 1, "a refused project must not be stored");
     }
 
     #[test]
