@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/sequ-r/timetrack/actions/workflows/ci.yml/badge.svg)](https://github.com/sequ-r/timetrack/actions/workflows/ci.yml)
 
-A time tracker for GNOME. You **enter** time — a quick tap for the common case,
+A time tracker for Linux. You **enter** time — a quick tap for the common case,
 or an explicit interval when you are reconstructing the day — and the app tells
 you where a week went.
 
@@ -23,7 +23,7 @@ the terminal never loses anything, and both can be open at once.
         |                                  |                                   |
         +--------- D-Bus: org.sequ.timetrack.Entries ----+
                            |
-              timetrack-service  (D-Bus activated)
+              timetrack-service  (started by the AppImage)
               owns the store; does all aggregation
                            |
                   ~/.local/share/timetrack/store.json
@@ -37,6 +37,7 @@ the terminal never loses anything, and both can be open at once.
 | `timetrack-cli` | Terminal client: a ratatui TUI plus one-shot subcommands. |
 | `timetrack-gui` | Desktop client, built on gpui (upstream, from crates.io). Ships as the AppImage. |
 | `timetrack-tray` | Host-only tray item (StatusNotifierItem): service presence, week total, per-project menu. |
+| `timetrack-update` | AppImage self-update check against GitHub releases; used by the GUI. |
 
 The core takes an explicit timestamp and never reads the clock, so the rules are
 identical everywhere and testable without any I/O. Aggregation is implemented in
@@ -183,7 +184,7 @@ install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.local/share/applications/
 install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.config/autostart/org.sequ.timetrack.tray.desktop
 ```
 
-D-Bus activation is unchanged by all of this: the tray connects anonymously
+Bus-name ownership is unchanged by all of this: the tray connects anonymously
 and never owns `org.sequ.timetrack`, so it can neither steal the service's
 name nor keep a stale service alive — it only reads. The AppImage ships no
 tray in v1 (it bundles the GUI, the service and the CLI); the tray is
@@ -436,8 +437,7 @@ window (PointerRoot focus) for a keystroke to arrive at all.
 The GUI originally used **gpui-ce**, the community fork, because the
 published `gpui` crate then carried no platform backend. Upstream
 0.2.2 ships the Linux backends behind its default features, so
-`gpui = "0.2.2"` from crates.io replaced both git dependencies (and
-the Flatpak no longer needs a toolkit checkout). Exactly one call site
+`gpui = "0.2.2"` from crates.io replaced both git dependencies. Exactly one call site
 changed — `FocusHandle::focus(window, cx)` lost its `cx` argument —
 plus an `image` pin that only existed for the fork's Wayland backend.
 The lockfile moved the other way: the fork was *ahead* of upstream on

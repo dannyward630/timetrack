@@ -88,12 +88,12 @@ open(lock, "w").write("".join(out))
 
 # 3. The AppStream releases block: newest first, history kept. Re-minting
 # the same version (every build job mints) is a no-op.
-appdata = f"{root}/data/org.sequ.timetrack.appdata.xml"
-text = open(appdata).read()
+metainfo = f"{root}/data/org.sequ.timetrack.metainfo.xml"
+text = open(metainfo).read()
 if f'version="{version}"' not in text:
     anchor = "  <releases>\n"
-    assert anchor in text, "no <releases> block in the appdata"
+    assert anchor in text, "no <releases> block in the metainfo"
     today = datetime.date.today().isoformat()
     text = text.replace(anchor, f'{anchor}    <release version="{version}" date="{today}"/>\n', 1)
-    open(appdata, "w").write(text)
+    open(metainfo, "w").write(text)
 EOF

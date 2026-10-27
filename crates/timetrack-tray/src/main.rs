@@ -57,8 +57,8 @@ const POLL: Duration = Duration::from_secs(5);
 
 /// How many projects sit at the menu's top level before the rest move under
 /// "More projects". Tray menus must stay short; the aggregates behind them
-/// still cover every project (cf. TODO task 5 on truncated entry lists --
-/// here it is the menu, not the data, that is capped).
+/// still cover every project -- here it is the menu, not the data, that is
+/// capped.
 const MAX_PROJECTS: usize = 8;
 
 /// The tray's one bus connection, shared by the poll loop and the menu
@@ -485,8 +485,8 @@ impl TimetrackTray {
         }));
         // Delete (tray-7, #11): the most recent entry for this project,
         // behind a confirm submenu stating exactly what would go -- the
-        // tray's version of the GUI's `d`-then-`d` delete confirmation (TODO
-        // task 11). Explicit `delete_entry` only, never `set_times`: delete
+        // tray's version of the GUI's `d`-then-`d` delete confirmation.
+        // Explicit `delete_entry` only, never `set_times`: delete
         // is not a side effect of shortening.
         match &project.last_entry {
             Some(target) => {

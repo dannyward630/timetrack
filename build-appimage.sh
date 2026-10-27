@@ -60,7 +60,7 @@ install -m0755 target/release/timetrack-gui AppDir/usr/bin/timetrack-gui
 install -m0755 target/release/timetrack-service AppDir/usr/bin/timetrack-service
 install -m0755 target/release/timetrack AppDir/usr/bin/timetrack
 install -m0644 data/org.sequ.timetrack.desktop AppDir/usr/share/applications/
-install -m0644 data/org.sequ.timetrack.appdata.xml AppDir/usr/share/metainfo/
+install -m0644 data/org.sequ.timetrack.metainfo.xml AppDir/usr/share/metainfo/
 install -m0644 data/icons/hicolor/scalable/apps/org.sequ.timetrack.svg \
     AppDir/usr/share/icons/hicolor/scalable/apps/
 install -m0644 data/icons/hicolor/symbolic/apps/org.sequ.timetrack-symbolic.svg \

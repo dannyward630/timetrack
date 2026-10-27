@@ -7,9 +7,9 @@
 
 //! The rules: everything that can change a `Store`.
 //!
-//! Like the old state machine, every operation takes the store mutably and an
+//! Every operation takes the store mutably and an
 //! explicit timestamp, and never reads a clock itself. That keeps the whole
-//! module deterministic and testable without I/O (PLAN.md).
+//! module deterministic and testable without I/O.
 
 use crate::model::{Entry, EntrySource, MS_PER_DAY, Project, Store};
 use serde::{Deserialize, Serialize};
