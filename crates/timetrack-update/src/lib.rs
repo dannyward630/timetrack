@@ -15,10 +15,11 @@
 //! The flow is deliberately in two halves. The *check* reads the latest
 //! GitHub release, compares its tag against this build's version, and picks
 //! the asset for this architecture -- pure data, no side effects. The
-//! *install* downloads that asset over HTTPS, sanity-checks it, and renames
-//! it over the running AppImage (renaming a running file is fine: the
-//! process keeps its old inode). The GUI confirms twice before calling it,
-//! like every other destructive action in this app.
+//! *install* downloads that asset over HTTPS under a hard byte cap, verifies
+//! its SHA256 against the release's `SHA256SUMS` asset, and only then
+//! renames it over the running AppImage (renaming a running file is fine:
+//! the process keeps its old inode). The GUI confirms twice before calling
+//! it, like every other destructive action in this app.
 //!
 //! # What this crate deliberately does not depend on
 //!
@@ -27,6 +28,8 @@
 //! gpui future. Network failures are ordinary errors the caller is expected
 //! to swallow: an offline launch is not an update failure.
 
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -50,9 +53,16 @@ pub const APPIMAGE_ENV: &str = "APPIMAGE";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Refuse downloads past this: the image is ~10 MB, so this is two orders of
-/// magnitude of headroom against a lying `Content-Length`, not a limit the
-/// real asset can hit.
+/// magnitude of headroom, not a limit the real asset can hit. Enforced while
+/// reading (see [`fetch_capped`]), never from `Content-Length`: a chunked
+/// body has no length to check, and a lying one is the whole threat.
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The same cap for the `SHA256SUMS` asset, which is a few hundred bytes.
+const MAX_SUMS_BYTES: u64 = 1024 * 1024;
+
+/// The checksum asset `release.yml` publishes next to every AppImage.
+const SUMS_NAME: &str = "SHA256SUMS";
 
 /// What went wrong. Network and protocol failures exist so the GUI can tell
 /// "offline" from "release broken"; both still surface as one quiet status
@@ -69,6 +79,12 @@ pub enum UpdateError {
     Download(String),
     #[error("the downloaded file is not an AppImage")]
     NotAnAppImage,
+    #[error("the download exceeds the size cap")]
+    TooLarge,
+    #[error("the download does not match the release checksum")]
+    ChecksumMismatch,
+    #[error("the release checksum could not be used ({0})")]
+    BadChecksum(String),
     #[error("could not replace the AppImage ({0})")]
     Install(String),
 }
@@ -282,17 +298,21 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// Download `url` and rename it over `dest`, which must be the running
-/// AppImage. The bytes land in a sibling `.new` file first, so a failed or
-/// half-written download leaves the current image untouched; the rename is
-/// atomic on the same filesystem.
+/// GET `url` and read the body under a hard cap, returning the bytes and
+/// their SHA256 as lowercase hex.
 ///
-/// The payload must start with the ELF magic: a GitHub error page served as
-/// `200 OK` must never become the user's TimeTrack binary.
-pub fn install_with(url: &str, dest: &Path) -> Result<(), UpdateError> {
-    if !dest.is_file() {
-        return Err(UpdateError::NotAppImage);
-    }
+/// The cap is a `take(max + 1)` on the byte stream, checked as the bytes
+/// arrive: `Content-Length` is never consulted, so a chunked body (which
+/// has none) and a lying header are capped exactly like an honest one, and
+/// an oversized body is aborted after `max + 1` bytes instead of being
+/// buffered whole and measured after the fact. `too_large` is the error an
+/// over-cap body produces, since the asset and its checksum file fail
+/// differently.
+fn fetch_capped(
+    url: &str,
+    max_bytes: u64,
+    too_large: UpdateError,
+) -> Result<(Vec<u8>, String), UpdateError> {
     let mut response = agent()
         .get(url)
         .header(
@@ -301,22 +321,109 @@ pub fn install_with(url: &str, dest: &Path) -> Result<(), UpdateError> {
         )
         .call()
         .map_err(|e| UpdateError::Download(e.to_string()))?;
-    if let Some(len) = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if len > MAX_BYTES {
-            return Err(UpdateError::Download("asset too large".into()));
+    let mut reader = response.body_mut().as_reader().take(max_bytes + 1);
+    let mut bytes = Vec::new();
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| UpdateError::Download(e.to_string()))?;
+        if n == 0 {
+            break;
         }
+        hasher.update(&buf[..n]);
+        bytes.extend_from_slice(&buf[..n]);
     }
-    let bytes = response
-        .body_mut()
-        .read_to_vec()
-        .map_err(|e| UpdateError::Download(e.to_string()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large);
+    }
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((bytes, hex))
+}
+
+/// The checksum `SHA256SUMS` records for `asset_name`, as written. Lines are
+/// `<hex>  <name>` (or `<hex> *<name>` for binary mode); a release lists
+/// every architecture, so the line is picked by file name, not position.
+fn parse_sums(body: &str, asset_name: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let hex = fields.next()?;
+        // The name may carry sha256sum's `*` binary marker or a path.
+        let named = fields.next()?.trim_start_matches('*').rsplit('/').next()?;
+        (named == asset_name).then(|| hex.to_string())
+    })
+}
+
+/// The SHA256 the release publishes for the asset at `url`.
+///
+/// GitHub download URLs are `.../releases/download/<tag>/<file>`, so the
+/// release's `SHA256SUMS` asset is the sibling of the AppImage asset: same
+/// tag directory, its own name. Failing to fetch or read it fails closed --
+/// an update that cannot be verified is not installed.
+fn expected_checksum(url: &str) -> Result<String, UpdateError> {
+    let (dir, name) = url
+        .rsplit_once('/')
+        .filter(|(_, name)| !name.is_empty())
+        .ok_or_else(|| UpdateError::BadChecksum(format!("no asset name in {url}")))?;
+    let (body, _) = fetch_capped(
+        &format!("{dir}/{SUMS_NAME}"),
+        MAX_SUMS_BYTES,
+        UpdateError::BadChecksum(format!("{SUMS_NAME} too large")),
+    )?;
+    let text = String::from_utf8_lossy(&body);
+    parse_sums(&text, name)
+        .ok_or_else(|| UpdateError::BadChecksum(format!("{SUMS_NAME} does not name {name}")))
+}
+
+/// Download `url` and rename it over `dest`, which must be the running
+/// AppImage. The bytes land in a sibling `.new` file first, so a failed or
+/// half-written download leaves the current image untouched; the rename is
+/// atomic on the same filesystem.
+///
+/// The checksum comes from the release's `SHA256SUMS` asset (see
+/// [`expected_checksum`]); the injectable half, with an explicit checksum
+/// and cap, is [`install_with_checksum`].
+pub fn install_with(url: &str, dest: &Path) -> Result<(), UpdateError> {
+    if !dest.is_file() {
+        return Err(UpdateError::NotAppImage);
+    }
+    let expected = expected_checksum(url)?;
+    install_with_checksum(url, dest, &expected, MAX_BYTES)
+}
+
+/// The injectable half of [`install_with`]: download `url` over `dest`,
+/// refusing anything past `max_bytes` (enforced during the read, never from
+/// `Content-Length`) or whose SHA256 is not `expected_sha256`.
+///
+/// The payload must also start with the ELF magic: a GitHub error page
+/// served as `200 OK` must never become the user's TimeTrack binary. Every
+/// refusal happens before the rename, so the running image stays untouched.
+pub fn install_with_checksum(
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    max_bytes: u64,
+) -> Result<(), UpdateError> {
+    if !dest.is_file() {
+        return Err(UpdateError::NotAppImage);
+    }
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(UpdateError::BadChecksum(format!(
+            "not a SHA256 hex digest: {expected_sha256:?}"
+        )));
+    }
+    let (bytes, actual) = fetch_capped(url, max_bytes, UpdateError::TooLarge)?;
     if bytes.len() < 4 || bytes[0..4] != [0x7f, b'E', b'L', b'F'] {
         return Err(UpdateError::NotAnAppImage);
+    }
+    if actual != expected {
+        return Err(UpdateError::ChecksumMismatch);
     }
     let tmp = dest.with_extension("AppImage.new");
     std::fs::write(&tmp, &bytes).map_err(|e| UpdateError::Install(e.to_string()))?;
@@ -438,5 +545,27 @@ mod tests {
         let err = install_with("http://127.0.0.1:9/nope", &dir.join("missing")).unwrap_err();
         assert_eq!(err, UpdateError::NotAppImage);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sums_parsing_picks_this_assets_line() {
+        // A release lists every file; the line is found by name, binary
+        // markers and paths on the name do not matter, and a sums file that
+        // does not name the asset verifies nothing.
+        let body = "\
+aaaa  TimeTrack-aarch64.AppImage
+bbbb *TimeTrack-x86_64.AppImage
+cccc  ./TimeTrack-x86_64.AppImage.zsync
+";
+        assert_eq!(
+            parse_sums(body, "TimeTrack-x86_64.AppImage").as_deref(),
+            Some("bbbb")
+        );
+        assert_eq!(
+            parse_sums(body, "TimeTrack-aarch64.AppImage").as_deref(),
+            Some("aaaa")
+        );
+        assert_eq!(parse_sums(body, "TimeTrack-riscv64.AppImage"), None);
+        assert_eq!(parse_sums("", "TimeTrack-x86_64.AppImage"), None);
     }
 }
