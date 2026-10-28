@@ -21,7 +21,7 @@
 //!
 //! `storage` is the one module that touches a filesystem. It is kept out of
 //! `rules` so the rules stay pure, and out of the clients' dependency path so
-//! the static CLI never links it.
+//! the CLI never links it.
 //!
 //! # Timezone
 //!
@@ -29,7 +29,7 @@
 //! explicit [`Tz`] rather than reading a clock or the environment. The service
 //! resolves the zone once from `TZ` (or the system zone); every instant below
 //! this line is then mapped through the offset in force *at that instant*,
-//! so DST transitions bucket correctly. See PLAN.md -- this is the app's
+//! so DST transitions bucket correctly. This is the app's
 //! likeliest source of off-by-one bugs, so it is deliberately concentrated
 //! in `tz.rs` plus the thin call sites that pass a `&Tz` through.
 

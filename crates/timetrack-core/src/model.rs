@@ -146,8 +146,8 @@ impl Store {
 
 /// Local-time helpers (fixed-offset primitives).
 ///
-/// Day and week bucketing is the single most error-prone part of this app
-/// (see PLAN.md). The public entry point is [`crate::tz::Tz`], which resolves
+/// Day and week bucketing is the single most error-prone part of this app.
+/// The public entry point is [`crate::tz::Tz`], which resolves
 /// the offset per instant (notably across DST) and delegates here only for
 /// fixed-offset zones. These free functions stay as the pure arithmetic core
 /// for a single known offset, and for the pre-existing unit tests that pin

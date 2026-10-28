@@ -7,9 +7,9 @@
 
 //! The rules: everything that can change a `Store`.
 //!
-//! Like the old state machine, every operation takes the store mutably and an
+//! Every operation takes the store mutably and an
 //! explicit timestamp, and never reads a clock itself. That keeps the whole
-//! module deterministic and testable without I/O (PLAN.md).
+//! module deterministic and testable without I/O.
 
 use crate::model::{Entry, EntrySource, MS_PER_DAY, Project, Store};
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,9 @@ pub trait Ids {
 }
 
 /// Sequential ids, `e1`, `p1`, ...
-#[derive(Debug)]
+// Clone lets the service snapshot the counter before a mutation and
+// restore it if the save fails (#100).
+#[derive(Debug, Clone)]
 pub struct Counter {
     next_entry: u64,
     next_project: u64,
@@ -603,6 +605,8 @@ mod tests {
 
     #[test]
     fn blank_project_name_is_refused() {
+        // The exact variant matters: blank used to report DuplicateProject(""),
+        // which tells the user a project named '' already exists.
         for name in ["", "   ", "\t"] {
             let mut s = store_with_project();
             let mut c = ids();
@@ -611,7 +615,7 @@ mod tests {
                 RuleError::BlankProjectName,
                 "blank project name {name:?} should have its own rule error"
             );
-            assert_eq!(s.projects.len(), 1, "a rejected project is not stored");
+            assert_eq!(s.projects.len(), 1, "a refused project must not be stored");
             assert_eq!(c.next_project, 1, "a rejected project does not use an id");
         }
     }

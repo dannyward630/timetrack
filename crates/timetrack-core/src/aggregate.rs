@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn local_offset_can_move_an_entry_into_the_next_week() {
         // 23:30 UTC is the next day in UTC+1, which can cross a week boundary
-        // -- the DST-adjacent class of bug PLAN.md warns about. Week 1 of 1970
+        // -- a classic DST-adjacent bug. Week 1 of 1970
         // starts on Monday 29 Dec 1969 and ends Sunday 4 Jan, so an entry that
         // rolls from local day 3 (Sun) to local day 4 (Mon) leaves the week.
         let late = 3 * D + 23 * 3_600_000 + 1_800_000; // Sunday 23:30 local

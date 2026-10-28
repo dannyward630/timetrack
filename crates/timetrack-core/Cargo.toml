@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Domain model, timer state machine and storage for TimeTrack"
+description = "Domain model, entry rules, aggregation and storage for TimeTrack"
 
 [dependencies]
 serde = { workspace = true }

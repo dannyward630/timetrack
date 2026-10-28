@@ -6,6 +6,6 @@ Exec=timetrack-gui
 Icon=org.sequ.timetrack
 Terminal=false
 Type=Application
-Categories=Utility;GTK;
+Categories=Utility;
 Keywords=time;track;todo;productivity;
 StartupNotify=true

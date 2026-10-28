@@ -962,6 +962,26 @@ mod tests {
     }
 
     #[test]
+    fn blank_project_names_are_refused_before_the_bus() {
+        // `timetrack project "  "` used to reach the service and come back
+        // as a duplicate-project refusal; rename already refused locally.
+        for blank in ["", "   ", "\t\n"] {
+            let err = validate_project_name(blank).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<timetrack_core::RuleError>(),
+                Some(&timetrack_core::RuleError::BlankProjectName),
+                "blank project name {blank:?} should preserve the core rule error"
+            );
+            assert_eq!(
+                err.to_string(),
+                timetrack_core::RuleError::BlankProjectName.to_string()
+            );
+        }
+        assert!(validate_project_name("Work").is_ok());
+        assert!(validate_project_name("  Work  ").is_ok());
+    }
+
+    #[test]
     fn the_command_line_parses() {
         // The subcommand surface is the CLI's real API; a rename that breaks
         // someone's alias should fail here, not at runtime.
